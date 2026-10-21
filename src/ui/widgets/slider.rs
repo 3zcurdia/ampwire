@@ -54,9 +54,11 @@ impl Widget for HSlider<'_> {
     }
 }
 
-/// Vertical slider. `value` is -1.0..=1.0 (0 = center), rendered with the
-/// knob at the proportional row and a `│` track. The focused band's knob
-/// uses `knob`; otherwise `track`.
+/// Vertical slider. `value` is -1.0..=1.0 (-1 = -12 dB, 0 = 0 dB, +1 = +12 dB).
+///
+/// The knob sits at `round((value + 1) / 2 × (rows − 1))`, so a taller panel
+/// gives real resolution (a 25-row slider resolves every dB). The track is
+/// `│`; the knob is `●`, in `accent` when focused, otherwise `track`.
 pub struct VSlider {
     pub value: f32,
     pub track: Color,
@@ -70,15 +72,15 @@ impl Widget for VSlider {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let height = area.height as f32;
-        // value +1 → top row, -1 → bottom row.
-        let norm = (self.value + 1.0) / 2.0;
-        let row = ((1.0 - norm) * (height - 1.0)).round() as u16;
-        let knob_y = area.y + row.min(area.height - 1);
+        let rows = area.height as f32;
+        // +12 dB (+1.0) sits at the top row, -12 dB (-1.0) at the bottom, so
+        // the knob lines up with the `+12 / 0 / -12` scale labels.
+        let norm = (self.value.clamp(-1.0, 1.0) + 1.0) / 2.0;
+        let knob_y = area.y + ((1.0 - norm) * (rows - 1.0)).round() as u16;
         for i in 0..area.height {
             let cell = &mut buf[(area.x, area.y + i)];
             if area.y + i == knob_y {
-                cell.set_symbol("█");
+                cell.set_symbol("●");
                 cell.set_fg(if self.focused { self.knob } else { self.track });
             } else {
                 cell.set_symbol("│");
@@ -137,8 +139,9 @@ mod tests {
     }
 
     #[test]
-    fn vslider_top_and_bottom() {
+    fn vslider_knob_tracks_value_top_to_bottom() {
         let area = Rect::new(0, 0, 1, 5);
+        // value +1 → knob on the top row.
         let mut buf = Buffer::empty(area);
         VSlider {
             value: 1.0,
@@ -147,9 +150,10 @@ mod tests {
             focused: true,
         }
         .render(area, &mut buf);
-        assert_eq!(buf[(0, 0)].symbol(), "█");
+        assert_eq!(buf[(0, 0)].symbol(), "●");
         assert_eq!(buf[(0, 4)].symbol(), "│");
 
+        // value -1 → knob on the bottom row.
         let mut buf = Buffer::empty(area);
         VSlider {
             value: -1.0,
@@ -158,6 +162,49 @@ mod tests {
             focused: true,
         }
         .render(area, &mut buf);
-        assert_eq!(buf[(0, 4)].symbol(), "█");
+        assert_eq!(buf[(0, 4)].symbol(), "●");
+        assert_eq!(buf[(0, 0)].symbol(), "│");
+    }
+
+    #[test]
+    fn vslider_knob_row_uses_rounded_formula() {
+        // rows = 5 → knob_row = round((v+1)/2 * 4).
+        let cases = [(1.0, 0), (0.0, 2), (-1.0, 4)];
+        for (value, expected_row) in cases {
+            let area = Rect::new(0, 0, 1, 5);
+            let mut buf = Buffer::empty(area);
+            VSlider {
+                value,
+                track: Color::Rgb(255, 106, 0),
+                knob: Color::Rgb(0, 229, 255),
+                focused: true,
+            }
+            .render(area, &mut buf);
+            assert_eq!(buf[(0, expected_row)].symbol(), "●", "value {value}");
+        }
+    }
+
+    #[test]
+    fn focused_knob_uses_accent_unfocused_uses_track() {
+        let area = Rect::new(0, 0, 1, 3);
+        let mut buf = Buffer::empty(area);
+        VSlider {
+            value: 0.0,
+            track: Color::Rgb(255, 106, 0),
+            knob: Color::Rgb(0, 229, 255),
+            focused: true,
+        }
+        .render(area, &mut buf);
+        assert_eq!(buf[(0, 1)].fg, Color::Rgb(0, 229, 255), "focused → accent");
+
+        let mut buf = Buffer::empty(area);
+        VSlider {
+            value: 0.0,
+            track: Color::Rgb(255, 106, 0),
+            knob: Color::Rgb(0, 229, 255),
+            focused: false,
+        }
+        .render(area, &mut buf);
+        assert_eq!(buf[(0, 1)].fg, Color::Rgb(255, 106, 0), "unfocused → track");
     }
 }

@@ -66,43 +66,6 @@ pub fn panel_block<'a>(
     block
 }
 
-/// A bottom-border hint line: ` a add ─ d del ─ / find ─ status`.
-pub fn hint_line<'a>(
-    entries: &[(Action, &'a str)],
-    theme: &'a Theme,
-    keymap: &'a Keymap,
-    status: Option<Span<'a>>,
-) -> Line<'a> {
-    let mut spans: Vec<Span<'a>> = Vec::new();
-    for (i, (action, label)) in entries.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(
-                " ─ ",
-                Style::default().fg(theme.color(Role::Muted)),
-            ));
-        }
-        let key = keymap.hint(*action).unwrap_or_default();
-        spans.push(Span::styled(
-            format!(" {key} "),
-            Style::default().fg(theme.color(Role::Accent)),
-        ));
-        spans.push(Span::styled(
-            (*label).to_string(),
-            Style::default().fg(theme.color(Role::Muted)),
-        ));
-    }
-    if let Some(status) = status {
-        if !spans.is_empty() {
-            spans.push(Span::styled(
-                " ─ ",
-                Style::default().fg(theme.color(Role::Muted)),
-            ));
-        }
-        spans.push(status);
-    }
-    Line::from(spans)
-}
-
 /// Render the "terminal too small" message.
 pub fn render_too_small(area: Rect, buf: &mut ratatui::buffer::Buffer, theme: &Theme) {
     let message = format!(

@@ -21,6 +21,9 @@ pub const PLAYER_HEIGHT: u16 = 9;
 pub const COMPACT_PLAYER_HEIGHT: u16 = 3;
 /// EQ panel height with default sliders.
 pub const EQ_HEIGHT: u16 = 9;
+/// Minimum EQ total height (rows including borders) before it is dropped
+/// rather than rendered squashed: 3 inner rows + 2 border rows.
+pub const MIN_EQ_TOTAL: u16 = 5;
 /// Playlist minimum height (borders included).
 pub const MIN_PLAYLIST_HEIGHT: u16 = 5;
 
@@ -218,13 +221,17 @@ fn compute_two_column(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> Comp
             } else {
                 PLAYER_HEIGHT.min(stack_area.height)
             };
-            // Spare height goes to the EQ; a short terminal shrinks it.
+            // Spare height goes to the EQ. A short terminal shrinks it, and
+            // the EQ is dropped entirely rather than rendered as a squashed
+            // box with fewer than 3 inner rows (≥5 with borders). This is a
+            // frame-only fallback; the saved visibility is untouched.
             let remaining = stack_area.height.saturating_sub(player_height);
             let eq_height = if remaining >= EQ_HEIGHT {
                 EQ_HEIGHT.max(remaining)
             } else {
                 remaining
             };
+            let show_eq = eq_height >= MIN_EQ_TOTAL;
 
             let mut y = stack_area.y;
             for panel in &stack {
@@ -243,7 +250,11 @@ fn compute_two_column(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> Comp
                 y += rect.height;
                 match panel {
                     Panel::Player => player = Some(rect),
-                    _ => eq = Some(rect),
+                    _ => {
+                        if show_eq {
+                            eq = Some(rect);
+                        }
+                    }
                 }
             }
         }
@@ -437,6 +448,30 @@ mod tests {
         assert_eq!(p.height, 3);
         let pl = l.playlist.unwrap();
         assert_eq!(pl.height, 5, "playlist at its minimum");
+    }
+
+    #[test]
+    fn two_column_drops_eq_when_too_squat() {
+        // Two-column at 104×N: player keeps 9 rows when it can, leaving the
+        // EQ `remaining` rows. Below MIN_EQ_TOTAL (5) the EQ is dropped, not
+        // rendered as a squashed box.
+        // 104×14: player 9, remaining 5 → EQ shown (exactly at the floor).
+        let l = compute_layout(area(104, 14), &prefs(), &Visibility::all());
+        assert!(l.player.is_some());
+        assert!(!l.player_compact);
+        assert!(l.eq.is_some(), "EQ shown at the 5-row floor");
+        // 104×13: player 9, remaining 4 → EQ dropped.
+        let l = compute_layout(area(104, 13), &prefs(), &Visibility::all());
+        assert!(l.player.is_some());
+        assert!(l.eq.is_none(), "EQ dropped below the floor");
+        // 104×10: player 9, remaining 1 → EQ dropped.
+        let l = compute_layout(area(104, 10), &prefs(), &Visibility::all());
+        assert!(l.eq.is_none(), "EQ dropped when only 1 row remains");
+        // 104×8: below PLAYER_HEIGHT → player compact (3), remaining 5 →
+        // the EQ fits again.
+        let l = compute_layout(area(104, 8), &prefs(), &Visibility::all());
+        assert!(l.player_compact);
+        assert!(l.eq.is_some(), "compact player frees room for the EQ");
     }
 
     #[test]

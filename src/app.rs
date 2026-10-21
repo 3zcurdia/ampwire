@@ -260,9 +260,25 @@ impl App {
     /// Feed a pressed key into the app. `Esc` closes the help overlay (the
     /// footer promises it); everything else goes through the keymap.
     pub fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
-        if self.ui.show_help && key.code == ratatui::crossterm::event::KeyCode::Esc {
-            self.ui.show_help = false;
-            return;
+        use ratatui::crossterm::event::KeyCode;
+        // While the help overlay is open, Esc closes it and ↑/↓ scroll it.
+        if self.ui.show_help {
+            match key.code {
+                KeyCode::Esc => {
+                    self.ui.show_help = false;
+                    return;
+                }
+                KeyCode::Up => {
+                    self.ui.help_scroll = self.ui.help_scroll.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    let max = crate::ui::help::line_count(self);
+                    self.ui.help_scroll = (self.ui.help_scroll + 1).min(max.saturating_sub(1));
+                    return;
+                }
+                _ => {}
+            }
         }
         if let Some(action) = self.keymap.resolve(self.ui.focus, key) {
             self.dispatch(action);
@@ -297,7 +313,9 @@ impl App {
         }
     }
 
-    /// Poll the Omarchy theme once and adopt it if it changed.
+    /// Poll the Omarchy theme once and adopt it if it changed. If Omarchy is
+    /// absent or unreadable, fall back to neon silently (plan §3.3) — no
+    /// notice, just the reason logged to the field below for debugging.
     fn check_omarchy(&mut self) {
         match self.omarchy.check(self.config.theme.transparent) {
             Ok(Some(mut theme)) => {
@@ -306,8 +324,8 @@ impl App {
                 self.theme = theme;
             }
             Ok(None) => {}
-            Err(reason) => {
-                // Silent fallback to neon, log the reason once.
+            Err(_reason) => {
+                // Silent fallback to neon: Omarchy is optional (e.g. macOS).
                 if self.config.theme.preset != "neon"
                     && let Some(neon) = Theme::preset("neon")
                 {
@@ -315,7 +333,6 @@ impl App {
                     Self::apply_theme_overrides(&mut self.theme, &self.config);
                     self.theme.apply_depth(ui::theme::ColorDepth::detect());
                 }
-                self.ui.notice = Some(format!("theme: {reason}"));
             }
         }
     }

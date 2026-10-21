@@ -47,17 +47,22 @@ pub struct MockPlayer {
     frozen: bool,
 }
 
-/// Build a plausible-looking spectrum from a seeded RNG: low bins loud, high
-/// bins quiet, with per-bin jitter. Same seed → same shape.
+/// Build a plausible-looking spectrum from a seeded RNG: a rolling hill that
+/// spans the full 0–1 range (so bars can drop to zero), low bins louder than
+/// high, with per-bin jitter. Same seed → same shape.
 fn seeded_spectrum(seed: u64) -> (Vec<f32>, Vec<f32>, Rng) {
     let mut rng = Rng(seed | 1);
     let mut spectrum = vec![0.0f32; SPECTRUM_BINS];
     for (i, bin) in spectrum.iter_mut().enumerate() {
-        let shape = 1.0 - (i as f32 / SPECTRUM_BINS as f32) * 0.78;
-        *bin = (shape * (0.55 + 0.45 * rng.next_f32())).clamp(0.0, 1.0);
+        let t = i as f32 / (SPECTRUM_BINS - 1) as f32;
+        // A rolling hill: peaks near the low end, dips that reach zero.
+        let hill = (0.55 + 0.45 * (t * 6.0).sin()) * (1.0 - 0.55 * t);
+        let jitter = 0.35 * rng.next_f32();
+        *bin = (hill * (0.45 + 0.55 * rng.next_f32()) + jitter - 0.18).clamp(0.0, 1.0);
     }
-    // Peak caps float just above the bars.
-    let peaks = spectrum.iter().map(|v| (v + 0.07).min(1.0)).collect();
+    // Peak caps track the bars exactly in the frozen state so a zero bar has
+    // a zero peak (the animated path re-derives peaks each tick anyway).
+    let peaks = spectrum.clone();
     (spectrum, peaks, rng)
 }
 
@@ -279,22 +284,23 @@ impl MockPlayer {
             return;
         }
 
-        // Spectrum: low bins louder than high bins, with a rolling wobble.
+        // Spectrum: low bins louder than high bins, with a rolling wobble that
+        // can drop to zero so bars fall all the way down.
         let playing = self.state == PlayState::Playing;
         let n = self.spectrum.len();
         for (i, bin) in self.spectrum.iter_mut().enumerate() {
             let freq_shape = 1.0 - (i as f32 / n as f32) * 0.7;
             let wobble = self.rng.next_f32();
             let target = if playing {
-                (freq_shape * (0.4 + 0.6 * wobble)).clamp(0.0, 1.0)
+                (freq_shape * wobble * 1.15).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            // Attack fast, release slow.
+            // Attack fast, release moderately fast (bars can reach zero).
             if target > *bin {
                 *bin = target;
             } else {
-                *bin = (*bin - target).mul_add(0.25, target);
+                *bin = (*bin - target).mul_add(0.45, target);
             }
             let peak = &mut self.peaks[i];
             if *bin >= *peak {

@@ -25,11 +25,12 @@ impl Widget for Spectrum<'_> {
             return;
         }
         let n = self.values.len();
-        let bar_height = area.height as f32;
+        // 16 levels across `area.height` rows (each row = 8 eighth-blocks).
+        let total_levels = area.height as f32 * 8.0;
 
         for col in 0..area.width {
-            // Map each column to a value; wide terminals spread values out
-            // by interpolating between bins.
+            // Map each column to a bin; more columns → more bars, not
+            // stretched ones (bins repeat only when the panel is very wide).
             let idx = (col as usize * n / area.width as usize).min(n - 1);
             let value = self.values[idx].clamp(0.0, 1.0);
             let peak = self
@@ -42,30 +43,35 @@ impl Widget for Spectrum<'_> {
             let x = area.x + col;
             let color = (self.color_for)(idx, n);
 
-            // Bar: fill rows from the bottom; the top cell is partial for the
-            // fractional remainder.
-            let filled = (value * bar_height).floor() as u16;
+            // Bar height in 1/8 blocks, from the bottom. A zero bar draws
+            // nothing, so the row can go fully blank.
+            let levels = (value * total_levels).round() as u16;
             for row in 0..area.height {
                 let y = area.y + area.height - 1 - row;
                 let cell = &mut buf[(x, y)];
-                if row < filled {
-                    cell.set_symbol(&EIGHTHS[7].to_string());
-                    cell.set_fg(color);
-                } else if row == filled && value > 0.0 {
-                    let frac = value * bar_height - filled as f32;
-                    if frac > 0.0 {
-                        let eighth = ((frac * 8.0).round() as usize).clamp(1, 8) - 1;
-                        cell.set_symbol(&EIGHTHS[eighth].to_string());
-                        cell.set_fg(color);
-                    }
+                // This row covers eighth-levels [row*8, row*8+8) from bottom.
+                let lo = row * 8;
+                let filled_here = levels.saturating_sub(lo).min(8);
+                if filled_here == 0 {
+                    continue;
                 }
+                let symbol = if filled_here >= 8 {
+                    EIGHTHS[7]
+                } else {
+                    EIGHTHS[(filled_here - 1) as usize]
+                };
+                cell.set_symbol(&symbol.to_string());
+                cell.set_fg(color);
             }
 
-            // Peak cap: at or above the bar's top, accent-colored.
-            if peak > 0.0 {
-                let cap_filled = (peak * bar_height).round() as u16;
-                if cap_filled >= filled {
-                    let y = area.y + area.height.saturating_sub(cap_filled.max(1));
+            // Peak cap: a single accent cell floating just above the bar.
+            // Only drawn when the peak clears the bar top, so low bars can
+            // drop to zero without a stray block.
+            let cap_levels = (peak * total_levels).round() as u16;
+            if cap_levels > levels {
+                let cap_row = (cap_levels - 1) / 8;
+                if cap_row < area.height {
+                    let y = area.y + area.height - 1 - cap_row;
                     let cell = &mut buf[(x, y)];
                     cell.set_symbol(&EIGHTHS[7].to_string());
                     cell.set_fg(self.peak_color);

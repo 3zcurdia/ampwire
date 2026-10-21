@@ -4,16 +4,17 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
 use crate::action::{Action, Scope};
 use crate::app::App;
+use crate::keymap::Keymap;
 use crate::ui::chrome;
 use crate::ui::layout::Panel;
-use crate::ui::theme::Role;
 use crate::ui::theme::glyphs;
+use crate::ui::theme::{Role, Theme};
 
 /// Format a track total as `h:mm:ss` / `m:ss`.
 pub fn format_duration(secs: u64) -> String {
@@ -26,49 +27,116 @@ pub fn scroll_for(cursor: usize, height: usize) -> usize {
     cursor.saturating_sub(height.saturating_sub(1))
 }
 
+/// Build the playlist bottom-border line: key hints, then an optional notice
+/// (truncated by display width with `…`, first line only), then the track
+/// count and total time. `width` is the available inner border width; the
+/// count and total are never dropped, the notice is truncated first.
+fn playlist_bottom_border<'a>(
+    theme: &'a Theme,
+    keymap: &'a Keymap,
+    notice: Option<&'a str>,
+    totals: &'a str,
+    width: usize,
+) -> Line<'a> {
+    let muted = Style::default().fg(theme.color(Role::Muted));
+    let mut spans: Vec<Span<'a>> = Vec::new();
+
+    // Hints: ` a add ─ d del ─ / find `.
+    let hints: [(Action, &str); 3] = [
+        (Action::Add, "add"),
+        (Action::Del, "del"),
+        (Action::Find, "find"),
+    ];
+    for (i, (action, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" ─ ", muted));
+        }
+        let key = keymap.hint(*action).unwrap_or_default();
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default().fg(theme.color(Role::Accent)),
+        ));
+        spans.push(Span::styled((*label).to_string(), muted));
+    }
+
+    // The fixed tail: `── <totals> ─`, reserved so it always fits.
+    let totals_tail: Vec<Span<'a>> = vec![
+        Span::styled(" ── ", muted),
+        Span::styled(
+            totals.to_string(),
+            Style::default().fg(theme.color(Role::Fg)),
+        ),
+        Span::styled(" ─", muted),
+    ];
+    let tail_width: usize = totals_tail.iter().map(|s| s.content.width()).sum();
+
+    if let Some(notice) = notice {
+        // Collapse multi-line TOML errors to their first line.
+        let first_line = notice.lines().next().unwrap_or(notice);
+        let head_width: usize = spans.iter().map(|s| s.content.width()).sum();
+        let available = width
+            .saturating_sub(head_width)
+            .saturating_sub(tail_width)
+            .saturating_sub(4); // `── ` + ` ─` separators around the notice
+        if available >= 4 {
+            let truncated = truncate_ellipsis(first_line, available);
+            spans.push(Span::styled(" ── ", muted));
+            spans.push(Span::styled(
+                format!(" {truncated} "),
+                Style::default().fg(theme.color(Role::Warn)),
+            ));
+        }
+        // If there's no room at all, drop the notice — the totals win.
+    }
+
+    spans.extend(totals_tail);
+    Line::from(spans)
+}
+
+/// Truncate `text` to at most `width` display columns, appending `…` when it
+/// had to cut. Never splits a character.
+fn truncate_ellipsis(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1); // room for the ellipsis
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in text.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let theme = &app.theme;
     let keymap = &app.keymap;
     let snapshot = app.snapshot();
     let focused = app.ui.focus == Scope::Playlist;
-    let notice = app.ui.notice.clone();
 
     let total_secs: u64 = snapshot.tracks.iter().map(|t| t.duration.as_secs()).sum();
-    let status = Span::styled(
-        format!(
-            " {} · {} ",
-            snapshot.tracks.len(),
-            format_duration(total_secs)
-        ),
-        Style::default().fg(theme.color(Role::Fg)),
+    let totals = format!(
+        "{} · {}",
+        snapshot.tracks.len(),
+        format_duration(total_secs)
     );
-    let bottom = chrome::hint_line(
-        &[
-            (Action::Add, "add"),
-            (Action::Del, "del"),
-            (Action::Find, "find"),
-        ],
+    // Layout: `─ a add ─ d del ─ / find ── <notice…> ── 24 · 1:56:43 ─`.
+    // The count and total always survive; the notice is truncated first, and
+    // multi-line TOML errors collapse to their first line.
+    let bottom = playlist_bottom_border(
         theme,
         keymap,
-        notice.as_deref().map(|n| {
-            Span::styled(
-                format!(" {n} "),
-                Style::default().fg(theme.color(Role::Warn)),
-            )
-        }),
+        app.ui.notice.as_deref(),
+        &totals,
+        area.width.saturating_sub(2) as usize,
     );
-    // Append the totals after the hints.
-    let bottom = if notice.is_some() {
-        bottom
-    } else {
-        let mut line = bottom;
-        line.spans.push(Span::styled(
-            " ─ ",
-            Style::default().fg(theme.color(Role::Muted)),
-        ));
-        line.spans.push(status);
-        line
-    };
 
     let block = chrome::panel_block(Panel::Playlist, focused, theme, keymap, Some(bottom));
     let inner = block.inner(area);
@@ -268,5 +336,66 @@ mod tests {
         render(&app, area, &mut buf);
         // No cell outside the buffer was touched (would have panicked).
         assert_eq!(buf[(0, 0)].symbol(), "╭");
+    }
+
+    /// Flatten the bottom-border row of a rendered playlist.
+    fn bottom_border(app: &App, width: u16) -> String {
+        let area = Rect::new(0, 0, width, 18);
+        let mut buf = Buffer::empty(area);
+        render(app, area, &mut buf);
+        let y = 17; // last row = bottom border
+        (0..width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn notice_keeps_track_count_and_total() {
+        let mut app = test_app();
+        app.ui.notice = Some("config invalid — not saving".into());
+        let border = bottom_border(&app, 104);
+        // The count and total time must survive.
+        assert!(border.contains("24"), "count kept: {border}");
+        assert!(border.contains("1:56:43"), "total kept: {border}");
+        // The notice appears, truncated by width if needed.
+        assert!(border.contains("config invalid"), "notice shown: {border}");
+    }
+
+    #[test]
+    fn multiline_notice_collapses_to_first_line() {
+        let mut app = test_app();
+        app.ui.notice = Some("config invalid — not saving\n  extra detail line".into());
+        let border = bottom_border(&app, 104);
+        assert!(border.contains("config invalid"), "{border}");
+        assert!(
+            !border.contains("extra detail"),
+            "second line dropped: {border}"
+        );
+        assert!(border.contains("24"), "count kept: {border}");
+    }
+
+    #[test]
+    fn long_notice_is_truncated_totals_survive() {
+        let mut app = test_app();
+        app.ui.notice = Some("x".repeat(400));
+        // Wide panel: the notice fits but must be truncated with an ellipsis.
+        let border = bottom_border(&app, 104);
+        assert!(border.contains("24"), "count kept: {border}");
+        assert!(border.contains("1:56:43"), "total kept: {border}");
+        assert!(border.contains('…'), "notice truncated: {border}");
+        assert!(
+            !border.contains(&"x".repeat(100)),
+            "notice capped: {border}"
+        );
+
+        // Narrow panel: no room for the notice at all → it is dropped, but
+        // the count and total still win the space.
+        let narrow = bottom_border(&app, 52);
+        assert!(
+            narrow.contains("24"),
+            "count kept when notice dropped: {narrow}"
+        );
+        assert!(narrow.contains("1:56:43"), "total kept: {narrow}");
+        assert!(!narrow.contains('…'), "no room → notice omitted: {narrow}");
     }
 }

@@ -44,27 +44,29 @@ pub enum ColorDepth {
 
 impl ColorDepth {
     /// Detect from the environment; defaults to TrueColor when unknown.
+    /// Detect from the environment. Truecolor is claimed only when `COLORTERM`
+    /// is `truecolor` or `24bit`; an unset `COLORTERM` degrades to 256 colors
+    /// (never pretends to truecolor it can't prove).
     pub fn detect() -> Self {
-        let colorterm = std::env::var("COLORTERM")
-            .unwrap_or_default()
-            .to_lowercase();
+        Self::detect_from(
+            &std::env::var("COLORTERM").unwrap_or_default(),
+            &std::env::var("TERM").unwrap_or_default(),
+        )
+    }
+
+    /// Pure core of [`detect`](Self::detect), split out so it is testable.
+    pub fn detect_from(colorterm: &str, term: &str) -> Self {
+        let colorterm = colorterm.to_lowercase();
+        let term = term.to_lowercase();
         if colorterm.contains("truecolor") || colorterm.contains("24bit") {
             return ColorDepth::TrueColor;
         }
-        let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
-        if term.contains("truecolor") {
-            return ColorDepth::TrueColor;
-        }
+        // COLORTERM is unset or unhelpful: 16-color terminals are detected by
+        // TERM, everything else gets a safe 256-color mapping.
         if term.contains("16color") || term == "linux" || term.ends_with("-mono") {
             return ColorDepth::Ansi16;
         }
-        // COLORTERM unset and TERM says nothing useful: assume truecolor
-        // (modern terminals) rather than degrading colors.
-        if term.contains("color") {
-            ColorDepth::Ansi256
-        } else {
-            ColorDepth::TrueColor
-        }
+        ColorDepth::Ansi256
     }
 }
 
@@ -544,5 +546,21 @@ mod tests {
     #[test]
     fn color_depth_detection_does_not_panic() {
         let _ = ColorDepth::detect();
+    }
+
+    #[test]
+    fn truecolor_only_from_colorterm() {
+        use ColorDepth::*;
+        let detect = ColorDepth::detect_from;
+        // COLORTERM proves truecolor.
+        assert_eq!(detect("truecolor", "xterm-256color"), TrueColor);
+        assert_eq!(detect("24bit", "xterm-256color"), TrueColor);
+        // Unset COLORTERM degrades to 256 even with a modern TERM.
+        assert_eq!(detect("", "xterm-256color"), Ansi256);
+        assert_eq!(detect("", "xterm-truecolor"), Ansi256);
+        assert_eq!(detect("", "alacritty"), Ansi256);
+        // 16-color terminals are still detected by TERM.
+        assert_eq!(detect("", "xterm-16color"), Ansi16);
+        assert_eq!(detect("", "linux"), Ansi16);
     }
 }

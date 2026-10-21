@@ -10,18 +10,22 @@ pub mod theme;
 pub mod widgets;
 
 use ratatui::Frame;
+use ratatui::style::Color;
 
 use crate::app::App;
+use crate::ui::theme::Role;
 
 /// Draw one frame.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let computed = app.compute_layout(area);
 
+    // When the theme sets a real `bg` (transparent = false), paint it across
+    // the whole frame first so every panel sits on it.
+    paint_background(frame, app);
+
     if computed.too_small {
         let theme = &app.theme;
-        // Wipe to bg first so the message stands alone.
-        frame.render_widget(ratatui::widgets::Clear, area);
         chrome::render_too_small(area, frame.buffer_mut(), theme);
         return;
     }
@@ -41,6 +45,25 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 }
 
+/// Fill the frame with the theme's `bg` role when it is an opaque color.
+/// `Color::Reset` (the transparent default) is skipped so the terminal's own
+/// background shows through.
+fn paint_background(frame: &mut Frame, app: &App) {
+    let bg = app.theme.color(Role::Bg);
+    if matches!(bg, Color::Reset) {
+        return;
+    }
+    let area = frame.area();
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(bg);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +73,7 @@ mod tests {
     use crate::ui::theme::{self, Role};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn render_frame(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(w, h);
@@ -136,6 +160,44 @@ mod tests {
             .map(|c| c.symbol().to_string())
             .collect();
         assert!(text.contains("key help"));
+    }
+
+    #[test]
+    fn transparent_theme_leaves_bg_reset() {
+        // neon's bg is Reset → panel cells keep the terminal background. The
+        // playlist cursor row is the one place a bg tint is drawn, so check a
+        // player-panel border cell instead.
+        let app = App::new(Config::default(), Keymap::defaults(), theme::neon(), false);
+        let buf = render_frame(&app, 104, 18);
+        let neon = theme::neon();
+        // Player top-left corner (a border cell, never specially tinted).
+        assert_eq!(
+            buf.cell((0, 0)).unwrap().bg,
+            neon.color(Role::Bg),
+            "transparent keeps the corner bg as Reset"
+        );
+        // A player interior cell too.
+        assert_eq!(buf.cell((5, 2)).unwrap().bg, neon.color(Role::Bg));
+    }
+
+    #[test]
+    fn opaque_theme_paints_bg_on_every_panel() {
+        // With a real bg, panel cells are painted with it. The playlist cursor
+        // row keeps its own muted tint, so assert on the player and eq panels.
+        let bg = Color::Rgb(18, 18, 28);
+        let mut opaque = theme::neon();
+        opaque.override_role(Role::Bg, bg);
+        let app = App::new(Config::default(), Keymap::defaults(), opaque, false);
+        let buf = render_frame(&app, 104, 18);
+        // Player panel: border and interior.
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, bg, "player border painted");
+        assert_eq!(buf.cell((5, 2)).unwrap().bg, bg, "player interior painted");
+        // EQ panel (starts at y=9): border and interior.
+        assert_eq!(buf.cell((0, 9)).unwrap().bg, bg, "eq border painted");
+        assert_eq!(buf.cell((5, 12)).unwrap().bg, bg, "eq interior painted");
+        // Playlist panel (right column): a non-cursor row (cursor is on the
+        // first track at y=1; y=5 is a plain row).
+        assert_eq!(buf.cell((60, 5)).unwrap().bg, bg, "playlist painted");
     }
 }
 

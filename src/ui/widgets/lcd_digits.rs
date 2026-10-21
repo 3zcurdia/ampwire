@@ -1,56 +1,56 @@
-//! 2-row half-block LCD time digits, Winamp-style.
+//! 2-row LCD time digits, Winamp-style.
 //!
-//! Each digit is a 2×4 sub-cell grid rendered with half blocks: the top row
-//! of each terminal line uses `▀`, the bottom `▄`, `█` for both, space for
-//! neither. A colon is one column wide.
+//! Each digit is a 3-column, 2-row glyph (`"█▀▀"` over `"▄▄█"` etc). Glyphs
+//! are separated by one blank column; the colon is a single column. Digits 0–3
+//! and the colon match the plan §2.3 mockup; 4–9 follow the same style.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::widgets::Widget;
 
-/// 2 columns × 4 sub-rows per digit, top-left first.
-const DIGITS: [[u8; 8]; 10] = [
-    // 0
-    [1, 1, 1, 0, 1, 0, 1, 1],
-    // 1
-    [0, 1, 1, 1, 0, 1, 1, 1],
-    // 2
-    [1, 1, 0, 1, 1, 1, 1, 0],
-    // 3
-    [1, 1, 0, 1, 1, 1, 0, 1],
-    // 4
-    [1, 0, 1, 1, 1, 1, 0, 1],
-    // 5
-    [1, 1, 1, 0, 1, 1, 0, 1],
-    // 6
-    [1, 1, 1, 0, 1, 1, 1, 1],
-    // 7
-    [1, 1, 0, 1, 0, 1, 0, 1],
-    // 8
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    // 9
-    [1, 1, 1, 1, 1, 1, 0, 1],
+/// Top and bottom row of each digit 0–9. Every glyph is 3 columns wide.
+const DIGITS: [(&str, &str); 10] = [
+    ("█▀█", "█▄█"), // 0
+    ("▀█ ", "▄█▄"), // 1
+    ("▀▀█", "█▄▄"), // 2
+    ("▀▀█", "▄▄█"), // 3
+    ("█ █", "▀▀█"), // 4
+    ("█▀▀", "▄▄█"), // 5
+    ("█▀▀", "█▄█"), // 6
+    ("▀▀█", "  █"), // 7
+    ("█▀█", "█▀█"), // 8
+    ("█▀█", "▀▀█"), // 9
 ];
 
-/// Colon: 1 column × 4 sub-rows, lit at rows 1 and 2.
-const COLON: [u8; 4] = [0, 1, 1, 0];
+/// Colon: 1 column wide, lit on both rows (a half-block dot each).
+const COLON: (&str, &str) = ("▄", "▄");
 
-/// Width in columns of an LCD string (`"1:23"` → 2+1+2+2 = 7... digits 2 wide, colon 1).
+/// Width in columns of an LCD string, including one blank column between
+/// glyphs. Digits are 3 wide, the colon 1.
 pub fn lcd_width(text: &str) -> u16 {
-    text.chars()
-        .map(|c| if c == ':' || c == '.' { 1 } else { 2 })
-        .sum()
+    let mut width = 0u16;
+    let mut glyphs = 0u16;
+    for c in text.chars() {
+        width += match c {
+            ':' | '.' => 1,
+            ' ' => 1,
+            _ => 3,
+        };
+        glyphs += 1;
+    }
+    // One blank column between each pair of glyphs.
+    width + glyphs.saturating_sub(1)
 }
 
-/// Renders `text` (`"1:23"`, `"1:23:45"` with `.` separators allowed) as
-/// 2-row half-block digits. Non-digit, non-separator chars render blank.
+/// Renders `text` (`"1:23"`, `"12:34"`) as 2-row LCD digits.
 pub struct LcdDigits<'a> {
     pub text: &'a str,
+    /// Lit segments (playing). Digits use the `primary` role.
     pub color: Color,
-    /// Unlit segments use this color (blink effect: pass `muted` while paused).
+    /// Unlit segments: the pause-blink off phase, in `muted`.
     pub dim: Color,
-    /// When false, every segment renders unlit (blink off-phase).
+    /// When false every segment renders in `dim` (blink off phase).
     pub lit: bool,
 }
 
@@ -59,48 +59,41 @@ impl Widget for LcdDigits<'_> {
         if area.height < 2 {
             return;
         }
-        let half = |top: u8, bottom: u8| match (top == 1, bottom == 1) {
-            (true, true) => '█',
-            (true, false) => '▀',
-            (false, true) => '▄',
-            (false, false) => ' ',
-        };
+        let fg = if self.lit { self.color } else { self.dim };
         let mut x = area.x;
+        let right = area.x + area.width;
+
         for c in self.text.chars() {
-            if x + 2 > area.x + area.width {
+            let (top, bottom): (&str, &str) = match c {
+                '0'..='9' => DIGITS[(c as u8 - b'0') as usize],
+                ':' | '.' => COLON,
+                ' ' => {
+                    x += 2; // one blank glyph + its separator
+                    continue;
+                }
+                _ => {
+                    x += 4; // unknown: blank glyph + separator
+                    continue;
+                }
+            };
+            let width = top.chars().count() as u16;
+            if x + width > right {
                 break;
             }
-            let fg = if self.lit { self.color } else { self.dim };
-            match c {
-                '0'..='9' => {
-                    let grid = &DIGITS[(c as u8 - b'0') as usize];
-                    for terminal_row in 0..2u16 {
-                        let top = terminal_row * 2;
-                        let bottom = top + 1;
-                        for col in 0..2u16 {
-                            let idx = (top * 2 + col) as usize;
-                            let idx2 = (bottom * 2 + col) as usize;
-                            let cell = &mut buf[(x + col, area.y + terminal_row)];
-                            cell.set_symbol(&half(grid[idx], grid[idx2]).to_string());
-                            cell.set_fg(fg);
-                        }
-                    }
-                    x += 2;
-                }
-                ':' | '.' => {
-                    // Lit at sub-rows 1 and 2 → '▀' over '▄'.
-                    for terminal_row in 0..2usize {
-                        let top = COLON[terminal_row * 2];
-                        let bottom = COLON[terminal_row * 2 + 1];
-                        let cell = &mut buf[(x, area.y + terminal_row as u16)];
-                        cell.set_symbol(&half(top, bottom).to_string());
-                        cell.set_fg(fg);
-                    }
-                    x += 1;
-                }
-                ' ' => x += 1,
-                _ => x += 2, // unknown: blank advance
-            }
+            write_row(buf, x, area.y, top, fg);
+            write_row(buf, x, area.y + 1, bottom, fg);
+            x += width + 1; // glyph + one blank column
+        }
+    }
+}
+
+/// Write one 1-row glyph string starting at (x, y), clipped to the buffer.
+fn write_row(buf: &mut Buffer, x: u16, y: u16, glyphs: &str, fg: Color) {
+    for (i, c) in glyphs.chars().enumerate() {
+        let cx = x + i as u16;
+        if let Some(cell) = buf.cell_mut((cx, y)) {
+            cell.set_symbol(&c.to_string());
+            cell.set_fg(fg);
         }
     }
 }
@@ -109,14 +102,17 @@ impl Widget for LcdDigits<'_> {
 mod tests {
     use super::*;
 
-    fn render_text(text: &str) -> Vec<String> {
+    const ORANGE: Color = Color::Rgb(255, 106, 0);
+    const MUTED: Color = Color::Rgb(122, 58, 16);
+
+    fn render_text(text: &str, lit: bool) -> Vec<String> {
         let area = Rect::new(0, 0, lcd_width(text), 2);
         let mut buf = Buffer::empty(area);
         LcdDigits {
             text,
-            color: Color::Rgb(255, 106, 0),
-            dim: Color::Rgb(122, 58, 16),
-            lit: true,
+            color: ORANGE,
+            dim: MUTED,
+            lit,
         }
         .render(area, &mut buf);
         (0..2)
@@ -129,48 +125,79 @@ mod tests {
     }
 
     #[test]
-    fn width_counts() {
-        assert_eq!(lcd_width("1:23"), 7);
-        assert_eq!(lcd_width("12:34"), 9);
-        assert_eq!(lcd_width("0:00"), 7);
+    fn width_includes_separators() {
+        // "1:23" = 3 + 1 + 1 + 3 + 3 glyphs widths (10) + 3 separators = 13.
+        assert_eq!(lcd_width("1:23"), 13);
+        // "12:34" = 3+3+1+3+3 = 13 + 4 separators = 17.
+        assert_eq!(lcd_width("12:34"), 17);
+        assert_eq!(lcd_width("0"), 3);
     }
 
     #[test]
-    fn digits_render_two_rows() {
-        let rows = render_text("1:23");
-        assert_eq!(rows.len(), 2);
-        // All rows fit the width.
-        for row in &rows {
-            assert_eq!(row.chars().count() as u16, lcd_width("1:23"));
+    fn all_ten_glyphs_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for (top, bottom) in DIGITS {
+            let glyph = format!("{top}|{bottom}");
+            assert!(seen.insert(glyph.clone()), "duplicate digit glyph: {glyph}");
+        }
+        assert_eq!(seen.len(), 10);
+        // Every glyph is 3 columns wide.
+        for (top, bottom) in DIGITS {
+            assert_eq!(top.chars().count(), 3, "{top}");
+            assert_eq!(bottom.chars().count(), 3, "{bottom}");
         }
     }
 
     #[test]
-    fn unlit_renders_blanks() {
-        let area = Rect::new(0, 0, lcd_width("8"), 2);
+    fn digits_match_the_plan_mockup() {
+        // 0–3 and the colon are copied from the plan §2.3 mockup. Digit 1 is
+        // "▀█ " (padded), so a separator after it yields two spaces.
+        let rows = render_text("0123", true);
+        assert_eq!(rows[0], "█▀█ ▀█  ▀▀█ ▀▀█");
+        assert_eq!(rows[1], "█▄█ ▄█▄ █▄▄ ▄▄█");
+        let colon = render_text(":", true);
+        assert_eq!(colon[0], "▄");
+        assert_eq!(colon[1], "▄");
+    }
+
+    #[test]
+    fn lit_uses_primary_unlit_uses_muted() {
+        // Blink phases share glyphs but differ in color, so compare the color
+        // of a lit segment.
+        let area = Rect::new(0, 0, lcd_width("1"), 2);
         let mut buf = Buffer::empty(area);
         LcdDigits {
-            text: "8",
-            color: Color::Rgb(255, 106, 0),
-            dim: Color::Rgb(122, 58, 16),
+            text: "1",
+            color: ORANGE,
+            dim: MUTED,
+            lit: true,
+        }
+        .render(area, &mut buf);
+        assert_eq!(buf.cell((1, 0)).unwrap().fg, ORANGE, "lit → primary");
+
+        let mut buf = Buffer::empty(area);
+        LcdDigits {
+            text: "1",
+            color: ORANGE,
+            dim: MUTED,
             lit: false,
         }
         .render(area, &mut buf);
-        for y in 0..area.height {
-            for x in 0..area.width {
-                let cell = buf.cell((x, y)).unwrap();
-                assert!(
-                    cell.symbol() == " " || cell.fg == Color::Rgb(122, 58, 16),
-                    "unlit segment must not use the lit color"
-                );
-            }
-        }
+        assert_eq!(buf.cell((1, 0)).unwrap().fg, MUTED, "unlit → muted");
     }
 
     #[test]
-    fn eight_fills_both_columns() {
-        let rows = render_text("8");
-        // Digit 8 is fully lit: top line all '█', bottom line all '█'.
-        assert!(rows[0].contains('█') && rows[1].contains('█'));
+    fn too_narrow_renders_nothing_rather_than_panicking() {
+        let area = Rect::new(0, 0, 2, 2);
+        let mut buf = Buffer::empty(area);
+        LcdDigits {
+            text: "12:34",
+            color: ORANGE,
+            dim: MUTED,
+            lit: true,
+        }
+        .render(area, &mut buf);
+        // A 3-wide digit doesn't fit in 2 columns, so nothing is drawn.
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), " ");
     }
 }

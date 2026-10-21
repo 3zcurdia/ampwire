@@ -1,4 +1,6 @@
 //! `?` key-help overlay, generated from the live keymap so remaps show up.
+//! Sized to fit the terminal; when the entries don't fit, `↑`/`↓` scroll it
+//! so no entry is ever silently cut.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -12,12 +14,27 @@ use crate::ui::theme::{Role, Theme};
 
 const WIDTH: u16 = 62;
 
-/// Render the help overlay centered over `full_area`.
+/// Render the help overlay centered over `full_area`, showing the window of
+/// entries starting at `app.ui.help_scroll`.
 pub fn render(app: &App, full_area: Rect, buf: &mut Buffer) {
     let theme = &app.theme;
-    let area = centered(full_area, WIDTH, entry_count() as u16 + 4);
+    let rows = build_lines(app, theme);
+    // Fit the overlay to the terminal: as tall as the content, but never
+    // taller than the screen minus a row of margin.
+    let wanted = rows.len() as u16 + 4; // +4 borders/title/footer
+    let height = wanted.min(full_area.height.saturating_sub(1)).max(3);
+    let area = centered(full_area, WIDTH, height);
+    if area.height < 3 || area.width < 3 {
+        return;
+    }
     Clear.render(area, buf);
 
+    let scrollable = rows.len() as u16 > area.height.saturating_sub(3);
+    let footer = if scrollable {
+        " ↑↓ scroll · ?/esc close "
+    } else {
+        " ? or esc to close "
+    };
     let block = Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -27,7 +44,7 @@ pub fn render(app: &App, full_area: Rect, buf: &mut Buffer) {
             Style::default().fg(theme.color(Role::Glow)),
         )]))
         .title_bottom(Line::from(Span::styled(
-            " ? or esc to close ",
+            footer,
             Style::default().fg(theme.color(Role::Muted)),
         )));
     let inner = block.inner(area);
@@ -36,8 +53,16 @@ pub fn render(app: &App, full_area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let rows: Vec<Line> = build_lines(app, theme);
-    for (i, line) in rows.iter().take(inner.height as usize).enumerate() {
+    // Window the entries by the scroll offset, clamped so the last page is
+    // flush (no blank gap that would hide entries).
+    let max_scroll = rows.len().saturating_sub(inner.height as usize);
+    let scroll = app.ui.help_scroll.min(max_scroll);
+    for (i, line) in rows
+        .iter()
+        .skip(scroll)
+        .take(inner.height as usize)
+        .enumerate()
+    {
         line.render(
             Rect {
                 x: inner.x,
@@ -50,8 +75,9 @@ pub fn render(app: &App, full_area: Rect, buf: &mut Buffer) {
     }
 }
 
-fn entry_count() -> usize {
-    Action::all().len()
+/// Total help lines, so the key handler can clamp the scroll offset.
+pub fn line_count(app: &App) -> usize {
+    build_lines(app, &app.theme).len()
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -166,5 +192,77 @@ mod tests {
             .map(|s| s.content.to_string())
             .collect();
         assert!(text.contains('n'), "remapped key shows: {text}");
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::keymap::Keymap;
+    use crate::ui::theme;
+
+    fn press(code: ratatui::crossterm::event::KeyCode) -> ratatui::crossterm::event::KeyEvent {
+        ratatui::crossterm::event::KeyEvent::new(
+            code,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        )
+    }
+
+    #[test]
+    fn overlay_scrolls_and_nothing_is_cut_at_80x24() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(Config::default(), Keymap::defaults(), theme::neon(), false);
+        app.dispatch(crate::action::Action::Help);
+
+        // Collect the description text visible at each scroll position.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    render(&app, area, f.buffer_mut());
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let text: String = buf
+                .content()
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .collect();
+            // Every action whose description appears in the overlay is seen.
+            for action in Action::all() {
+                if text.contains(action.description()) {
+                    seen.insert(action.description().to_string());
+                }
+            }
+            app.handle_key(press(ratatui::crossterm::event::KeyCode::Down));
+        }
+        // Every action description must be reachable by scrolling.
+        for action in Action::all() {
+            assert!(
+                seen.contains(action.description()),
+                "entry never visible at 80×24: {}",
+                action.description()
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_down_then_up_returns_to_top() {
+        let mut app = App::new(Config::default(), Keymap::defaults(), theme::neon(), false);
+        app.dispatch(crate::action::Action::Help);
+        assert_eq!(app.ui.help_scroll, 0);
+        app.handle_key(press(ratatui::crossterm::event::KeyCode::Down));
+        app.handle_key(press(ratatui::crossterm::event::KeyCode::Down));
+        assert_eq!(app.ui.help_scroll, 2);
+        app.handle_key(press(ratatui::crossterm::event::KeyCode::Up));
+        app.handle_key(press(ratatui::crossterm::event::KeyCode::Up));
+        assert_eq!(app.ui.help_scroll, 0, "up clamps at the top");
+        app.handle_key(press(ratatui::crossterm::event::KeyCode::Up));
+        assert_eq!(app.ui.help_scroll, 0);
     }
 }
