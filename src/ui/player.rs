@@ -506,7 +506,7 @@ mod tests {
         // Pause the mock via dispatch.
         app.dispatch(crate::action::Action::Pause);
         assert_eq!(app.snapshot().state, PlayState::Paused);
-        app.tick();
+        app.tick(std::time::Duration::from_millis(500));
         // After tick the blink phase flipped; digits still render (either
         // lit or unlit) — just ensure no panic and time area is stable.
         let area = Rect::new(0, 0, 52, 9);

@@ -35,30 +35,39 @@ impl Key {
         Self { code, modifiers }
     }
 
-    /// Parse a config key spec: `"z"`, `"space"`, `"shift+l"`, `"ctrl+t"`.
-    /// A lone `+` is the plus key, not a modifier prefix.
+    /// Parse a config key spec: `"z"`, `"L"` (= Shift+L), `"space"`,
+    /// `"shift+l"`, `"ctrl+t"`. A lone `+` is the plus key, not a modifier
+    /// prefix. An uppercase letter with no explicit modifier implies Shift.
     pub fn parse(spec: &str) -> Result<Self, String> {
-        let spec = spec.trim().to_ascii_lowercase();
+        let spec = spec.trim();
         let mut modifiers = KeyModifiers::NONE;
-        let mut code_part = spec.as_str();
+        let mut code_part = spec;
 
-        // Only split on '+' when a modifier name precedes it.
+        // Only split on '+' when a modifier name precedes it. Modifier names
+        // are matched case-insensitively.
         if let Some((prefix, rest)) = code_part.split_once('+')
             && !prefix.is_empty()
             && !rest.is_empty()
             && !rest.starts_with('+')
+            && matches!(
+                prefix.to_ascii_lowercase().as_str(),
+                "shift" | "ctrl" | "control" | "alt"
+            )
         {
             let mut parts = vec![prefix];
             let mut remaining = rest;
             while let Some((prefix, rest)) = remaining.split_once('+')
                 && !prefix.is_empty()
-                && matches!(prefix, "shift" | "ctrl" | "control" | "alt")
+                && matches!(
+                    prefix.to_ascii_lowercase().as_str(),
+                    "shift" | "ctrl" | "control" | "alt"
+                )
             {
                 parts.push(prefix);
                 remaining = rest;
             }
             for prefix in parts {
-                match prefix {
+                match prefix.to_ascii_lowercase().as_str() {
                     "shift" => modifiers |= KeyModifiers::SHIFT,
                     "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
                     "alt" => modifiers |= KeyModifiers::ALT,
@@ -71,7 +80,9 @@ impl Key {
             return Err(format!("empty key code in key spec `{spec}`"));
         }
 
-        let code = match code_part {
+        // Named keys are case-insensitive; match on the lowercased form.
+        let named = code_part.to_ascii_lowercase();
+        let code = match named.as_str() {
             "space" => KeyCode::Char(' '),
             "enter" | "return" => KeyCode::Enter,
             "esc" | "escape" => KeyCode::Esc,
@@ -92,8 +103,20 @@ impl Key {
             "f3" => KeyCode::F(3),
             "f4" => KeyCode::F(4),
             "f5" => KeyCode::F(5),
-            s if s.chars().count() == 1 => KeyCode::Char(s.chars().next().unwrap()),
-            _ => return Err(format!("unknown key in key spec `{spec}`")),
+            _ => {
+                // A single character. An uppercase letter implies Shift, so
+                // `"L"` means Shift+L (and its code is the lowercase letter,
+                // matching how terminals report it).
+                let mut chars = code_part.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) if c.is_ascii_uppercase() => {
+                        modifiers |= KeyModifiers::SHIFT;
+                        KeyCode::Char(c.to_ascii_lowercase())
+                    }
+                    (Some(c), None) => KeyCode::Char(c),
+                    _ => return Err(format!("unknown key in key spec `{spec}`")),
+                }
+            }
         };
         Ok(Self::new(code, modifiers))
     }
@@ -266,21 +289,27 @@ impl Keymap {
     /// Build a keymap from `[keys]` config overrides.
     ///
     /// Spec syntax is `"key"` (bound in the action's own scope) or
-    /// `"scope:key"` (e.g. `"global:+"`). Conflicts within one scope keep the
-    /// defaults for the conflicting actions and are reported as strings.
+    /// `"scope:key"` (e.g. `"global:+"`). Overrides are applied in sorted
+    /// action-name order so the result is deterministic. Then conflicts are
+    /// detected against the *final* map: any key bound to two different
+    /// actions in one scope reverts **every** action involved back to its
+    /// defaults, and each such revert is reported.
     pub fn from_overrides(overrides: &HashMap<String, Vec<String>>) -> (Self, Vec<String>) {
-        let mut bindings = defaults();
-        let mut conflicts = Vec::new();
+        let mut messages = Vec::new();
 
-        for (name, specs) in overrides {
+        // 1. Parse each override, in sorted action-name order.
+        let mut names: Vec<&String> = overrides.keys().collect();
+        names.sort();
+        let mut parsed: Vec<(Action, Vec<(Scope, Key)>)> = Vec::new();
+        for name in names {
+            let specs = &overrides[name];
             let Some(action) = action_by_name(name) else {
-                conflicts.push(format!("unknown action `{name}` in [keys], ignored"));
+                messages.push(format!("unknown action `{name}` in [keys], ignored"));
                 continue;
             };
             let primary_scope = action.scope();
-            let mut new_bindings = Vec::new();
-            let mut bad_spec = false;
-
+            let mut keys = Vec::new();
+            let mut bad = false;
             for spec in specs {
                 let (scope, key_spec) = match spec.split_once(':') {
                     Some((scope_name, key_spec)) => match scope_name {
@@ -289,60 +318,109 @@ impl Keymap {
                         "eq" => (Scope::Eq, key_spec),
                         "playlist" => (Scope::Playlist, key_spec),
                         _ => {
-                            conflicts.push(format!("unknown scope `{scope_name}` in `{spec}`"));
-                            bad_spec = true;
+                            messages.push(format!("unknown scope `{scope_name}` in `{spec}`"));
+                            bad = true;
                             continue;
                         }
                     },
                     None => (primary_scope, spec.as_str()),
                 };
                 match Key::parse(key_spec) {
-                    Ok(key) => new_bindings.push((scope, key, action)),
+                    Ok(key) => keys.push((scope, key)),
                     Err(err) => {
-                        conflicts.push(err);
-                        bad_spec = true;
+                        messages.push(err);
+                        bad = true;
                     }
                 }
             }
-
-            if bad_spec || new_bindings.is_empty() {
+            if bad || keys.is_empty() {
                 continue;
             }
-
-            // Conflict check inside each scope the override touches.
-            for (scope, key, _) in &new_bindings {
-                let clash = bindings
-                    .iter()
-                    .any(|(s, k, a)| s == scope && k.matches(*key) && a != &action);
-                if clash {
-                    let other = bindings
-                        .iter()
-                        .find(|(s, k, a)| s == scope && k.matches(*key) && a != &action)
-                        .map(|(_, _, a)| a.name())
-                        .unwrap_or("?");
-                    conflicts.push(format!(
-                        "{} bound to `{}` conflicts with {} in {scope:?} scope; keeping defaults for both",
-                        action.name(),
-                        key.display(),
-                        other
-                    ));
-                    // Keep defaults for this action entirely.
-                    bindings.retain(|(_, _, a)| a != &action);
-                    bindings.extend(defaults().into_iter().filter(|(_, _, a)| a == &action));
-                    bad_spec = true;
-                    break;
-                }
-            }
-            if bad_spec {
-                continue;
-            }
-
-            bindings.retain(|(_, _, a)| a != &action);
-            bindings.extend(new_bindings);
+            parsed.push((action, keys));
         }
 
-        (Self { bindings }, conflicts)
+        // 2. Build the final map: defaults, with each overridden action's
+        //    bindings replaced by its override.
+        let mut use_default: std::collections::HashSet<Action> = std::collections::HashSet::new();
+        loop {
+            let bindings = build_bindings(&parsed, &use_default);
+            let conflicts = find_conflicts(&bindings);
+            if conflicts.is_empty() {
+                break;
+            }
+            // Revert every action involved in any conflict to its defaults.
+            let mut any_new = false;
+            for (scope, key, actions) in &conflicts {
+                let names: Vec<&str> = actions.iter().map(|a| a.name()).collect();
+                messages.push(format!(
+                    "{} all bound to `{}` in {scope:?} scope; reverting to defaults",
+                    names.join(", "),
+                    key.display(),
+                ));
+                for action in actions {
+                    if use_default.insert(*action) {
+                        any_new = true;
+                    }
+                }
+            }
+            if !any_new {
+                // Every conflicted action is already on defaults (which are
+                // conflict-free), so we can't be stuck.
+                break;
+            }
+        }
+
+        (
+            Self {
+                bindings: build_bindings(&parsed, &use_default),
+            },
+            messages,
+        )
     }
+}
+
+/// Assemble the binding list: defaults, with each non-reverted override
+/// replacing its action's default bindings.
+fn build_bindings(
+    parsed: &[(Action, Vec<(Scope, Key)>)],
+    use_default: &std::collections::HashSet<Action>,
+) -> Vec<(Scope, Key, Action)> {
+    let mut bindings = Vec::new();
+    for (scope, key, action) in defaults() {
+        let overridden = parsed.iter().any(|(a, _)| *a == action);
+        if overridden && !use_default.contains(&action) {
+            continue; // replaced below
+        }
+        bindings.push((scope, key, action));
+    }
+    for (action, keys) in parsed {
+        if use_default.contains(action) {
+            continue;
+        }
+        for (scope, key) in keys {
+            bindings.push((*scope, *key, *action));
+        }
+    }
+    bindings
+}
+
+/// Find every `(scope, key)` bound to more than one distinct action.
+fn find_conflicts(bindings: &[(Scope, Key, Action)]) -> Vec<(Scope, Key, Vec<Action>)> {
+    let mut groups: Vec<(Scope, Key, Vec<Action>)> = Vec::new();
+    for (scope, key, action) in bindings {
+        if let Some(g) = groups
+            .iter_mut()
+            .find(|(s, k, _)| s == scope && k.matches(*key))
+        {
+            if !g.2.contains(action) {
+                g.2.push(*action);
+            }
+        } else {
+            groups.push((*scope, *key, vec![*action]));
+        }
+    }
+    groups.retain(|(_, _, actions)| actions.len() > 1);
+    groups
 }
 
 fn action_by_name(name: &str) -> Option<Action> {
@@ -419,14 +497,20 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_remap_reports_and_keeps_defaults() {
+    fn conflicting_remap_reverts_every_action_involved() {
         let mut overrides = HashMap::new();
-        // `n` is free, but steal `b` (already Next) for play_pause → conflict
+        // Steal `b` (already Next) for play_pause → both revert to defaults.
         overrides.insert("play_pause".to_string(), vec!["b".into()]);
-        let (map, conflicts) = Keymap::from_overrides(&overrides);
-        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
-        assert!(conflicts[0].contains("conflicts"));
-        // Defaults kept: space still plays/pauses, b still next
+        let (map, messages) = Keymap::from_overrides(&overrides);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("reverting to defaults"),
+            "{}",
+            messages[0]
+        );
+        assert!(messages[0].contains("next"), "{}", messages[0]);
+        assert!(messages[0].contains("play_pause"), "{}", messages[0]);
+        // Both reverted: space still plays/pauses, b still next.
         assert_eq!(
             map.resolve(Scope::Global, press(KeyCode::Char(' '))),
             Some(Action::PlayPause)
@@ -438,11 +522,58 @@ mod tests {
     }
 
     #[test]
+    fn swapping_two_keys_is_not_a_conflict() {
+        // Swap next= z and prev= b. Each key ends up on exactly one action.
+        let mut overrides = HashMap::new();
+        overrides.insert("next".to_string(), vec!["z".into()]);
+        overrides.insert("prev".to_string(), vec!["b".into()]);
+        let (map, messages) = Keymap::from_overrides(&overrides);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(
+            map.resolve(Scope::Global, press(KeyCode::Char('z'))),
+            Some(Action::Next)
+        );
+        assert_eq!(
+            map.resolve(Scope::Global, press(KeyCode::Char('b'))),
+            Some(Action::Prev)
+        );
+    }
+
+    #[test]
+    fn override_replaces_all_default_keys_for_an_action() {
+        // next defaults to `b`; remap to just `n` → `b` is freed entirely.
+        let mut overrides = HashMap::new();
+        overrides.insert("next".to_string(), vec!["n".into()]);
+        let (map, messages) = Keymap::from_overrides(&overrides);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(
+            map.resolve(Scope::Global, press(KeyCode::Char('b'))),
+            None,
+            "`b` was Next's default and is now unbound"
+        );
+        assert_eq!(
+            map.resolve(Scope::Global, press(KeyCode::Char('n'))),
+            Some(Action::Next)
+        );
+        assert_eq!(map.hint(Action::Next).as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn uppercase_letter_spec_implies_shift() {
+        assert_eq!(Key::parse("L").unwrap(), Key::parse("shift+l").unwrap());
+        // Lowercase stays unshifted.
+        let l = Key::parse("l").unwrap();
+        assert!(l.modifiers.is_empty());
+        // Uppercase non-letters are not shifted (they already encode it).
+        assert!(Key::parse("+").unwrap().modifiers.is_empty());
+    }
+
+    #[test]
     fn unknown_action_reported() {
         let mut overrides = HashMap::new();
         overrides.insert("warp".to_string(), vec!["w".into()]);
-        let (_, conflicts) = Keymap::from_overrides(&overrides);
-        assert_eq!(conflicts.len(), 1);
-        assert!(conflicts[0].contains("unknown action"));
+        let (_, messages) = Keymap::from_overrides(&overrides);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("unknown action"));
     }
 }

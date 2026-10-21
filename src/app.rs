@@ -15,12 +15,14 @@ use crate::ui::layout::{LayoutPrefs, Panel, PlaylistSide, Visibility, compute_la
 use crate::ui::theme::omarchy::OmarchyWatch;
 use crate::ui::theme::{Role, Theme};
 
-/// Target frame budget (~30 fps).
-const FRAME: Duration = Duration::from_millis(33);
-/// UI tick: marquee, blink, spectrum, clock (2 Hz).
-const TICK: Duration = Duration::from_millis(500);
-/// Omarchy change check cadence (1 Hz).
-const OMARCHY_EVERY: u32 = 2;
+/// Target frame budget (~30 fps). Spectrum and clock advance every frame.
+pub const FRAME: Duration = Duration::from_millis(33);
+/// Marquee scroll step cadence.
+const MARQUEE: Duration = Duration::from_millis(200);
+/// LCD blink cadence (only while paused).
+const BLINK: Duration = Duration::from_millis(500);
+/// Omarchy theme change check cadence.
+const OMARCHY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Per-frame UI state the panels read.
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub struct UiState {
     pub eq_on: bool,
     pub eq_auto: bool,
     pub show_help: bool,
+    /// Scroll offset into the `?` overlay, in rows.
+    pub help_scroll: usize,
     /// One-line notice for the playlist bottom border.
     pub notice: Option<String>,
 }
@@ -58,6 +62,7 @@ impl Default for UiState {
             eq_on: true,
             eq_auto: false,
             show_help: false,
+            help_scroll: 0,
             notice: None,
         }
     }
@@ -72,10 +77,21 @@ pub struct App {
     snapshot: PlayerSnapshot,
     player: MockPlayer,
     omarchy: OmarchyWatch,
-    ticks: u32,
+    /// Frame deadline: when we next redraw (independent of the 30 fps tick).
+    next_frame: Instant,
+    /// When the clock/spectrum last advanced, for `tick(dt)`.
     last_tick: Instant,
+    /// Per-cadence accumulators, advanced by `dt` each frame: the marquee
+    /// steps every 200 ms, the LCD blinks every 500 ms, Omarchy is polled
+    /// every second. Keeping them separate (and driven by the frame `dt`, not
+    /// the wall clock) makes each cadence deterministic and testable.
+    marquee_acc: Duration,
+    blink_acc: Duration,
+    omarchy_acc: Duration,
     /// Where layout hotkeys save the config. `None` = don't persist (tests).
     config_path: Option<std::path::PathBuf>,
+    /// True when the on-disk config failed to load: never write back.
+    read_only: bool,
 }
 
 /// Fixed EQ state for `--dump` and the golden tests (plan §2.3 shape).
@@ -89,15 +105,15 @@ impl App {
     /// Deterministic app for `--dump` and golden tests: frozen player state,
     /// fixed EQ bands, no config persistence, no Omarchy polling.
     pub fn deterministic(keymap: Keymap, theme: Theme) -> Self {
-        let mut ui = UiState {
+        let ui = UiState {
             vis: Visibility::all(),
             playlist_cursor: 2,
             eq_bands: DETERMINISTIC_EQ_BANDS,
             ..UiState::default()
         };
-        ui.playlist_cursor = 2;
         let player = MockPlayer::deterministic();
         let snapshot = player.snapshot();
+        let now = Instant::now();
         Self {
             ui,
             theme,
@@ -107,9 +123,13 @@ impl App {
             snapshot,
             player,
             omarchy: OmarchyWatch::new(),
-            ticks: 0,
-            last_tick: Instant::now(),
+            next_frame: now,
+            last_tick: now,
+            marquee_acc: Duration::ZERO,
+            blink_acc: Duration::ZERO,
+            omarchy_acc: Duration::ZERO,
             config_path: None,
+            read_only: false,
         }
     }
 
@@ -133,11 +153,12 @@ impl App {
             // A pleasing demo state: cursor on the playing track.
             ui.playlist_cursor = 2;
         }
-        let player = MockPlayer::default();
+        let player = MockPlayer::animated();
         let snapshot = player.snapshot();
         ui.playlist_cursor = ui
             .playlist_cursor
             .min(snapshot.tracks.len().saturating_sub(1));
+        let now = Instant::now();
         Self {
             ui,
             theme,
@@ -147,9 +168,23 @@ impl App {
             snapshot,
             player,
             omarchy: OmarchyWatch::new(),
-            ticks: 0,
-            last_tick: Instant::now(),
-            config_path,
+            next_frame: now,
+            last_tick: now,
+            marquee_acc: Duration::ZERO,
+            blink_acc: Duration::ZERO,
+            omarchy_acc: Duration::ZERO,
+            // Demo mode never writes: layout changes stay in memory only.
+            config_path: if demo { None } else { config_path },
+            read_only: false,
+        }
+    }
+
+    /// Mark the config read-only for this session (its load failed). Hotkeys
+    /// keep working on the in-memory layout; nothing is written back.
+    pub fn set_read_only(&mut self, read_only: bool, notice: Option<String>) {
+        self.read_only = read_only;
+        if let Some(notice) = notice {
+            self.ui.notice = Some(notice);
         }
     }
 
@@ -183,62 +218,104 @@ impl App {
         compute_layout(area, &self.layout_prefs(), &self.ui.vis)
     }
 
-    /// Run the event loop (plan §7).
+    /// Run the event loop (plan §7, revised).
+    ///
+    /// The frame deadline is tracked separately from the tick so an idle app
+    /// blocks in `poll` instead of spinning (the old code let the poll timeout
+    /// fall to 0 and burned a core). Each cadence — spectrum/clock (every
+    /// frame), marquee, blink, Omarchy — has its own deadline.
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         loop {
             terminal.draw(|frame| ui::render(frame, self))?;
 
-            let timeout = FRAME.saturating_sub(self.last_tick.elapsed());
-            if event::poll(timeout)? {
+            self.next_frame += FRAME;
+            let now = Instant::now();
+            if self.next_frame < now {
+                // We fell behind (slow draw); resync rather than catch up in a
+                // burst that would peg the CPU.
+                self.next_frame = now;
+            }
+            if event::poll(self.next_frame - now)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if let Some(action) = self.keymap.resolve(self.ui.focus, key) {
-                            self.dispatch(action);
-                        }
+                        self.handle_key(key);
                     }
                     // Resize: next draw recomputes the layout from frame.area().
                     _ => {}
                 }
             }
 
-            if self.last_tick.elapsed() >= TICK {
-                self.tick();
-                self.last_tick = Instant::now();
-            }
+            // Advance by the real elapsed time every frame (30 fps), so the
+            // clock and spectrum stay smooth.
+            let after_poll = Instant::now();
+            self.tick(after_poll - self.last_tick);
+            self.last_tick = after_poll;
+
             if self.should_quit {
                 return Ok(());
             }
         }
     }
 
-    /// Advance mock clock, spectrum, marquee, blink, and Omarchy check.
-    pub fn tick(&mut self) {
-        self.ticks = self.ticks.wrapping_add(1);
-        self.player.tick(TICK);
+    /// Feed a pressed key into the app. `Esc` closes the help overlay (the
+    /// footer promises it); everything else goes through the keymap.
+    pub fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        if self.ui.show_help && key.code == ratatui::crossterm::event::KeyCode::Esc {
+            self.ui.show_help = false;
+            return;
+        }
+        if let Some(action) = self.keymap.resolve(self.ui.focus, key) {
+            self.dispatch(action);
+        }
+    }
+
+    /// Advance the mock clock/spectrum by `dt`, and fire the slower cadences
+    /// (marquee, blink, Omarchy) when their accumulators fill up.
+    pub fn tick(&mut self, dt: Duration) {
+        self.player.tick(dt);
         self.snapshot = self.player.snapshot();
 
-        self.ui.marquee_offset = self.ui.marquee_offset.wrapping_add(1);
-        self.ui.blink_lit = !self.ui.blink_lit;
+        // Marquee: one step every 200 ms.
+        self.marquee_acc += dt;
+        while self.marquee_acc >= MARQUEE {
+            self.marquee_acc -= MARQUEE;
+            self.ui.marquee_offset = self.ui.marquee_offset.wrapping_add(1);
+        }
+        // LCD blink: toggle every 500 ms (render only shows it while paused).
+        self.blink_acc += dt;
+        while self.blink_acc >= BLINK {
+            self.blink_acc -= BLINK;
+            self.ui.blink_lit = !self.ui.blink_lit;
+        }
+        // Omarchy: poll once a second, only when the preset asks for it.
+        if self.config.theme.preset == "omarchy" {
+            self.omarchy_acc += dt;
+            while self.omarchy_acc >= OMARCHY_INTERVAL {
+                self.omarchy_acc -= OMARCHY_INTERVAL;
+                self.check_omarchy();
+            }
+        }
+    }
 
-        if self.ticks.is_multiple_of(OMARCHY_EVERY) && self.config.theme.preset == "omarchy" {
-            match self.omarchy.check(self.config.theme.transparent) {
-                Ok(Some(mut theme)) => {
-                    Self::apply_theme_overrides(&mut theme, &self.config);
-                    theme.apply_depth(ui::theme::ColorDepth::detect());
-                    self.theme = theme;
+    /// Poll the Omarchy theme once and adopt it if it changed.
+    fn check_omarchy(&mut self) {
+        match self.omarchy.check(self.config.theme.transparent) {
+            Ok(Some(mut theme)) => {
+                Self::apply_theme_overrides(&mut theme, &self.config);
+                theme.apply_depth(ui::theme::ColorDepth::detect());
+                self.theme = theme;
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                // Silent fallback to neon, log the reason once.
+                if self.config.theme.preset != "neon"
+                    && let Some(neon) = Theme::preset("neon")
+                {
+                    self.theme = neon;
+                    Self::apply_theme_overrides(&mut self.theme, &self.config);
+                    self.theme.apply_depth(ui::theme::ColorDepth::detect());
                 }
-                Ok(None) => {}
-                Err(reason) => {
-                    // Silent fallback to neon, log the reason once.
-                    if self.config.theme.preset != "neon"
-                        && let Some(neon) = Theme::preset("neon")
-                    {
-                        self.theme = neon;
-                        Self::apply_theme_overrides(&mut self.theme, &self.config);
-                        self.theme.apply_depth(ui::theme::ColorDepth::detect());
-                    }
-                    self.ui.notice = Some(format!("theme: {reason}"));
-                }
+                self.ui.notice = Some(format!("theme: {reason}"));
             }
         }
     }
@@ -256,7 +333,7 @@ impl App {
 
     pub fn dispatch(&mut self, action: Action) {
         if self.ui.show_help && action != Action::Help && action != Action::Quit {
-            // Any key closes the overlay, then the key is swallowed.
+            // Any other key closes the overlay, then is swallowed.
             self.ui.show_help = false;
             return;
         }
@@ -264,7 +341,10 @@ impl App {
         use Action::*;
         match action {
             Quit => self.should_quit = true,
-            Help => self.ui.show_help = !self.ui.show_help,
+            Help => {
+                self.ui.show_help = !self.ui.show_help;
+                self.ui.help_scroll = 0;
+            }
 
             // Transport
             PlayPause | Play | Pause | Stop | Prev | Next => {
@@ -336,15 +416,23 @@ impl App {
                 self.save_config();
             }
             CycleOrder => {
-                // Fixed presets (plan §11.2): playlist right ↔ left, and the
-                // player/EQ stack swaps.
-                match self.config.layout.playlist_side {
-                    PlaylistSide::Right => {
-                        self.config.layout.playlist_side = PlaylistSide::Left;
+                if self.config.layout.columns == 2 {
+                    // Two-column: playlist right ↔ left, then swap the stack.
+                    match self.config.layout.playlist_side {
+                        PlaylistSide::Right => {
+                            self.config.layout.playlist_side = PlaylistSide::Left;
+                        }
+                        PlaylistSide::Left => {
+                            self.config.layout.playlist_side = PlaylistSide::Right;
+                            self.config.layout.stack.reverse();
+                        }
                     }
-                    PlaylistSide::Left => {
-                        self.config.layout.playlist_side = PlaylistSide::Right;
-                        self.config.layout.stack.reverse();
+                } else {
+                    // Single-column: rotate the panel order left by one.
+                    let order = &mut self.config.layout.single_order;
+                    if !order.is_empty() {
+                        let first = order.remove(0);
+                        order.push(first);
                     }
                 }
                 self.save_config();
@@ -409,12 +497,33 @@ impl App {
         self.ui.focus = visible_scopes[next];
     }
 
+    /// Persist the current layout. Mirrors the live visibility into
+    /// `config.layout.visible` first so what's on screen is what's saved, and
+    /// refuses to write when the on-disk config failed to load.
     fn save_config(&mut self) {
+        if self.read_only {
+            // The file on disk didn't parse; never overwrite it.
+            self.ui.notice = Some("config invalid — not saving".into());
+            return;
+        }
+        self.sync_visible_to_config();
         if let Some(path) = self.config_path.clone()
             && let Err(err) = self.config.save(&path)
         {
             self.ui.notice = Some(format!("config save failed: {err}"));
         }
+    }
+
+    /// Copy the live visibility (which panels are shown) into the config, in
+    /// canonical panel order.
+    fn sync_visible_to_config(&mut self) {
+        let mut visible = Vec::new();
+        for panel in [Panel::Player, Panel::Eq, Panel::Playlist] {
+            if self.ui.vis.is_visible(panel) {
+                visible.push(panel);
+            }
+        }
+        self.config.layout.visible = visible;
     }
 }
 
@@ -560,8 +669,135 @@ mod tests {
         let (mut app, _dir) = test_app();
         let before = app.snapshot().position;
         let blink = app.ui.blink_lit;
-        app.tick();
-        assert!(app.snapshot().position >= before);
-        assert_ne!(app.ui.blink_lit, blink, "blink phase flips each tick");
+        // One 500 ms step: the clock advances and the blink phase flips.
+        app.tick(Duration::from_millis(500));
+        assert!(
+            app.snapshot().position > before,
+            "clock advances every tick"
+        );
+        assert_ne!(app.ui.blink_lit, blink, "blink flips every 500 ms");
+    }
+
+    #[test]
+    fn tick_cadences_are_independent() {
+        let (mut app, _dir) = test_app();
+        // A short frame advances the clock but not the marquee (200 ms) or
+        // blink (500 ms) yet.
+        let marquee = app.ui.marquee_offset;
+        let blink = app.ui.blink_lit;
+        app.tick(Duration::from_millis(33));
+        assert!(
+            app.snapshot().position.as_millis() >= 33,
+            "clock runs at 30 fps"
+        );
+        assert_eq!(app.ui.marquee_offset, marquee, "marquee waits for 200 ms");
+        assert_eq!(app.ui.blink_lit, blink, "blink waits for 500 ms");
+
+        // After 200 ms the marquee has stepped once.
+        app.tick(Duration::from_millis(167));
+        assert_eq!(
+            app.ui.marquee_offset,
+            marquee + 1,
+            "marquee steps at 200 ms"
+        );
+        assert_eq!(app.ui.blink_lit, blink, "blink still waiting");
+    }
+
+    #[test]
+    fn demo_mode_never_writes_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut app = App::with_config_path(
+            Config::default(),
+            Keymap::defaults(),
+            crate::ui::theme::neon(),
+            true, // demo
+            Some(path.clone()),
+        );
+        assert!(
+            app.config_path.is_none(),
+            "demo mode drops the config path entirely"
+        );
+        app.dispatch(Action::ToggleEq);
+        app.dispatch(Action::ToggleColumns);
+        assert!(!path.exists(), "no config file is created in demo mode");
+    }
+
+    #[test]
+    fn invalid_config_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this is not toml [").unwrap();
+        let mut app = App::with_config_path(
+            Config::default(),
+            Keymap::defaults(),
+            crate::ui::theme::neon(),
+            false,
+            Some(path.clone()),
+        );
+        app.set_read_only(true, Some("config invalid — not saving".into()));
+        app.dispatch(Action::ToggleEq);
+        app.dispatch(Action::ToggleColumns);
+        // In-memory layout changed…
+        assert!(!app.ui.vis.eq);
+        // …but the broken file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "this is not toml ["
+        );
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("config invalid — not saving")
+        );
+    }
+
+    #[test]
+    fn visibility_persists_to_saved_config() {
+        let (mut app, dir) = test_app();
+        app.dispatch(Action::ToggleEq);
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        // Isolate the `visible = [...]` line so we don't trip over "eq" in
+        // the `stack` array.
+        let visible_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("visible"))
+            .expect("visible line saved");
+        assert!(
+            !visible_line.contains("eq"),
+            "saved visible must drop eq after pressing 2: {visible_line}"
+        );
+        assert!(visible_line.contains("player"), "{visible_line}");
+        assert!(visible_line.contains("playlist"), "{visible_line}");
+    }
+
+    #[test]
+    fn cycle_order_rotates_single_order_in_single_column() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::ToggleColumns); // → single column
+        assert_eq!(app.config.layout.columns, 1);
+        let before = app.config.layout.single_order.clone();
+        app.dispatch(Action::CycleOrder);
+        let after = app.config.layout.single_order.clone();
+        assert_ne!(before, after, "single_order rotates");
+        assert_eq!(after[0], before[1], "rotated left by one");
+        assert_eq!(*after.last().unwrap(), before[0]);
+        // Two-column mode keeps the side/stack cycle.
+        app.dispatch(Action::ToggleColumns); // → two columns
+        let side = app.config.layout.playlist_side;
+        app.dispatch(Action::CycleOrder);
+        assert_ne!(side, app.config.layout.playlist_side);
+    }
+
+    #[test]
+    fn esc_closes_help_overlay() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::Help);
+        assert!(app.ui.show_help);
+        let esc = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Esc,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(esc);
+        assert!(!app.ui.show_help, "esc closes the overlay");
     }
 }

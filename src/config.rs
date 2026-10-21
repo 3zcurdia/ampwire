@@ -82,6 +82,10 @@ pub struct LoadedConfig {
     pub config: Config,
     /// One-line notice for the playlist bottom border, if anything went wrong.
     pub notice: Option<String>,
+    /// True when the file exists but failed to parse or type-check. The
+    /// session must not write back over it: hotkeys still change the in-memory
+    /// layout, but nothing is saved.
+    pub read_only: bool,
 }
 
 impl Config {
@@ -91,6 +95,7 @@ impl Config {
             return LoadedConfig {
                 config: Config::default(),
                 notice: Some("config: no home directory, using defaults".into()),
+                read_only: false,
             };
         };
         Self::load_from(&path)
@@ -101,21 +106,27 @@ impl Config {
             return LoadedConfig {
                 config: Config::default(),
                 notice: None,
+                read_only: false,
             };
         }
         match fs::read_to_string(path) {
+            // An unreadable file is treated as read-only too: we can't trust
+            // what's there, so don't overwrite it.
             Err(err) => LoadedConfig {
                 config: Config::default(),
-                notice: Some(format!("config: {err}, using defaults")),
+                notice: Some(format!("config invalid — not saving ({err})")),
+                read_only: true,
             },
             Ok(text) => match toml::from_str::<Config>(&text) {
                 Ok(config) => LoadedConfig {
                     config: sanitize(config),
                     notice: None,
+                    read_only: false,
                 },
                 Err(err) => LoadedConfig {
                     config: Config::default(),
-                    notice: Some(format!("config: {err}, using defaults")),
+                    notice: Some(format!("config invalid — not saving ({err})")),
+                    read_only: true,
                 },
             },
         }
@@ -242,7 +253,22 @@ mod tests {
         fs::write(&path, "this is not toml [").unwrap();
         let loaded = Config::load_from(&path);
         assert_eq!(loaded.config, Config::default());
-        assert!(loaded.notice.as_deref().unwrap_or("").contains("config:"));
+        assert!(
+            loaded.read_only,
+            "a config that failed to parse is read-only"
+        );
+        let notice = loaded.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("config invalid — not saving"), "{notice}");
+    }
+
+    #[test]
+    fn valid_config_is_not_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[theme]\npreset = \"amber\"\n").unwrap();
+        let loaded = Config::load_from(&path);
+        assert!(!loaded.read_only);
+        assert!(loaded.notice.is_none());
     }
 
     #[test]

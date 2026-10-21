@@ -9,7 +9,7 @@ mod keymap;
 mod player;
 mod ui;
 
-use app::App;
+use app::{App, FRAME};
 use config::Config;
 use keymap::Keymap;
 use ui::theme::{ColorDepth, Theme, omarchy};
@@ -67,7 +67,7 @@ fn dump(dump: Dump) -> std::io::Result<()> {
 
     // Advance the deterministic clock so `--frame N` shows a later moment.
     for _ in 0..dump.frame {
-        app.tick();
+        app.tick(FRAME);
     }
 
     let backend = ratatui::backend::TestBackend::new(dump.width, dump.height);
@@ -114,8 +114,10 @@ fn main() -> std::io::Result<()> {
     theme.apply_depth(ColorDepth::detect());
 
     let mut app = App::new(config, keymap, theme, demo);
-    if let Some(notice) = loaded.notice {
-        app.ui.notice = Some(notice);
+    // If the on-disk config failed to load, mark it read-only so layout
+    // hotkeys never overwrite the broken file.
+    if !demo {
+        app.set_read_only(loaded.read_only, loaded.notice);
     }
     if let Some(conflict) = key_conflicts.into_iter().next() {
         // One line only in the border; report the first conflict.
