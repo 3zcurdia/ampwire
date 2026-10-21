@@ -15,8 +15,10 @@ pub const MIN_PLAYLIST_WIDTH: u16 = 40;
 pub const MIN_WIDTH: u16 = 40;
 /// Height below which nothing fits.
 pub const MIN_HEIGHT: u16 = 3;
-/// Full player panel height (borders included).
-pub const PLAYER_HEIGHT: u16 = 9;
+/// Natural height of the player panel (borders included). 20% above the
+/// original 7-row body so the boxed transport buttons have room to breathe:
+/// 9 inner rows + 2 borders = 11.
+pub const PLAYER_HEIGHT: u16 = 11;
 /// Compact player: time, marquee, seek bar.
 pub const COMPACT_PLAYER_HEIGHT: u16 = 3;
 /// EQ panel height with default sliders.
@@ -453,8 +455,9 @@ mod tests {
         let p = l.player.expect("player");
         let eq = l.eq.expect("eq");
         let pl = l.playlist.expect("playlist");
-        assert_eq!(p, Rect::new(0, 0, 52, 9));
-        assert_eq!(eq, Rect::new(0, 9, 52, 9));
+        let h = PLAYER_HEIGHT;
+        assert_eq!(p, Rect::new(0, 0, 52, h));
+        assert_eq!(eq, Rect::new(0, h, 52, 18 - h));
         assert_eq!(pl, Rect::new(52, 0, 52, 18));
         assert!(!l.player_compact);
         assert!(!l.too_small);
@@ -462,12 +465,12 @@ mod tests {
 
     #[test]
     fn two_column_spare_height_goes_to_eq() {
-        // 160×45: left column 52 wide, player 9, EQ takes the rest.
+        // 160×45: left column 52 wide, player at natural height, EQ the rest.
         let l = compute_layout(area(160, 45), &prefs(), &Visibility::all());
         let p = l.player.unwrap();
         let eq = l.eq.unwrap();
         let pl = l.playlist.unwrap();
-        assert_eq!(p.height, 9);
+        assert_eq!(p.height, PLAYER_HEIGHT);
         assert_eq!(eq.height + p.height, 45);
         assert_eq!(pl.width, 160 - 52);
     }
@@ -482,36 +485,40 @@ mod tests {
         assert_eq!(p.width, 91);
         assert_eq!(eq.width, 91);
         assert_eq!(pl.width, 91);
-        // Stacked: player 9, eq 9, playlist the rest.
+        // Stacked: player, eq, playlist top to bottom. The EQ keeps its own
+        // natural height, so the playlist starts below player + EQ.
         assert_eq!(p.y, 0);
-        assert_eq!(eq.y, 9);
-        assert_eq!(pl.y, 18);
-        assert_eq!(pl.height, 30 - 18);
+        assert_eq!(p.height, PLAYER_HEIGHT);
+        assert_eq!(eq.y, PLAYER_HEIGHT);
+        assert_eq!(eq.height, EQ_HEIGHT);
+        assert_eq!(pl.y, PLAYER_HEIGHT + EQ_HEIGHT);
+        assert_eq!(pl.height, 30 - (PLAYER_HEIGHT + EQ_HEIGHT));
     }
 
     #[test]
     fn short_single_column_shrinks_playlist_then_hides_eq() {
-        // 52×14 is exactly player 9 + playlist 5 after the EQ is hidden.
-        let l = compute_layout(area(52, 14), &prefs(), &Visibility::all());
+        // PLAYER_HEIGHT + 5 is exactly player + a minimum playlist once the
+        // EQ is hidden.
+        let full = PLAYER_HEIGHT + 5;
+        let l = compute_layout(area(52, full), &prefs(), &Visibility::all());
         assert!(l.player.is_some());
         assert!(l.eq.is_none(), "EQ hidden on short terminal");
         assert!(!l.player_compact);
         let p = l.player.unwrap();
-        assert_eq!(p.height, 9);
+        assert_eq!(p.height, PLAYER_HEIGHT);
         let pl = l.playlist.unwrap();
         assert_eq!(pl.height, 5, "playlist at its minimum");
 
-        // 52×12: 9 + 5 = 14 > 12 → the player drops to compact as well.
-        let l = compute_layout(area(52, 12), &prefs(), &Visibility::all());
+        // Two rows shorter: the player drops to compact as well.
+        let l = compute_layout(area(52, full - 2), &prefs(), &Visibility::all());
         assert!(l.eq.is_none());
         assert!(l.player_compact, "still too short → compact player");
         assert_eq!(l.player.unwrap().height, 3);
-        assert_eq!(l.playlist.unwrap().height, 9);
     }
 
     #[test]
     fn very_short_terminal_compacts_player() {
-        // 52×8: after hiding EQ, 9 + 5 = 14 > 8 → compact player (3).
+        // 52×8: after hiding EQ, the player drops to compact (3).
         let l = compute_layout(area(52, 8), &prefs(), &Visibility::all());
         assert!(l.player_compact);
         let p = l.player.unwrap();
@@ -522,23 +529,23 @@ mod tests {
 
     #[test]
     fn two_column_drops_eq_when_too_squat() {
-        // Two-column at 104×N: player keeps 9 rows when it can, leaving the
-        // EQ `remaining` rows. Below MIN_EQ_TOTAL (5) the EQ is dropped, not
-        // rendered as a squashed box.
-        // 104×14: player 9, remaining 5 → EQ shown (exactly at the floor).
-        let l = compute_layout(area(104, 14), &prefs(), &Visibility::all());
+        // Two-column: player keeps its natural height when it can, leaving
+        // the EQ the remainder. Below MIN_EQ_TOTAL (5) the EQ is dropped,
+        // not rendered as a squashed box.
+        let h = PLAYER_HEIGHT;
+        // Exactly at the EQ floor.
+        let l = compute_layout(area(104, h + 5), &prefs(), &Visibility::all());
         assert!(l.player.is_some());
         assert!(!l.player_compact);
         assert!(l.eq.is_some(), "EQ shown at the 5-row floor");
-        // 104×13: player 9, remaining 4 → EQ dropped.
-        let l = compute_layout(area(104, 13), &prefs(), &Visibility::all());
+        // One row less → EQ dropped.
+        let l = compute_layout(area(104, h + 4), &prefs(), &Visibility::all());
         assert!(l.player.is_some());
         assert!(l.eq.is_none(), "EQ dropped below the floor");
-        // 104×10: player 9, remaining 1 → EQ dropped.
-        let l = compute_layout(area(104, 10), &prefs(), &Visibility::all());
+        // Well below → still dropped.
+        let l = compute_layout(area(104, h + 1), &prefs(), &Visibility::all());
         assert!(l.eq.is_none(), "EQ dropped when only 1 row remains");
-        // 104×8: below PLAYER_HEIGHT → player compact (3), remaining 5 →
-        // the EQ fits again.
+        // Below PLAYER_HEIGHT → player compact, freeing room for the EQ.
         let l = compute_layout(area(104, 8), &prefs(), &Visibility::all());
         assert!(l.player_compact);
         assert!(l.eq.is_some(), "compact player frees room for the EQ");
@@ -619,7 +626,8 @@ mod tests {
     fn playlist_hidden_renders_stack_alone() {
         let mut vis = Visibility::all();
         vis.playlist = false;
-        let l = compute_layout(area(104, 18), &prefs(), &vis);
+        // Tall enough that the 11-row player + 9-row EQ both fit.
+        let l = compute_layout(area(104, 24), &prefs(), &vis);
         assert!(l.playlist.is_none());
         assert!(l.player.is_some());
         assert!(l.eq.is_some());
@@ -662,7 +670,8 @@ mod tests {
         let mut p = prefs();
         p.columns = 1;
         p.single_order = vec![Panel::Playlist, Panel::Player, Panel::Eq];
-        let l = compute_layout(area(80, 24), &p, &Visibility::all());
+        // Tall enough for player + EQ + a minimum playlist.
+        let l = compute_layout(area(80, 30), &p, &Visibility::all());
         let pl = l.playlist.unwrap();
         let player = l.player.unwrap();
         let eq = l.eq.unwrap();

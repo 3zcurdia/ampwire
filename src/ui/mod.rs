@@ -84,14 +84,17 @@ mod tests {
 
     #[test]
     fn focused_border_uses_glow_unfocused_uses_muted() {
+        use crate::ui::layout::PLAYER_HEIGHT;
         let app = App::new(Config::default(), Keymap::defaults(), theme::neon(), false);
-        let buf = render_frame(&app, 104, 18);
+        // Tall enough that the EQ renders below the taller player.
+        let buf = render_frame(&app, 104, 26);
         let neon = theme::neon();
         // Player is focused by default: its top-left corner is `glow`.
         let corner = buf.cell((0, 0)).unwrap();
         assert_eq!(corner.fg, neon.color(Role::Glow), "focused border");
-        // The EQ (unfocused) top-left corner is `muted`.
-        let eq_corner = buf.cell((0, 9)).unwrap();
+        // The EQ (unfocused) top-left corner is `muted`, right below the
+        // player.
+        let eq_corner = buf.cell((0, PLAYER_HEIGHT)).unwrap();
         assert_eq!(eq_corner.fg, neon.color(Role::Muted), "unfocused border");
     }
 
@@ -230,10 +233,12 @@ mod tests {
     #[test]
     fn key_cells_use_the_right_roles() {
         use crate::app::DETERMINISTIC_EQ_BANDS;
+        use crate::ui::layout::PLAYER_HEIGHT;
         let neon = theme::neon();
         let app = App::deterministic(Keymap::defaults(), neon.clone());
 
-        let backend = TestBackend::new(104, 18);
+        // Tall enough that the EQ renders comfortably below the 11-row player.
+        let backend = TestBackend::new(104, 26);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -244,9 +249,10 @@ mod tests {
             neon.color(Role::Glow),
             "focused border uses glow"
         );
-        // Unfocused border = muted. EQ panel top-left (y=9).
+        // Unfocused border = muted. EQ panel top-left, right below the player.
+        let eq_y = PLAYER_HEIGHT;
         assert_eq!(
-            buf.cell((0, 9)).unwrap().fg,
+            buf.cell((0, eq_y)).unwrap().fg,
             neon.color(Role::Muted),
             "unfocused border uses muted"
         );
@@ -263,9 +269,10 @@ mod tests {
         }
         assert!(digit, "LCD digit uses primary");
         // Focused EQ knob = accent. The EQ focus defaults to band 1 with a
-        // nonzero gain, so its knob is accent-colored.
+        // nonzero gain, so its knob is accent-colored. Scan the EQ's slider
+        // rows (below its top border + toggle row).
         let mut knob = false;
-        for y in 3..7u16 {
+        for y in (eq_y + 2)..(eq_y + 7) {
             for x in 4..52u16 {
                 let c = buf.cell((x, y)).unwrap();
                 if c.symbol() == "●" && c.fg == neon.color(Role::Accent) {

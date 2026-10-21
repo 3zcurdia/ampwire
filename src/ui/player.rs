@@ -66,14 +66,16 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     let snapshot = app.snapshot();
 
     // Rows: [time + spectrum (2)] [marquee (1)] [format (1)] [seek (1)]
-    //        [vol/bal (1)] [transport (1)] = 7 rows (9 with borders).
+    //        [vol/bal (1)] [transport box (3)] = 9 inner rows (11 with
+    //        borders). The transport gets 3 rows so each button is a real
+    //        boxed target instead of a cramped glyph.
     let rows = [
         Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(1),
+        Constraint::Length(3),
     ];
     let [
         time_area,
@@ -279,9 +281,25 @@ fn render_seek(app: &App, area: Rect, buf: &mut Buffer, time_pair: &str) {
 fn render_mix(app: &App, area: Rect, buf: &mut Buffer) {
     let theme = &app.theme;
     let snapshot = app.snapshot();
-    // vol slider on the left half, bal on the right half.
-    let [vol_area, bal_area] =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
+    // vol and bal are separated by a 2-column gap so they read as two
+    // distinct controls rather than one continuous track.
+    const GAP: u16 = 2;
+    if area.width <= GAP {
+        return;
+    }
+    let usable = area.width - GAP;
+    let vol_w = usable * 55 / 100;
+    let bal_w = usable - vol_w;
+    let vol_area = Rect {
+        x: area.x,
+        width: vol_w,
+        ..area
+    };
+    let bal_area = Rect {
+        x: area.x + vol_w + GAP,
+        width: bal_w,
+        ..area
+    };
 
     HSlider {
         value: snapshot.volume as f32 / 100.0,
@@ -316,34 +334,80 @@ const TRANSPORT: &[(Action, &str)] = &[
 fn render_transport(app: &App, area: Rect, buf: &mut Buffer) {
     let theme = &app.theme;
     let keymap = &app.keymap;
-    let mut x = area.x;
-    for (action, glyph) in TRANSPORT {
-        if x >= area.x + area.width {
-            break;
+    if area.width == 0 || area.height < 3 {
+        return;
+    }
+
+    // Six buttons spread evenly across the full width, each in its own box.
+    // The box is 3 rows: a rounded top border, the hotkey + glyph, and a
+    // rounded bottom border — so each button is a real target, not a glyph
+    // squeezed against its neighbour.
+    let n = TRANSPORT.len() as u16;
+    let button_h = 3u16.min(area.height);
+    for (i, (action, glyph)) in TRANSPORT.iter().enumerate() {
+        let bx = area.x + (i as u16 * area.width) / n;
+        let next_x = area.x + ((i as u16 + 1) * area.width) / n;
+        let bw = next_x.saturating_sub(bx);
+        if bw < 2 {
+            continue;
         }
-        // Hotkey letter in accent before the glyph.
-        if let Some(hint) = keymap.hint(*action) {
-            for c in hint.chars() {
-                if x >= area.x + area.width {
-                    return;
-                }
-                let cell = &mut buf[(x, area.y)];
-                cell.set_symbol(&c.to_string());
-                cell.set_fg(theme.color(Role::Accent));
-                x += 1;
+
+        let top = theme.color(if app.ui.focus == crate::action::Scope::Player {
+            Role::Primary
+        } else {
+            Role::Muted
+        });
+        // Top and bottom borders, leaving the corners rounded.
+        for x in 0..bw {
+            let symbol = match x {
+                0 => "╭",
+                w if w == bw - 1 => "╮",
+                _ => "─",
+            };
+            let cell = &mut buf[(bx + x, area.y)];
+            cell.set_symbol(symbol);
+            cell.set_fg(top);
+            if button_h >= 3 {
+                let cell = &mut buf[(bx + x, area.y + 2)];
+                let symbol = match x {
+                    0 => "╰",
+                    w if w == bw - 1 => "╯",
+                    _ => "─",
+                };
+                cell.set_symbol(symbol);
+                cell.set_fg(top);
             }
         }
-        // The glyph may be more than one cell (e.g. `|◀`, `▶|`).
-        for c in glyph.chars() {
-            if x >= area.x + area.width {
-                return;
+
+        // Side walls and the content row (middle).
+        let mid_y = area.y + 1;
+        let content_y = if button_h >= 2 { mid_y } else { area.y };
+        for x in 0..bw {
+            if x == 0 || x == bw - 1 {
+                let cell = &mut buf[(bx + x, content_y)];
+                cell.set_symbol("│");
+                cell.set_fg(top);
             }
-            let cell = &mut buf[(x, area.y)];
+        }
+
+        // Content: hotkey letter (accent) then the glyph (fg), centered.
+        let hint = keymap.hint(*action).unwrap_or_default();
+        let content: String = format!("{hint}{glyph}");
+        let content_width = content.chars().count() as u16;
+        let start = bx + 1 + bw.saturating_sub(1).saturating_sub(content_width) / 2;
+        let end = bx + bw.saturating_sub(1);
+        let hotkey_len = hint.chars().count();
+        for (cx, (j, c)) in (start.max(bx + 1)..end).zip(content.chars().enumerate()) {
+            let cell = &mut buf[(cx, content_y)];
             cell.set_symbol(&c.to_string());
-            cell.set_fg(theme.color(Role::Fg));
-            x += 1;
+            // The hotkey letter is accent; the glyph is foreground.
+            let is_hotkey = j < hotkey_len;
+            cell.set_fg(if is_hotkey {
+                theme.color(Role::Accent)
+            } else {
+                theme.color(Role::Fg)
+            });
         }
-        x += 1; // gap after glyph
     }
 }
 

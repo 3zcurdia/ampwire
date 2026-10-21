@@ -675,7 +675,7 @@ mod tests {
         );
         assert_eq!(map.hint(Action::Next).as_deref(), Some("n"));
 
-        // The transport row (drawn from keymap.hint) shows the remapped key.
+        // The transport box (drawn from keymap.hint) shows the remapped key.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let app = crate::app::App::new(
@@ -684,16 +684,17 @@ mod tests {
             crate::ui::theme::neon(),
             false,
         );
-        let backend = TestBackend::new(52, 9);
+        // Tall enough for the 11-row player so the transport box renders.
+        let backend = TestBackend::new(52, 11);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| crate::ui::player::render(&app, f.area(), f.buffer_mut(), false))
             .unwrap();
         let buf = terminal.backend().buffer();
-        // The transport row is the last inner row; find `n` immediately left
-        // of the next glyph `▶`.
+        // In the boxed transport, the hotkey letter sits immediately left of
+        // the next glyph `▶` (the box draws `n▶|`).
         let mut found = false;
-        for y in 0..9u16 {
+        for y in 0..11u16 {
             let row: Vec<String> = (0..52u16)
                 .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
                 .collect();
@@ -703,7 +704,7 @@ mod tests {
                 }
             }
         }
-        assert!(found, "transport row shows the remapped `n` for next");
+        assert!(found, "transport box shows the remapped `n` for next");
     }
 
     #[test]
