@@ -1,7 +1,9 @@
 //! Mock player: fake playlist, ticking clock, animated spectrum.
 //!
-//! Stands in for the real audio thread until it exists. Deterministic-ish
-//! pseudo-random spectrum so tests can pin values by seeding.
+//! Stands in for the real audio thread until it exists. The RNG is seeded so
+//! a given seed always yields the same spectrum; [`MockPlayer::deterministic`]
+//! freezes that seed's spectrum so `--dump` and the golden tests reproduce
+//! exactly.
 
 use std::time::Duration;
 
@@ -21,6 +23,11 @@ impl Rng {
 
 const SPECTRUM_BINS: usize = 24;
 
+/// Seed for the animated (non-deterministic) player.
+const ANIMATED_SEED: u64 = 42;
+/// Seed for the frozen `--dump` / golden-test spectrum.
+const DETERMINISTIC_SEED: u64 = 0x5EED_C0DE;
+
 pub struct MockPlayer {
     state: PlayState,
     current: Option<usize>,
@@ -35,6 +42,23 @@ pub struct MockPlayer {
     /// Peaks slowly fall back toward the bar height, btop-style.
     peaks: Vec<f32>,
     rng: Rng,
+    /// When true the spectrum and peaks never move (only the clock does), so
+    /// `--dump --frame N` and the golden tests are byte-for-byte reproducible.
+    frozen: bool,
+}
+
+/// Build a plausible-looking spectrum from a seeded RNG: low bins loud, high
+/// bins quiet, with per-bin jitter. Same seed → same shape.
+fn seeded_spectrum(seed: u64) -> (Vec<f32>, Vec<f32>, Rng) {
+    let mut rng = Rng(seed | 1);
+    let mut spectrum = vec![0.0f32; SPECTRUM_BINS];
+    for (i, bin) in spectrum.iter_mut().enumerate() {
+        let shape = 1.0 - (i as f32 / SPECTRUM_BINS as f32) * 0.78;
+        *bin = (shape * (0.55 + 0.45 * rng.next_f32())).clamp(0.0, 1.0);
+    }
+    // Peak caps float just above the bars.
+    let peaks = spectrum.iter().map(|v| (v + 0.07).min(1.0)).collect();
+    (spectrum, peaks, rng)
 }
 
 /// 24 fake tracks of imaginary downtempo.
@@ -75,21 +99,18 @@ fn fake_tracks() -> Vec<Track> {
 
 impl Default for MockPlayer {
     fn default() -> Self {
-        Self::new(42)
+        Self::animated()
     }
 }
 
 impl MockPlayer {
-    pub fn new(seed: u64) -> Self {
-        let mut rng = Rng(seed | 1);
-        let mut spectrum = vec![0.0f32; SPECTRUM_BINS];
-        for bin in &mut spectrum {
-            *bin = rng.next_f32() * 0.5;
-        }
+    /// The live, animated mock: the spectrum wobbles every tick.
+    pub fn animated() -> Self {
+        let (spectrum, peaks, rng) = seeded_spectrum(ANIMATED_SEED);
         Self {
             state: PlayState::Playing,
             current: Some(2),
-            position: Duration::from_secs(83),
+            position: Duration::from_secs(84),
             tracks: fake_tracks(),
             shuffle: false,
             repeat: false,
@@ -97,8 +118,52 @@ impl MockPlayer {
             balance: 0,
             format: FormatInfo::default(),
             spectrum,
-            peaks: vec![0.0; SPECTRUM_BINS],
+            peaks,
             rng,
+            frozen: false,
+        }
+    }
+
+    /// Frozen state for `--dump` and the golden tests: 1:24 into track 3 with
+    /// a fixed spectrum. Only the clock advances on tick; the bars hold still
+    /// so the output is reproducible.
+    pub fn deterministic() -> Self {
+        let (spectrum, peaks, rng) = seeded_spectrum(DETERMINISTIC_SEED);
+        Self {
+            state: PlayState::Playing,
+            current: Some(2),
+            position: Duration::from_secs(84),
+            tracks: fake_tracks(),
+            shuffle: false,
+            repeat: false,
+            volume: 68,
+            balance: 0,
+            format: FormatInfo::default(),
+            spectrum,
+            peaks,
+            rng,
+            frozen: true,
+        }
+    }
+
+    /// Seed-controlled mock for tests (the spectrum depends on the seed).
+    #[cfg(test)]
+    pub fn new(seed: u64) -> Self {
+        let (spectrum, peaks, rng) = seeded_spectrum(seed);
+        Self {
+            state: PlayState::Playing,
+            current: Some(2),
+            position: Duration::from_secs(84),
+            tracks: fake_tracks(),
+            shuffle: false,
+            repeat: false,
+            volume: 68,
+            balance: 0,
+            format: FormatInfo::default(),
+            spectrum,
+            peaks,
+            rng,
+            frozen: false,
         }
     }
 
@@ -188,10 +253,13 @@ impl MockPlayer {
         self.current.and_then(|i| self.tracks.get(i))
     }
 
-    /// Advance the clock, spectrum, and peaks. Called at 2 Hz from `App::tick`.
+    /// Advance the clock, spectrum, and peaks. Called from `App::tick` with
+    /// the elapsed time since the last frame.
     pub fn tick(&mut self, dt: Duration) {
         if self.state != PlayState::Playing {
-            self.decay_spectrum();
+            if !self.frozen {
+                self.decay_spectrum();
+            }
             return;
         }
 
@@ -204,6 +272,11 @@ impl MockPlayer {
             } else {
                 self.handle(PlayerCommand::Next);
             }
+        }
+
+        // Frozen (dump/golden) mode: the clock moved but the bars hold still.
+        if self.frozen {
+            return;
         }
 
         // Spectrum: low bins louder than high bins, with a rolling wobble.

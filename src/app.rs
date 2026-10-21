@@ -78,9 +78,39 @@ pub struct App {
     config_path: Option<std::path::PathBuf>,
 }
 
+/// Fixed EQ state for `--dump` and the golden tests (plan §2.3 shape).
+pub const DETERMINISTIC_EQ_BANDS: [i8; 11] = [0, 3, 6, 2, 0, -2, -3, 0, 2, 4, 5];
+
 impl App {
     pub fn new(config: Config, keymap: Keymap, theme: Theme, demo: bool) -> Self {
         Self::with_config_path(config, keymap, theme, demo, crate::config::config_path())
+    }
+
+    /// Deterministic app for `--dump` and golden tests: frozen player state,
+    /// fixed EQ bands, no config persistence, no Omarchy polling.
+    pub fn deterministic(keymap: Keymap, theme: Theme) -> Self {
+        let mut ui = UiState {
+            vis: Visibility::all(),
+            playlist_cursor: 2,
+            eq_bands: DETERMINISTIC_EQ_BANDS,
+            ..UiState::default()
+        };
+        ui.playlist_cursor = 2;
+        let player = MockPlayer::deterministic();
+        let snapshot = player.snapshot();
+        Self {
+            ui,
+            theme,
+            keymap,
+            config: Config::default(),
+            should_quit: false,
+            snapshot,
+            player,
+            omarchy: OmarchyWatch::new(),
+            ticks: 0,
+            last_tick: Instant::now(),
+            config_path: None,
+        }
     }
 
     /// Construct with an explicit config path (tests inject a temp file).

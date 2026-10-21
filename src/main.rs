@@ -14,8 +14,92 @@ use config::Config;
 use keymap::Keymap;
 use ui::theme::{ColorDepth, Theme, omarchy};
 
+/// Parsed `--dump WxH` request.
+struct Dump {
+    width: u16,
+    height: u16,
+    frame: u64,
+}
+
+/// Parse `--dump WxH [--frame N]` from the args, if present.
+fn parse_dump(args: &[String]) -> Result<Option<Dump>, String> {
+    let Some(idx) = args.iter().position(|a| a == "--dump") else {
+        return Ok(None);
+    };
+    let spec = args
+        .get(idx + 1)
+        .ok_or_else(|| "--dump needs a size, e.g. --dump 104x18".to_string())?;
+    let (w, h) = spec
+        .split_once('x')
+        .ok_or_else(|| format!("--dump size must look like WxH, got `{spec}`"))?;
+    let width: u16 = w
+        .parse()
+        .map_err(|_| format!("--dump width must be a number, got `{w}`"))?;
+    let height: u16 = h
+        .parse()
+        .map_err(|_| format!("--dump height must be a number, got `{h}`"))?;
+    if width == 0 || height == 0 {
+        return Err("--dump size must be non-zero".into());
+    }
+
+    let frame = match args.iter().position(|a| a == "--frame") {
+        Some(fi) => args
+            .get(fi + 1)
+            .ok_or_else(|| "--frame needs a number".to_string())?
+            .parse()
+            .map_err(|_| "--frame must be a number".to_string())?,
+        None => 0,
+    };
+    Ok(Some(Dump {
+        width,
+        height,
+        frame,
+    }))
+}
+
+/// Render one frame into a `TestBackend` and print it as plain text. Never
+/// enters raw mode or the alternate screen.
+fn dump(dump: Dump) -> std::io::Result<()> {
+    let config = Config::default();
+    let (keymap, _) = Keymap::from_overrides(&config.keys);
+    let theme = Theme::preset("neon").expect("neon preset exists");
+    let mut app = App::deterministic(keymap, theme);
+
+    // Advance the deterministic clock so `--frame N` shows a later moment.
+    for _ in 0..dump.frame {
+        app.tick();
+    }
+
+    let backend = ratatui::backend::TestBackend::new(dump.width, dump.height);
+    let mut terminal =
+        ratatui::Terminal::new(backend).map_err(|e| std::io::Error::other(e.to_string()))?;
+    terminal
+        .draw(|f| ui::render(f, &app))
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let buf = terminal.backend().buffer();
+    for y in 0..dump.height {
+        let line: String = (0..dump.width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+            .collect();
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
-    let demo = std::env::args().any(|arg| arg == "--demo");
+    let args: Vec<String> = std::env::args().collect();
+
+    match parse_dump(&args) {
+        Ok(Some(dump_req)) => return dump(dump_req),
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("ampwire: {msg}");
+            std::process::exit(2);
+        }
+    }
+
+    let demo = args.iter().any(|arg| arg == "--demo");
 
     let loaded = Config::load();
     let mut config = loaded.config;
