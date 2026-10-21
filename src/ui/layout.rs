@@ -123,6 +123,21 @@ pub struct ComputedLayout {
     pub too_small: bool,
 }
 
+impl ComputedLayout {
+    /// Drop any panel shorter than `min` rows. A squashed panel reads as
+    /// noise, so it is better to give the space to nothing than to a smear.
+    fn with_min_height(mut self, min: u16) -> Self {
+        for rect in [&mut self.player, &mut self.eq, &mut self.playlist] {
+            if let Some(r) = rect
+                && r.height < min
+            {
+                *rect = None;
+            }
+        }
+        self
+    }
+}
+
 /// Compute the layout for one frame. Pure: same inputs, same rects.
 pub fn compute_layout(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> ComputedLayout {
     let empty = ComputedLayout {
@@ -144,12 +159,17 @@ pub fn compute_layout(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> Comp
     let two_column =
         prefs.columns == 2 && area.width >= NATURAL_LEFT_WIDTH + MIN_PLAYLIST_WIDTH && vis.playlist;
 
-    if two_column {
+    let computed = if two_column {
         compute_two_column(area, prefs, vis)
     } else {
         compute_single_column(area, prefs, vis)
-    }
+    };
+    // Invariant: never render a panel shorter than 3 rows — drop it instead.
+    computed.with_min_height(MIN_PANEL_HEIGHT)
 }
+
+/// Smallest height a panel may render at before it is dropped.
+pub const MIN_PANEL_HEIGHT: u16 = 3;
 
 fn split_columns(area: Rect, left_width: u16, playlist_side: PlaylistSide) -> (Rect, Rect) {
     let (stack_area, playlist_area) = match playlist_side {
@@ -360,6 +380,56 @@ fn compute_single_column(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> C
     }
 }
 
+/// Every combination of layout preferences, for the property tests.
+#[cfg(test)]
+pub fn all_pref_variants() -> Vec<LayoutPrefs> {
+    let stacks = [
+        vec![Panel::Player, Panel::Eq],
+        vec![Panel::Eq, Panel::Player],
+    ];
+    let orders = [
+        vec![Panel::Player, Panel::Eq, Panel::Playlist],
+        vec![Panel::Playlist, Panel::Player, Panel::Eq],
+        vec![Panel::Eq, Panel::Playlist, Panel::Player],
+    ];
+    let mut out = Vec::new();
+    for columns in [1u8, 2] {
+        for side in [PlaylistSide::Right, PlaylistSide::Left] {
+            for stack in stacks.clone() {
+                for order in orders.clone() {
+                    out.push(LayoutPrefs {
+                        columns,
+                        playlist_side: side,
+                        stack: stack.clone(),
+                        single_order: order.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every visibility combination that shows at least one panel.
+#[cfg(test)]
+pub fn all_visibility_variants() -> Vec<Visibility> {
+    let mut out = Vec::new();
+    for player in [true, false] {
+        for eq in [true, false] {
+            for playlist in [true, false] {
+                out.push(Visibility {
+                    player,
+                    eq,
+                    playlist,
+                });
+            }
+        }
+    }
+    // Never all hidden (the app refuses that).
+    out.retain(|v| v.player || v.eq || v.playlist);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +542,66 @@ mod tests {
         let l = compute_layout(area(104, 8), &prefs(), &Visibility::all());
         assert!(l.player_compact);
         assert!(l.eq.is_some(), "compact player frees room for the EQ");
+    }
+
+    /// Property test (plan §3.2): for every size and every preference
+    /// combination, the layout is well-formed — no panel overlaps another,
+    /// every rect is inside the area, and no rendered panel is shorter than
+    /// 3 rows.
+    #[test]
+    fn layout_invariants_hold_for_every_size_and_pref() {
+        for w in 1..=200u16 {
+            for h in 1..=60u16 {
+                let a = area(w, h);
+                for prefs in all_pref_variants() {
+                    for vis in all_visibility_variants() {
+                        let l = compute_layout(a, &prefs, &vis);
+                        let rects: Vec<(Panel, Rect)> = [
+                            (Panel::Player, l.player),
+                            (Panel::Eq, l.eq),
+                            (Panel::Playlist, l.playlist),
+                        ]
+                        .into_iter()
+                        .filter_map(|(p, r)| r.map(|r| (p, r)))
+                        .collect();
+
+                        for (panel, r) in &rects {
+                            // Inside the area.
+                            assert!(
+                                r.x >= a.x
+                                    && r.y >= a.y
+                                    && r.x + r.width <= a.x + a.width
+                                    && r.y + r.height <= a.y + a.height,
+                                "{panel:?} {r:?} outside {a:?} ({w}x{h})"
+                            );
+                            // Never squashed below 3 rows.
+                            assert!(
+                                r.height >= MIN_PANEL_HEIGHT,
+                                "{panel:?} {r:?} shorter than {MIN_PANEL_HEIGHT} ({w}x{h})"
+                            );
+                            // Visible panels are only rendered when asked for.
+                            assert!(
+                                vis.is_visible(*panel),
+                                "{panel:?} rendered but hidden ({w}x{h})"
+                            );
+                        }
+
+                        // No two panels overlap.
+                        for i in 0..rects.len() {
+                            for j in (i + 1)..rects.len() {
+                                let (pa, ra) = &rects[i];
+                                let (pb, rb) = &rects[j];
+                                let overlap = ra.x < rb.x + rb.width
+                                    && rb.x < ra.x + ra.width
+                                    && ra.y < rb.y + rb.height
+                                    && rb.y < ra.y + ra.height;
+                                assert!(!overlap, "{pa:?} {ra:?} overlaps {pb:?} {rb:?} ({w}x{h})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

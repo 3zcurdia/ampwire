@@ -381,14 +381,16 @@ const XTERM16: [(u8, u8, u8); 16] = [
     (255, 255, 255),
 ];
 
-/// Vetted, 1-cell-wide, non-emoji glyphs used across the UI.
+/// Vetted, non-emoji glyphs used across the UI. All are 1 cell wide per code
+/// point; the two-char transport glyphs are just two 1-cell chars in a row.
 pub mod glyphs {
     pub const PLAY: char = '▶';
     pub const PAUSE: char = '‖';
     pub const STOP: char = '■';
-    pub const PREV: char = '◀';
-    pub const NEXT: char = '▶';
-    pub const EJECT: char = '▲';
+    /// Winamp previous: a bar then a left triangle.
+    pub const PREV: &str = "|◀";
+    /// Winamp next: a right triangle then a bar.
+    pub const NEXT: &str = "▶|";
     pub const CURSOR: char = '▸';
     pub const KNOB: char = '●';
     pub const TRACK_FULL: char = '█';
@@ -400,14 +402,17 @@ mod tests {
     use super::*;
 
     /// Every glyph the UI may draw, for the width test. Kept here (not in
-    /// `glyphs`) so it can't drift out of sync with usage warnings.
+    /// `glyphs`) so it can't drift out of sync with usage warnings. The
+    /// two-char transport glyphs are split into their component chars.
     const ALL_GLYPHS: &[char] = &[
         glyphs::PLAY,
         glyphs::PAUSE,
         glyphs::STOP,
-        glyphs::PREV,
-        glyphs::NEXT,
-        glyphs::EJECT,
+        '|', // PREV = "|◀"
+        '◀',
+        '▶',
+        '|', // NEXT = "▶|"
+        '▲', // eject
         glyphs::CURSOR,
         glyphs::KNOB,
         glyphs::TRACK_FULL,
@@ -510,6 +515,20 @@ mod tests {
     #[test]
     fn apply_depth_downgrades_every_role() {
         let mut t = neon();
+        // Confirm the roles really are RGB before downgrading, so the check
+        // below can't pass vacuously.
+        for role in [
+            Role::Primary,
+            Role::Glow,
+            Role::Accent,
+            Role::Fg,
+            Role::Warn,
+        ] {
+            assert!(
+                matches!(t.color(role), Color::Rgb(..)),
+                "{role:?} should start as RGB"
+            );
+        }
         t.apply_depth(ColorDepth::Ansi16);
         for role in [
             Role::Bg,
@@ -521,7 +540,11 @@ mod tests {
             Role::Warn,
         ] {
             match t.color(role) {
-                Color::Rgb(..) | Color::Reset | Color::Indexed(_) => {}
+                // Bg is Reset (transparent) and stays so; every real RGB
+                // role must have been mapped to an ANSI index.
+                Color::Reset => assert_eq!(role, Role::Bg, "only Bg stays Reset"),
+                Color::Indexed(_) => {}
+                Color::Rgb(..) => panic!("{role:?} stayed RGB after Ansi16 downgrade"),
                 other => panic!("unexpected {other:?} for {role:?}"),
             }
         }

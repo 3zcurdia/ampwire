@@ -1,0 +1,18 @@
+╭¹player───────────────────────────────────────────╮╭³playlist─────────────────────────────────────────╮
+│▶ ▀█  ▄ ▀▀█ █ █   ▁▁▁▃▁▁ ▁▃▃                      ││  1. Aphex Twin - Xtal                      4:51 █│
+│  ▄█▄ ▄ █▄▄ ▀▀█ ▂▂██████▇███▇▆▆▄▂▄▄▄▃▃▃  ▁ ▁▁ ▁▁▂▁││  2. Boards of Canada - Roygbiv             2:31 █│
+│3. Daft Punk - Veridis Quo (5:45)                 ││▸ 3. Daft Punk - Veridis Quo                5:45 █│
+│FLAC  24/96  stereo  bit-perfect      shuf  rep   ││  4. Massive Attack - Teardrop              5:29 █│
+│━━━━━━━━━●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1:24/5:45 ││  5. Portishead - Roads                     5:05 █│
+│vol ━━━━━━━━━━━━━━━━●━━━━━━━bal ━━━━━━━━━●━━━━━━━━││  6. Burial - Archangel                     3:58 █│
+│z|◀ x▶ c‖ v■ b▶| l▲                               ││  7. Air - La Femme d'Argent                7:11 █│
+╰──────────────────────────────────────────────────╯│  8. Moderat - A New Error                  5:46 █│
+╭²eq───────────────────────────────────────────────╮│  9. Bonobo - Kerala                        4:05 █│
+│on  auto  presets 60Hz +3dB  ⠌⠌⠌⠌⠌⠌⠌⠰⠰⠰⠰⠰⠰⠰⠌⠌⠌⠌⠌⠌⠌││ 10. Tycho - Awake                          4:44 █│
+│ +12│   │    │   │    │   │    │   │    │   │    │││ 11. Röyksopp - Eple                        3:39 █│
+│    │   │    ●   │    │   │    │   │    │   ●    ●││ 12. Kiasmos - Blurred EP                   6:07 ││
+│   0●   ●    │   ●    ●   ●    │   ●    ●   │    │││ 13. Jon Hopkins - Open Eye Signal          7:48 ││
+│    │   │    │   │    │   │    ●   │    │   │    │││ 14. Four Tet - Two Thousand                5:12 ││
+│ -12│   │    │   │    │   │    │   │    │   │    │││ 15. Floating Points - Ratio                6:30 ││
+│    pre 60   170 310  600 1k   3k  6k   12k 14k16k││ 16. Caribou - Sun                          4:57 ││
+╰──────────────────────────────────────────────────╯╰ a add ─  d del ─  / find ── 24 · 1:56:43 ────────╯

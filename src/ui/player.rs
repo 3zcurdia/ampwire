@@ -304,13 +304,13 @@ fn render_mix(app: &App, area: Rect, buf: &mut Buffer) {
     .render(bal_area, buf);
 }
 
-const TRANSPORT: &[(Action, char)] = &[
+const TRANSPORT: &[(Action, &str)] = &[
     (Action::Prev, glyphs::PREV),
-    (Action::Play, glyphs::PLAY),
-    (Action::Pause, glyphs::PAUSE),
-    (Action::Stop, glyphs::STOP),
+    (Action::Play, "▶"),
+    (Action::Pause, "‖"),
+    (Action::Stop, "■"),
     (Action::Next, glyphs::NEXT),
-    (Action::Open, glyphs::EJECT),
+    (Action::Open, "▲"),
 ];
 
 fn render_transport(app: &App, area: Rect, buf: &mut Buffer) {
@@ -333,13 +333,17 @@ fn render_transport(app: &App, area: Rect, buf: &mut Buffer) {
                 x += 1;
             }
         }
-        if x >= area.x + area.width {
-            return;
+        // The glyph may be more than one cell (e.g. `|◀`, `▶|`).
+        for c in glyph.chars() {
+            if x >= area.x + area.width {
+                return;
+            }
+            let cell = &mut buf[(x, area.y)];
+            cell.set_symbol(&c.to_string());
+            cell.set_fg(theme.color(Role::Fg));
+            x += 1;
         }
-        let cell = &mut buf[(x, area.y)];
-        cell.set_symbol(&glyph.to_string());
-        cell.set_fg(theme.color(Role::Fg));
-        x += 2; // gap after glyph
+        x += 1; // gap after glyph
     }
 }
 

@@ -576,4 +576,152 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("unknown action"));
     }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// Table test (plan §5): every default key resolves to the right action in
+    /// the right scope.
+    #[test]
+    fn every_plan_default_resolves() {
+        let map = Keymap::defaults();
+        let c = KeyCode::Char;
+        let table: &[(Scope, KeyEvent, Action)] = &[
+            // Transport (global)
+            (Scope::Global, press(c(' ')), Action::PlayPause),
+            (Scope::Global, press(c('z')), Action::Prev),
+            (Scope::Global, press(c('x')), Action::Play),
+            (Scope::Global, press(c('c')), Action::Pause),
+            (Scope::Global, press(c('v')), Action::Stop),
+            (Scope::Global, press(c('b')), Action::Next),
+            (Scope::Global, press(c('l')), Action::Open),
+            (Scope::Global, press(c('s')), Action::ToggleShuffle),
+            (Scope::Global, press(c('r')), Action::ToggleRepeat),
+            // Volume: +/- anywhere
+            (Scope::Global, press(c('+')), Action::VolumeUp),
+            (Scope::Global, press(c('-')), Action::VolumeDown),
+            // Seek: player and playlist focus
+            (Scope::Player, press(KeyCode::Left), Action::SeekBack),
+            (Scope::Player, press(KeyCode::Right), Action::SeekFwd),
+            (Scope::Playlist, press(KeyCode::Left), Action::SeekBack),
+            (Scope::Playlist, press(KeyCode::Right), Action::SeekFwd),
+            // EQ band selection
+            (Scope::Eq, press(KeyCode::Left), Action::BandLeft),
+            (Scope::Eq, press(KeyCode::Right), Action::BandRight),
+            // Volume arrows in player focus
+            (Scope::Player, press(KeyCode::Up), Action::VolumeUp),
+            (Scope::Player, press(KeyCode::Down), Action::VolumeDown),
+            // Cursor in playlist focus
+            (Scope::Playlist, press(KeyCode::Up), Action::CursorUp),
+            (Scope::Playlist, press(KeyCode::Down), Action::CursorDown),
+            // EQ band gain in eq focus
+            (Scope::Eq, press(KeyCode::Up), Action::BandUp),
+            (Scope::Eq, press(KeyCode::Down), Action::BandDown),
+            // Playlist controls
+            (Scope::Playlist, press(KeyCode::Enter), Action::Select),
+            (Scope::Playlist, press(KeyCode::PageUp), Action::PageUp),
+            (Scope::Playlist, press(KeyCode::PageDown), Action::PageDown),
+            (Scope::Playlist, press(KeyCode::Home), Action::JumpHome),
+            (Scope::Playlist, press(KeyCode::End), Action::JumpEnd),
+            // Global misc
+            (
+                Scope::Global,
+                ctrl(KeyCode::Char('t')),
+                Action::ToggleTimeMode,
+            ),
+            (Scope::Global, press(KeyCode::Tab), Action::FocusNext),
+            (Scope::Global, press(KeyCode::BackTab), Action::FocusPrev),
+            (Scope::Global, press(c('1')), Action::TogglePlayer),
+            (Scope::Global, press(c('2')), Action::ToggleEq),
+            (Scope::Global, press(c('3')), Action::TogglePlaylist),
+            (Scope::Global, shift(c('l')), Action::ToggleColumns),
+            (Scope::Global, shift(c('o')), Action::CycleOrder),
+            (Scope::Global, press(c('?')), Action::Help),
+            (Scope::Global, press(c('q')), Action::Quit),
+            (Scope::Global, ctrl(c('c')), Action::Quit),
+        ];
+        for (scope, key, action) in table {
+            assert_eq!(
+                map.resolve(*scope, *key),
+                Some(*action),
+                "{scope:?} + {:?} should be {:?}",
+                key,
+                action
+            );
+        }
+    }
+
+    #[test]
+    fn remap_next_to_n_updates_hints_and_transport() {
+        // remap `next = ["n"]`: `b` no longer maps to Next, and the transport
+        // row shows `n`.
+        let mut overrides = HashMap::new();
+        overrides.insert("next".to_string(), vec!["n".into()]);
+        let (map, messages) = Keymap::from_overrides(&overrides);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(
+            map.resolve(Scope::Global, press(KeyCode::Char('b'))),
+            None,
+            "`b` no longer maps to Next"
+        );
+        assert_eq!(
+            map.resolve(Scope::Global, press(KeyCode::Char('n'))),
+            Some(Action::Next)
+        );
+        assert_eq!(map.hint(Action::Next).as_deref(), Some("n"));
+
+        // The transport row (drawn from keymap.hint) shows the remapped key.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let app = crate::app::App::new(
+            crate::config::Config::default(),
+            map,
+            crate::ui::theme::neon(),
+            false,
+        );
+        let backend = TestBackend::new(52, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::ui::player::render(&app, f.area(), f.buffer_mut(), false))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // The transport row is the last inner row; find `n` immediately left
+        // of the next glyph `▶`.
+        let mut found = false;
+        for y in 0..9u16 {
+            let row: Vec<String> = (0..52u16)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            for i in 0..row.len().saturating_sub(1) {
+                if row[i] == "n" && row[i + 1] == "▶" {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "transport row shows the remapped `n` for next");
+    }
+
+    #[test]
+    fn swapping_next_and_prev_reports_no_conflict() {
+        // swap `next = ["z"]`, `prev = ["b"]`: no conflict, each key lands on
+        // exactly one action.
+        let mut overrides = HashMap::new();
+        overrides.insert("next".to_string(), vec!["z".into()]);
+        overrides.insert("prev".to_string(), vec!["b".into()]);
+        let (map, messages) = Keymap::from_overrides(&overrides);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(
+            map.resolve(Scope::Global, press(KeyCode::Char('z'))),
+            Some(Action::Next)
+        );
+        assert_eq!(
+            map.resolve(Scope::Global, press(KeyCode::Char('b'))),
+            Some(Action::Prev)
+        );
+    }
 }

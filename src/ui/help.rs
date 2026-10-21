@@ -176,6 +176,9 @@ mod tests {
 
     #[test]
     fn remapped_key_shows_in_help() {
+        // Remap next → "n"; the help overlay must list exactly "n" for the
+        // next-track row (not the default "b", and not just any "n" that
+        // happens to appear elsewhere on screen).
         let mut overrides = std::collections::HashMap::new();
         overrides.insert("next".to_string(), vec!["n".into()]);
         let (keymap, conflicts) = Keymap::from_overrides(&overrides);
@@ -186,12 +189,17 @@ mod tests {
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.contains("next track")))
             .expect("next track listed");
-        let text: String = next_line
-            .spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
-        assert!(text.contains('n'), "remapped key shows: {text}");
+        // The first span is the padded keys column.
+        let keys_col = next_line.spans[0].content.to_string();
+        assert_eq!(
+            keys_col.trim(),
+            "n",
+            "help shows the remapped key column: {keys_col:?}"
+        );
+        assert!(
+            !keys_col.contains('b'),
+            "default `b` is gone after remap: {keys_col:?}"
+        );
     }
 }
 
