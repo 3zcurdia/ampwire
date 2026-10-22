@@ -1,5 +1,7 @@
 # Plan 07 — Equalizer presets screen
 
+**Status:** ⬜ not started — safe to pick up (needs plan 06 done).
+
 Goal: press `p` to open a centered list of presets. Moving the cursor
 **previews** the preset live (the EQ sliders and the sound change), `Enter`
 keeps it, `Esc` restores what you had.

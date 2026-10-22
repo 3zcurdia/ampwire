@@ -1,5 +1,7 @@
 # Plan 03 — Real audio playback (wav, mp3, m4a, flac)
 
+**Status:** ⬜ not started — safe to pick up (needs plan 02 done).
+
 Goal: tracks in the playlist actually play through the speakers, with
 **play, pause, stop, next, prev** working. Tracks auto-advance; bad files are
 skipped with a notice.

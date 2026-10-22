@@ -4,19 +4,44 @@ Plan `01` (layout) is done. Plans `02`–`08` turn the mock UI into a real playe
 **Do them in numeric order.** Each plan lists its prerequisites and assumes
 the earlier ones are merged.
 
-| Plan | Feature | Needs |
-|---|---|---|
-| [02](02-playlist-loading.md) | Load files/dirs into the playlist + playlist controls | 01 |
-| [03](03-audio-playback.md) | Play wav/mp3/m4a/flac: play, pause, stop, next, prev, **ordered/shuffle play order** (no timer, no spectrum) | 02 |
-| [04](04-live-sync.md) | Real timer, seeking, FFT spectrum synced to the audio | 03 |
-| [05](05-volume-balance-format.md) | Volume + balance that work, format/bitrate line | 03 (04 recommended) |
-| [06](06-equalizer-dsp.md) | Real 10-band equalizer + preamp | 05 |
-| [07](07-eq-presets.md) | Presets screen (full bass/treble, jazz, rock, …) | 06 |
-| [08](08-jellyfin.md) | Jellyfin server → playlist; temp-dir cache (3 ahead/3 behind) or HTTP streaming, optional EQ bypass | 03, 04, 05, 06 |
+| Plan | Status | Feature | Needs |
+|---|---|---|---|
+| [01](01-winamp-layout.md) | ✅ done | UI shell (mock player, no audio) | — |
+| [02](02-playlist-loading.md) | ⬜ not started | Load files/dirs into the playlist + playlist controls | 01 |
+| [03](03-audio-playback.md) | ⬜ not started | Play wav/mp3/m4a/flac: play, pause, stop, next, prev, **ordered/shuffle play order** (no timer, no spectrum) | 02 |
+| [04](04-live-sync.md) | ⬜ not started | Real timer, seeking, FFT spectrum synced to the audio | 03 |
+| [05](05-volume-balance-format.md) | ⬜ not started | Volume + balance that work, format/bitrate line | 03 (04 recommended) |
+| [06](06-equalizer-dsp.md) | ⬜ not started | Real 10-band equalizer + preamp | 05 |
+| [07](07-eq-presets.md) | ⬜ not started | Presets screen (full bass/treble, jazz, rock, …) | 06 |
+| [08](08-jellyfin.md) | ⬜ not started | Jellyfin server → playlist; temp-dir cache (3 ahead/3 behind) or HTTP streaming, optional EQ bypass | 03, 04, 05, 06 |
+
+## Status line — read it before you touch a plan
+
+Every plan file starts with a `**Status:**` line right under its title. It is
+the source of truth for whether the work is already done:
+
+- ⬜ `not started` — safe to pick up.
+- 🟨 `in progress — <branch/agent>, since <date>` — someone is on it; **do not
+  start over**, coordinate first.
+- ✅ `done — <date>, <commit>` — **do not re-implement.** Never redo a done
+  plan's steps; only fix regressions, and only after `cargo test` shows one.
+
+An agent that has just finished a plan must, **in the same commit that
+completes it**:
+
+1. flip the plan's Status to `✅ done — <YYYY-MM-DD>, <short commit hash>`
+   (the commit that finished it; if folded into another commit, use the merge
+   commit), and
+2. set that plan's row in the table above to `✅ done`.
+
+This is what stops the next agent from duplicating finished work — keep both
+in sync.
 
 ## Rules that apply to EVERY plan
 
-1. **Read first**: `AGENTS.md`, `docs/plans/01-winamp-layout.md` §1, and the
+1. **Read first**: the plan's own `**Status:**` line (if it says ✅ done or 🟨
+   in progress, **stop** — the effort is already claimed), then `AGENTS.md`,
+   `docs/plans/01-winamp-layout.md` §1, and the
    source files named in the plan's "Files" section. Do not guess APIs: for each
    new crate run `cargo add <crate>`, then read its docs on docs.rs for the
    version Cargo resolved. ratatui/crossterm/symphonia/cpal APIs differ between

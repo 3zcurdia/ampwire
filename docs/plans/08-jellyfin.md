@@ -1,5 +1,7 @@
 # Plan 08 — Jellyfin: load the whole server library and play it
 
+**Status:** ⬜ not started — safe to pick up (needs plans 03, 04, 05, 06 done).
+
 Goal: with a `[jellyfin]` section in `config.toml`, pressing `j` fetches every
 audio track on the server into the playlist (appended to whatever is there).
 Those tracks play like local files, in one of three modes:

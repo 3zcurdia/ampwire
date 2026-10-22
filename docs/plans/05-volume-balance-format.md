@@ -1,5 +1,7 @@
 # Plan 05 — Volume, balance and the format/bitrate line
 
+**Status:** ⬜ not started — safe to pick up (needs plan 03; 04 recommended).
+
 Goal: the volume and balance controls change what you hear (and are
 remembered), and the player shows what is playing: `FLAC 24bit 96kHz stereo`
 for lossless, `MP3 320kbps 44.1kHz stereo` for lossy. A bit-perfect marker

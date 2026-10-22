@@ -1,5 +1,7 @@
 # Plan 04 — Live timer, seeking and FFT spectrum in sync with the audio
 
+**Status:** ⬜ not started — safe to pick up (needs plan 03 done).
+
 Goal: the LCD clock, seek bar and spectrum bars follow what is *actually being
 heard*. Pausing freezes them, stopping zeroes them, seeking jumps the clock.
 

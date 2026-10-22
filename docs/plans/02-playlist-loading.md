@@ -1,5 +1,7 @@
 # Plan 02 — Load playlist from files/directories + playlist controls
 
+**Status:** ⬜ not started — safe to pick up.
+
 Goal: the user can launch `ampwire ~/Music` (or press `l` / `a` in the app and
 type a path) and get a real playlist read from disk. Each row shows
 `artist - title (m:ss)`, or `filename (m:ss)` when tags are missing. The

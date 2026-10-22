@@ -1,5 +1,8 @@
 # Plan 01 — Basic layout (UI shell, no audio)
 
+**Status:** ✅ done — implemented (see `git log`: phases 1–3 + layout fixes),
+verified 2026-10-22. **Do not re-implement**; only fix regressions.
+
 Goal: a Ratatui TUI with Winamp 2.x's *anatomy* (player, equalizer, playlist)
 dressed in a **btop-style, cyberpunk-retro** look. Everything runs from the
 keyboard and you quit with `q`. This phase uses **mock player state** only: no
