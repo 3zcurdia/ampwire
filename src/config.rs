@@ -216,22 +216,43 @@ fn string_array<'a>(items: impl IntoIterator<Item = &'a str>) -> toml_edit::Item
 }
 
 /// Drop obviously wrong values serde can't catch (empty orders, bad columns).
+///
+/// `stack` must be a permutation of player + eq and `single_order` of all
+/// three panels: unknown, misplaced, and repeated entries are dropped, and
+/// missing panels are appended in default order. The layout engine relies on
+/// this — a panel listed twice would be laid out twice.
 fn sanitize(mut config: Config) -> Config {
     if !(1..=2).contains(&config.layout.columns) {
         config.layout.columns = 2;
     }
-    for list in [
-        &mut config.layout.stack,
-        &mut config.layout.single_order,
-        &mut config.layout.visible,
-    ] {
-        list.retain(|p| *p != Panel::Unknown);
-        list.dedup();
-        if list.is_empty() {
-            *list = LayoutConfig::default().visible;
+    let defaults = LayoutConfig::default();
+    normalize_order(&mut config.layout.stack, &defaults.stack);
+    normalize_order(&mut config.layout.single_order, &defaults.single_order);
+
+    let mut visible: Vec<Panel> = Vec::new();
+    for panel in &config.layout.visible {
+        if *panel != Panel::Unknown && !visible.contains(panel) {
+            visible.push(*panel);
         }
     }
+    config.layout.visible = if visible.is_empty() {
+        defaults.visible
+    } else {
+        visible
+    };
     config
+}
+
+/// Reorder `list` into a permutation of `allowed`, keeping the user's order
+/// for the entries that are valid.
+fn normalize_order(list: &mut Vec<Panel>, allowed: &[Panel]) {
+    let mut out: Vec<Panel> = Vec::with_capacity(allowed.len());
+    for panel in list.iter().chain(allowed) {
+        if allowed.contains(panel) && !out.contains(panel) {
+            out.push(*panel);
+        }
+    }
+    *list = out;
 }
 
 #[cfg(test)]
@@ -302,6 +323,46 @@ mod tests {
         let config = Config::default();
         config.save(&path).unwrap();
         assert_eq!(Config::load_from(&path).config, config);
+    }
+
+    #[test]
+    fn broken_layout_orders_are_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cases: &[(&str, &[Panel], &[Panel])] = &[
+            // Empty lists fall back to the defaults.
+            (
+                "stack = []\nsingle_order = []",
+                &[Panel::Player, Panel::Eq],
+                &[Panel::Player, Panel::Eq, Panel::Playlist],
+            ),
+            // Non-adjacent repeats, a playlist in the stack, unknown names.
+            (
+                "stack = [\"eq\", \"playlist\", \"bogus\", \"eq\"]\n\
+                 single_order = [\"playlist\", \"player\", \"playlist\"]",
+                &[Panel::Eq, Panel::Player],
+                &[Panel::Playlist, Panel::Player, Panel::Eq],
+            ),
+        ];
+        for (layout, stack, single_order) in cases {
+            fs::write(&path, format!("[layout]\n{layout}\n")).unwrap();
+            let config = Config::load_from(&path).config;
+            assert_eq!(config.layout.stack, *stack, "{layout}");
+            assert_eq!(config.layout.single_order, *single_order, "{layout}");
+        }
+    }
+
+    #[test]
+    fn visible_drops_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[layout]\nvisible = [\"eq\", \"player\", \"eq\", \"bogus\"]\n",
+        )
+        .unwrap();
+        let config = Config::load_from(&path).config;
+        assert_eq!(config.layout.visible, vec![Panel::Eq, Panel::Player]);
     }
 
     #[test]

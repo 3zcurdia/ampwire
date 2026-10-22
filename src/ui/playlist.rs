@@ -21,16 +21,24 @@ pub fn format_duration(secs: u64) -> String {
     crate::ui::player::format_time(secs)
 }
 
-/// The cursor stays visible: scroll is derived from the cursor and the
-/// visible height, never stored.
-pub fn scroll_for(cursor: usize, height: usize) -> usize {
-    cursor.saturating_sub(height.saturating_sub(1))
+/// Adjust the stored scroll so the cursor stays visible: the window only
+/// moves when the cursor would leave it, and never scrolls past the end.
+pub fn scroll_for(scroll: usize, cursor: usize, height: usize, total: usize) -> usize {
+    let scroll = if cursor < scroll {
+        cursor
+    } else if cursor >= scroll + height {
+        (cursor + 1).saturating_sub(height)
+    } else {
+        scroll
+    };
+    scroll.min(total.saturating_sub(height))
 }
 
 /// Build the playlist bottom-border line: key hints, then an optional notice
 /// (truncated by display width with `…`, first line only), then the track
 /// count and total time. `width` is the available inner border width; the
-/// count and total are never dropped, the notice is truncated first.
+/// count and total are never dropped: the notice goes first, then the hints
+/// from the right.
 fn playlist_bottom_border<'a>(
     theme: &'a Theme,
     keymap: &'a Keymap,
@@ -41,27 +49,9 @@ fn playlist_bottom_border<'a>(
     let muted = Style::default().fg(theme.color(Role::Muted));
     let mut spans: Vec<Span<'a>> = Vec::new();
 
-    // Hints: ` a add ─ d del ─ / find `.
-    let hints: [(Action, &str); 3] = [
-        (Action::Add, "add"),
-        (Action::Del, "del"),
-        (Action::Find, "find"),
-    ];
-    for (i, (action, label)) in hints.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" ─ ", muted));
-        }
-        let key = keymap.hint(*action).unwrap_or_default();
-        spans.push(Span::styled(
-            format!(" {key} "),
-            Style::default().fg(theme.color(Role::Accent)),
-        ));
-        spans.push(Span::styled((*label).to_string(), muted));
-    }
-
-    // The fixed tail: `── <totals> ─`, reserved so it always fits.
+    // The fixed tail: `─ <totals> ─`, reserved so it always fits.
     let totals_tail: Vec<Span<'a>> = vec![
-        Span::styled(" ── ", muted),
+        Span::styled("─ ", muted),
         Span::styled(
             totals.to_string(),
             Style::default().fg(theme.color(Role::Fg)),
@@ -70,19 +60,40 @@ fn playlist_bottom_border<'a>(
     ];
     let tail_width: usize = totals_tail.iter().map(|s| s.content.width()).sum();
 
+    // Hints: `─ a add ─ d del ─ / find ─`, each kept only while it fits.
+    let hints: [(Action, &str); 3] = [
+        (Action::Add, "add"),
+        (Action::Del, "del"),
+        (Action::Find, "find"),
+    ];
+    let mut head_width = 0usize;
+    for (action, label) in hints {
+        let key = keymap.hint(action).unwrap_or_default();
+        let hint = [
+            Span::styled("─ ", muted),
+            Span::styled(key, Style::default().fg(theme.color(Role::Accent))),
+            Span::styled(format!(" {label} "), muted),
+        ];
+        let hint_width: usize = hint.iter().map(|s| s.content.width()).sum();
+        if head_width + hint_width + tail_width > width {
+            break;
+        }
+        head_width += hint_width;
+        spans.extend(hint);
+    }
+
     if let Some(notice) = notice {
         // Collapse multi-line TOML errors to their first line.
         let first_line = notice.lines().next().unwrap_or(notice);
-        let head_width: usize = spans.iter().map(|s| s.content.width()).sum();
         let available = width
             .saturating_sub(head_width)
             .saturating_sub(tail_width)
-            .saturating_sub(4); // `── ` + ` ─` separators around the notice
+            .saturating_sub(3); // `─ ` before the notice, a space after
         if available >= 4 {
             let truncated = truncate_ellipsis(first_line, available);
-            spans.push(Span::styled(" ── ", muted));
+            spans.push(Span::styled("─ ", muted));
             spans.push(Span::styled(
-                format!(" {truncated} "),
+                format!("{truncated} "),
                 Style::default().fg(theme.color(Role::Warn)),
             ));
         }
@@ -152,8 +163,9 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         .min(snapshot.tracks.len().saturating_sub(1));
     let total = snapshot.tracks.len();
     let height = inner.height as usize;
-    // Keep the cursor visible; clamp so the list never scrolls past the end.
-    let scroll = scroll_for(cursor, height).min(total.saturating_sub(height));
+    // The app keeps the scroll in sync before each frame; re-derive it here
+    // so the cursor is visible even when rendered without that (tests).
+    let scroll = scroll_for(app.ui.playlist_scroll, cursor, height, total);
 
     let overflow = snapshot.tracks.len() > inner.height as usize;
     let list_width = if overflow {
@@ -318,9 +330,27 @@ mod tests {
             app.dispatch(Action::CursorDown);
         }
         assert_eq!(app.ui.playlist_cursor, 23); // clamped to last track
-        // Derived scroll keeps the cursor visible in a 16-row window.
-        let scroll = scroll_for(app.ui.playlist_cursor, 16);
-        assert!(scroll + 16 > 23, "cursor must be inside the window");
+        // The scroll keeps the cursor visible in a 16-row window.
+        let scroll = scroll_for(0, app.ui.playlist_cursor, 16, 24);
+        assert_eq!(scroll, 8, "cursor on the last row");
+        // Moving up inside the window keeps the scroll.
+        assert_eq!(scroll_for(scroll, 20, 16, 24), 8);
+        // Above the window, it follows the cursor.
+        assert_eq!(scroll_for(scroll, 3, 16, 24), 3);
+    }
+
+    #[test]
+    fn narrow_border_drops_hints_before_totals() {
+        let app = test_app();
+        for width in [40u16, 44, 52] {
+            let border = bottom_border(&app, width);
+            assert!(border.contains("24 · 1:56:43"), "totals kept: {border}");
+        }
+        assert!(
+            bottom_border(&app, 52).contains("find"),
+            "room for all hints"
+        );
+        assert!(!bottom_border(&app, 40).contains("find"), "find dropped");
     }
 
     #[test]
@@ -390,7 +420,7 @@ mod tests {
 
         // Narrow panel: no room for the notice at all → it is dropped, but
         // the count and total still win the space.
-        let narrow = bottom_border(&app, 52);
+        let narrow = bottom_border(&app, 44);
         assert!(
             narrow.contains("24"),
             "count kept when notice dropped: {narrow}"

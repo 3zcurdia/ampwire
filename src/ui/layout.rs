@@ -173,6 +173,20 @@ pub fn compute_layout(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> Comp
 /// Smallest height a panel may render at before it is dropped.
 pub const MIN_PANEL_HEIGHT: u16 = 3;
 
+/// The visible panels of `order`, keeping only the first occurrence of each
+/// panel in `allowed` and appending any `allowed` panel the order forgot.
+/// Config loading already normalizes the orders; this keeps the layout
+/// well-formed even if handed a bad one.
+fn visible_in_order(order: &[Panel], allowed: &[Panel], vis: &Visibility) -> Vec<Panel> {
+    let mut out: Vec<Panel> = Vec::with_capacity(allowed.len());
+    for panel in order.iter().chain(allowed) {
+        if allowed.contains(panel) && vis.is_visible(*panel) && !out.contains(panel) {
+            out.push(*panel);
+        }
+    }
+    out
+}
+
 fn split_columns(area: Rect, left_width: u16, playlist_side: PlaylistSide) -> (Rect, Rect) {
     let (stack_area, playlist_area) = match playlist_side {
         PlaylistSide::Right => {
@@ -199,12 +213,7 @@ fn compute_two_column(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> Comp
     );
 
     // Visible panels in the stack, in user order.
-    let stack: Vec<Panel> = prefs
-        .stack
-        .iter()
-        .copied()
-        .filter(|p| vis.is_visible(*p))
-        .collect();
+    let stack = visible_in_order(&prefs.stack, &[Panel::Player, Panel::Eq], vis);
 
     let mut player = None;
     let mut eq = None;
@@ -247,36 +256,27 @@ fn compute_two_column(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> Comp
             // the EQ is dropped entirely rather than rendered as a squashed
             // box with fewer than 3 inner rows (≥5 with borders). This is a
             // frame-only fallback; the saved visibility is untouched.
-            let remaining = stack_area.height.saturating_sub(player_height);
-            let eq_height = if remaining >= EQ_HEIGHT {
-                EQ_HEIGHT.max(remaining)
-            } else {
-                remaining
-            };
+            let eq_height = stack_area.height.saturating_sub(player_height);
             let show_eq = eq_height >= MIN_EQ_TOTAL;
 
             let mut y = stack_area.y;
             for panel in &stack {
-                let rect = match panel {
-                    Panel::Player => Rect {
-                        height: player_height,
-                        y,
-                        ..stack_area
-                    },
-                    _ => Rect {
-                        height: eq_height,
-                        y,
-                        ..stack_area
-                    },
+                // A dropped EQ takes no space, so the player never sits
+                // below an empty gap when the EQ is first in the stack.
+                let height = match panel {
+                    Panel::Player => player_height,
+                    _ if show_eq => eq_height,
+                    _ => continue,
                 };
-                y += rect.height;
+                let rect = Rect {
+                    height,
+                    y,
+                    ..stack_area
+                };
+                y += height;
                 match panel {
                     Panel::Player => player = Some(rect),
-                    _ => {
-                        if show_eq {
-                            eq = Some(rect);
-                        }
-                    }
+                    _ => eq = Some(rect),
                 }
             }
         }
@@ -292,12 +292,8 @@ fn compute_two_column(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> Comp
 }
 
 fn compute_single_column(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> ComputedLayout {
-    let visible: Vec<Panel> = prefs
-        .single_order
-        .iter()
-        .copied()
-        .filter(|p| vis.is_visible(*p))
-        .collect();
+    const ALL: [Panel; 3] = [Panel::Player, Panel::Eq, Panel::Playlist];
+    let visible = visible_in_order(&prefs.single_order, &ALL, vis);
 
     // Fallback order (plan §2.2):
     // 1. the playlist shrinks to MIN_PLAYLIST_HEIGHT (already assumed below),
@@ -317,12 +313,7 @@ fn compute_single_column(area: Rect, prefs: &LayoutPrefs, vis: &Visibility) -> C
     }
 
     // Recompute after hiding the EQ.
-    let visible: Vec<Panel> = prefs
-        .single_order
-        .iter()
-        .copied()
-        .filter(|p| effective.is_visible(*p))
-        .collect();
+    let visible = visible_in_order(&prefs.single_order, &ALL, &effective);
     let reduced: u16 = visible
         .iter()
         .map(|p| match p {
@@ -606,6 +597,50 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_eq_leaves_no_gap_above_the_player() {
+        // EQ first in the stack, too short for it: the player moves up to the
+        // top instead of sitting below the EQ's unused rows.
+        let mut p = prefs();
+        p.stack = vec![Panel::Eq, Panel::Player];
+        let l = compute_layout(area(104, PLAYER_HEIGHT + 4), &p, &Visibility::all());
+        assert!(l.eq.is_none());
+        assert_eq!(l.player.unwrap().y, 0);
+    }
+
+    /// Malformed orders (empty, repeated, misplaced panels) never produce
+    /// overlapping or out-of-area rects, and never lose a visible panel.
+    #[test]
+    fn malformed_orders_stay_well_formed() {
+        let broken: [Vec<Panel>; 5] = [
+            vec![],
+            vec![Panel::Player, Panel::Eq, Panel::Player],
+            vec![Panel::Player, Panel::Eq, Panel::Playlist],
+            vec![Panel::Playlist],
+            vec![Panel::Unknown, Panel::Eq],
+        ];
+        for columns in [1u8, 2] {
+            for order in &broken {
+                let p = LayoutPrefs {
+                    columns,
+                    playlist_side: PlaylistSide::Right,
+                    stack: order.clone(),
+                    single_order: order.clone(),
+                };
+                let a = area(160, 45);
+                let l = compute_layout(a, &p, &Visibility::all());
+                for r in [l.player, l.eq, l.playlist] {
+                    let r = r.unwrap_or_else(|| panic!("panel lost: {p:?} {l:?}"));
+                    assert!(r.y + r.height <= a.height, "{p:?} {r:?}");
+                }
+                if columns == 2 {
+                    let (pl, eq) = (l.player.unwrap(), l.eq.unwrap());
+                    assert!(pl.y + pl.height <= eq.y || eq.y + eq.height <= pl.y);
                 }
             }
         }

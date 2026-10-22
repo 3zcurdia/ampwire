@@ -143,6 +143,12 @@ fn curve_bands(bands: &[i8; 11]) -> Vec<f32> {
     bands[1..].iter().map(|db| *db as f32 / 12.0).collect()
 }
 
+/// Column of slider `i` of `n`, spread evenly so the first and last sit on
+/// the region's edges.
+fn slider_x(region: Rect, i: usize, n: usize) -> u16 {
+    region.x + (i as u16 * region.width.saturating_sub(1)) / (n as u16 - 1)
+}
+
 /// Slider region: everything right of the scale column.
 fn slider_region(area: Rect) -> Rect {
     let width = area.width.saturating_sub(SCALE_WIDTH);
@@ -164,7 +170,7 @@ fn render_sliders(app: &App, area: Rect, buf: &mut Buffer) {
     // 11 sliders spread evenly across the full region, reaching both edges.
     let n = ui.eq_bands.len(); // 11
     for (i, db) in ui.eq_bands.iter().enumerate() {
-        let x = region.x + (i as u16 * (region.width.saturating_sub(1))) / (n as u16 - 1);
+        let x = slider_x(region, i, n);
         let slider_area = Rect {
             x,
             width: 1,
@@ -210,28 +216,41 @@ fn render_labels(app: &App, area: Rect, buf: &mut Buffer) {
         return;
     }
     let n = ui.eq_bands.len();
+    let right = area.x + area.width;
+    // Each label is centered under its slider, clamped to the panel.
+    let start_of = |i: usize| {
+        let lw = BAND_LABELS[i].len() as u16;
+        slider_x(region, i, n)
+            .saturating_sub((lw - 1) / 2)
+            .max(area.x)
+            .min(right.saturating_sub(lw))
+    };
+    // `pre` and the top band always show, anchoring both ends. The labels
+    // between never touch a neighbour: one that would is skipped, so a
+    // narrow EQ shows fewer labels instead of runs like `310600`.
+    let last = n - 1;
+    let last_start = start_of(last);
+    let mut next_free = area.x;
     for (i, label) in BAND_LABELS.iter().enumerate() {
-        let x = region.x + (i as u16 * (region.width.saturating_sub(1))) / (n as u16 - 1);
+        let lw = label.len() as u16;
+        let start = start_of(i);
+        let fits = start >= next_free && start + lw < last_start;
+        if !(fits || i == 0 || i == last) {
+            continue;
+        }
+        next_free = start + lw + 1;
         let color = if ui.eq_focus == i {
             theme.color(Role::Glow)
         } else {
             theme.color(Role::Muted)
         };
-        // Center the label under its slider, clamped so it never overflows
-        // the panel edge (the last band sits at the far right).
-        let lw = label.chars().count() as u16;
-        let center = x.saturating_add(1);
-        let start = center
-            .saturating_sub(lw / 2)
-            .min(area.x + area.width.saturating_sub(lw.min(area.width)));
         for (j, c) in label.chars().enumerate() {
             let cx = start + j as u16;
-            if cx >= area.x + area.width {
-                break;
+            if cx < right {
+                let cell = &mut buf[(cx, area.y)];
+                cell.set_symbol(&c.to_string());
+                cell.set_fg(color);
             }
-            let cell = &mut buf[(cx, area.y)];
-            cell.set_symbol(&c.to_string());
-            cell.set_fg(color);
         }
     }
 }
@@ -363,6 +382,28 @@ mod tests {
         app.ui.eq_focus = 10;
         app.dispatch(crate::action::Action::BandRight);
         assert_eq!(app.ui.eq_focus, 10);
+    }
+
+    #[test]
+    fn band_labels_never_touch() {
+        let app = test_app();
+        for width in [40u16, 44, 52, 80, 160] {
+            let area = Rect::new(0, 0, width, 9);
+            let mut buf = Buffer::empty(area);
+            render(&app, area, &mut buf);
+            // Labels row is the last inner row.
+            let row: String = (1..width - 1)
+                .map(|x| buf[(x, 7)].symbol().to_string())
+                .collect();
+            for word in row.split_whitespace() {
+                assert!(
+                    BAND_LABELS.contains(&word),
+                    "run-on label {word:?} at {width}: {row:?}"
+                );
+            }
+            assert!(row.contains("pre"), "{row:?}");
+            assert!(row.contains("16k"), "{row:?}");
+        }
     }
 
     #[test]

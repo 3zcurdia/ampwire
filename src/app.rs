@@ -14,6 +14,7 @@ use crate::ui;
 use crate::ui::layout::{LayoutPrefs, Panel, PlaylistSide, Visibility, compute_layout};
 use crate::ui::theme::omarchy::OmarchyWatch;
 use crate::ui::theme::{Role, Theme};
+use ratatui::layout::Rect;
 
 /// Target frame budget (~30 fps). Spectrum and clock advance every frame.
 pub const FRAME: Duration = Duration::from_millis(33);
@@ -35,6 +36,9 @@ pub struct UiState {
     /// LCD blink phase (visible when true; digits blink while paused).
     pub blink_lit: bool,
     pub playlist_cursor: usize,
+    /// First visible playlist row. Moves only when the cursor would leave
+    /// the window, so ↑ near the bottom moves the cursor, not the list.
+    pub playlist_scroll: usize,
     /// Focused EQ band, 0 = preamp, 1–10 = bands.
     pub eq_focus: usize,
     /// Preamp + 10 bands, in dB (-12..=12).
@@ -57,6 +61,7 @@ impl Default for UiState {
             marquee_offset: 0,
             blink_lit: true,
             playlist_cursor: 0,
+            playlist_scroll: 0,
             eq_focus: 1,
             eq_bands: [0; 11],
             eq_on: true,
@@ -92,6 +97,11 @@ pub struct App {
     config_path: Option<std::path::PathBuf>,
     /// True when the on-disk config failed to load: never write back.
     read_only: bool,
+    /// Terminal area of the frame about to be drawn; `None` until the first
+    /// frame (tests, `--dump`). Focus uses it to skip auto-dropped panels.
+    last_area: Option<Rect>,
+    /// Omarchy is unavailable and the neon fallback is already applied.
+    omarchy_fallback: bool,
 }
 
 /// Fixed EQ state for `--dump` and the golden tests (plan §2.3 shape).
@@ -130,6 +140,8 @@ impl App {
             omarchy_acc: Duration::ZERO,
             config_path: None,
             read_only: false,
+            last_area: None,
+            omarchy_fallback: false,
         }
     }
 
@@ -176,6 +188,8 @@ impl App {
             // Demo mode never writes: layout changes stay in memory only.
             config_path: if demo { None } else { config_path },
             read_only: false,
+            last_area: None,
+            omarchy_fallback: false,
         }
     }
 
@@ -226,16 +240,13 @@ impl App {
     /// frame), marquee, blink, Omarchy — has its own deadline.
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         loop {
+            let size = terminal.size()?;
+            self.sync_to_area(Rect::new(0, 0, size.width, size.height));
             terminal.draw(|frame| ui::render(frame, self))?;
 
-            self.next_frame += FRAME;
             let now = Instant::now();
-            if self.next_frame < now {
-                // We fell behind (slow draw); resync rather than catch up in a
-                // burst that would peg the CPU.
-                self.next_frame = now;
-            }
-            if event::poll(self.next_frame - now)? {
+            self.next_frame = advance_deadline(self.next_frame, now);
+            if event::poll(self.next_frame.saturating_duration_since(now))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_key(key);
@@ -254,6 +265,39 @@ impl App {
             if self.should_quit {
                 return Ok(());
             }
+        }
+    }
+
+    /// Bring focus and playlist scroll in line with what the layout draws at
+    /// `area`. Called just before each frame is drawn.
+    pub fn sync_to_area(&mut self, area: Rect) {
+        self.last_area = Some(area);
+        // A fallback (short terminal) may have dropped the focused panel.
+        if !self.rendered_panels().is_visible(panel_for(self.ui.focus)) {
+            self.cycle_focus(1);
+        }
+        if let Some(rect) = self.compute_layout(area).playlist {
+            let rows = rect.height.saturating_sub(2) as usize;
+            self.ui.playlist_scroll = ui::playlist::scroll_for(
+                self.ui.playlist_scroll,
+                self.ui.playlist_cursor,
+                rows,
+                self.snapshot.tracks.len(),
+            );
+        }
+    }
+
+    /// Panels the layout actually draws: the visibility toggles minus any
+    /// panel an automatic fallback dropped at the last known size.
+    fn rendered_panels(&self) -> Visibility {
+        let Some(area) = self.last_area else {
+            return self.ui.vis;
+        };
+        let layout = self.compute_layout(area);
+        Visibility {
+            player: layout.player.is_some(),
+            eq: layout.eq.is_some(),
+            playlist: layout.playlist.is_some(),
         }
     }
 
@@ -314,24 +358,26 @@ impl App {
     }
 
     /// Poll the Omarchy theme once and adopt it if it changed. If Omarchy is
-    /// absent or unreadable, fall back to neon silently (plan §3.3) — no
-    /// notice, just the reason logged to the field below for debugging.
+    /// absent or unreadable, fall back to neon silently (plan §3.3), once —
+    /// not on every poll while it stays missing.
     fn check_omarchy(&mut self) {
         match self.omarchy.check(self.config.theme.transparent) {
             Ok(Some(mut theme)) => {
                 Self::apply_theme_overrides(&mut theme, &self.config);
                 theme.apply_depth(ui::theme::ColorDepth::detect());
                 self.theme = theme;
+                self.omarchy_fallback = false;
             }
             Ok(None) => {}
             Err(_reason) => {
                 // Silent fallback to neon: Omarchy is optional (e.g. macOS).
-                if self.config.theme.preset != "neon"
+                if !self.omarchy_fallback
                     && let Some(neon) = Theme::preset("neon")
                 {
                     self.theme = neon;
                     Self::apply_theme_overrides(&mut self.theme, &self.config);
                     self.theme.apply_depth(ui::theme::ColorDepth::detect());
+                    self.omarchy_fallback = true;
                 }
             }
         }
@@ -485,33 +531,26 @@ impl App {
             return;
         }
         self.ui.vis.set_visible(panel, visible);
-        if !self.ui.vis.is_visible(match self.ui.focus {
-            Scope::Player => Panel::Player,
-            Scope::Eq => Panel::Eq,
-            _ => Panel::Playlist,
-        }) {
+        if !self.rendered_panels().is_visible(panel_for(self.ui.focus)) {
             self.cycle_focus(1);
         }
         self.save_config();
     }
 
+    /// Move focus `dir` steps through player → eq → playlist, skipping
+    /// panels that aren't drawn. Starting from a hidden panel picks its
+    /// neighbour in that direction.
     fn cycle_focus(&mut self, dir: i32) {
         let order = [Scope::Player, Scope::Eq, Scope::Playlist];
-        let visible_scopes: Vec<Scope> = order
-            .iter()
-            .copied()
-            .filter(|s| self.ui.vis.is_visible(panel_for(*s)))
-            .collect();
-        if visible_scopes.is_empty() {
-            return;
+        let rendered = self.rendered_panels();
+        let start = order.iter().position(|s| *s == self.ui.focus).unwrap_or(0) as i32;
+        for step in 1..=order.len() as i32 {
+            let scope = order[(start + dir * step).rem_euclid(order.len() as i32) as usize];
+            if rendered.is_visible(panel_for(scope)) {
+                self.ui.focus = scope;
+                return;
+            }
         }
-        let idx = visible_scopes
-            .iter()
-            .position(|s| *s == self.ui.focus)
-            .unwrap_or(0);
-        let len = visible_scopes.len() as i32;
-        let next = (idx as i32 + dir).rem_euclid(len) as usize;
-        self.ui.focus = visible_scopes[next];
     }
 
     /// Persist the current layout. Mirrors the live visibility into
@@ -542,6 +581,18 @@ impl App {
         }
         self.config.layout.visible = visible;
     }
+}
+
+/// When the next periodic frame is due. Only a deadline that has passed
+/// moves forward, so redraws woken early by input don't push the animation
+/// clock into the future (holding a key used to freeze the spectrum). A draw
+/// more than a frame late resyncs instead of catching up in a burst.
+fn advance_deadline(deadline: Instant, now: Instant) -> Instant {
+    if now < deadline {
+        return deadline;
+    }
+    let next = deadline + FRAME;
+    if next < now { now + FRAME } else { next }
 }
 
 fn panel_for(scope: Scope) -> Panel {
@@ -803,6 +854,61 @@ mod tests {
         let side = app.config.layout.playlist_side;
         app.dispatch(Action::CycleOrder);
         assert_ne!(side, app.config.layout.playlist_side);
+    }
+
+    #[test]
+    fn early_wakeups_do_not_push_the_deadline() {
+        let start = Instant::now();
+        // Woken by input before the deadline: it stays put, however often.
+        let mut deadline = start + FRAME;
+        for ms in [1, 2, 3, 10, 20] {
+            deadline = advance_deadline(deadline, start + Duration::from_millis(ms));
+        }
+        assert_eq!(deadline, start + FRAME);
+        // Deadline reached: the next frame is one frame later.
+        assert_eq!(advance_deadline(deadline, deadline), deadline + FRAME);
+        // Far behind (slow draw): resync to one frame from now.
+        let late = deadline + FRAME * 5;
+        assert_eq!(advance_deadline(deadline, late), late + FRAME);
+    }
+
+    #[test]
+    fn focus_skips_panels_dropped_by_a_fallback() {
+        let (mut app, _dir) = test_app();
+        // 104×15: two columns, but too short for the EQ under the player.
+        app.ui.focus = Scope::Eq;
+        app.sync_to_area(Rect::new(0, 0, 104, 15));
+        assert_eq!(app.ui.focus, Scope::Playlist, "focus left the dropped EQ");
+        app.dispatch(Action::FocusNext);
+        assert_eq!(app.ui.focus, Scope::Player);
+        app.dispatch(Action::FocusNext);
+        assert_eq!(app.ui.focus, Scope::Playlist, "EQ skipped");
+    }
+
+    #[test]
+    fn hiding_the_focused_panel_moves_focus_to_its_neighbour() {
+        let (mut app, _dir) = test_app();
+        assert_eq!(app.ui.focus, Scope::Player);
+        app.dispatch(Action::TogglePlayer);
+        assert_eq!(app.ui.focus, Scope::Eq);
+    }
+
+    #[test]
+    fn playlist_scroll_moves_only_at_the_window_edge() {
+        let (mut app, _dir) = test_app();
+        // 104×18: the playlist shows 16 rows of 24 tracks.
+        let area = Rect::new(0, 0, 104, 18);
+        app.dispatch(Action::JumpEnd);
+        app.sync_to_area(area);
+        assert_eq!(app.ui.playlist_scroll, 8);
+        // ↑ moves the cursor inside the window; the list stays put.
+        app.dispatch(Action::CursorUp);
+        app.sync_to_area(area);
+        assert_eq!(app.ui.playlist_scroll, 8);
+        // Past the top edge the list follows.
+        app.dispatch(Action::JumpHome);
+        app.sync_to_area(area);
+        assert_eq!(app.ui.playlist_scroll, 0);
     }
 
     #[test]

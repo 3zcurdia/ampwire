@@ -12,24 +12,22 @@ use ratatui::widgets::Widget;
 const BRAILLE_BLANK: u32 = 0x2800;
 
 /// Bit layout of braille dots inside one cell (dot column, dot row) → bit.
+///
+/// Unicode numbers the dots down the left column first, then the right, with
+/// the bottom row (dots 7 and 8) added last:
+///
+/// ```text
+/// 1 4     0x01 0x08
+/// 2 5     0x02 0x10
+/// 3 6     0x04 0x20
+/// 7 8     0x40 0x80
+/// ```
 fn braille_bit(dx: u32, dy: u32) -> u32 {
-    // 2 columns × 4 rows:
-    // 0,0 → bit0 (0x01); 1,0 → bit1 (0x02);
-    // 0,1 → bit2 (0x04); 1,1 → bit3 (0x08);
-    // 0,2 → bit4 (0x10); 1,2 → bit5 (0x20);
-    // 0,3 → bit6 (0x40); 1,3 → bit7 (0x80).
-    let index = match (dx, dy) {
-        (0, 0) => 0,
-        (1, 0) => 1,
-        (0, 1) => 2,
-        (1, 1) => 3,
-        (0, 2) => 4,
-        (1, 2) => 5,
-        (0, 3) => 6,
-        (1, 3) => 7,
-        _ => 0,
-    };
-    1 << index
+    const BITS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    BITS.get(dy as usize)
+        .and_then(|row| row.get(dx as usize))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Values in -1.0..=1.0 (dB ±12 mapped by the caller), left to right.
@@ -169,13 +167,32 @@ mod tests {
 
     #[test]
     fn braille_bits_are_correct() {
+        // Unicode dot numbering: 1-2-3 down the left, 4-5-6 down the right,
+        // then 7 (bottom left) and 8 (bottom right).
         assert_eq!(braille_bit(0, 0), 0x01);
-        assert_eq!(braille_bit(1, 0), 0x02);
-        assert_eq!(braille_bit(0, 1), 0x04);
-        assert_eq!(braille_bit(1, 1), 0x08);
-        assert_eq!(braille_bit(0, 2), 0x10);
+        assert_eq!(braille_bit(0, 1), 0x02);
+        assert_eq!(braille_bit(0, 2), 0x04);
+        assert_eq!(braille_bit(1, 0), 0x08);
+        assert_eq!(braille_bit(1, 1), 0x10);
         assert_eq!(braille_bit(1, 2), 0x20);
         assert_eq!(braille_bit(0, 3), 0x40);
         assert_eq!(braille_bit(1, 3), 0x80);
+    }
+
+    #[test]
+    fn flat_line_lights_one_dot_row() {
+        // A flat 0 dB curve on a 1-row canvas sits on dot row 2 (of 0..=3,
+        // 1.5 rounded up) in every cell: both columns, nothing else — `⠤`
+        // (dots 3 + 6). The old row-major bit order drew `⠰` here.
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        EqCurve {
+            values: &[0.0; 10],
+            color: Color::Rgb(255, 106, 0),
+        }
+        .render(area, &mut buf);
+        for x in 0..4 {
+            assert_eq!(buf.cell((x, 0)).unwrap().symbol(), "⠤");
+        }
     }
 }

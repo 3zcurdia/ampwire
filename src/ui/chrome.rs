@@ -49,8 +49,10 @@ pub fn panel_block<'a>(
     let super_hint = superscript(toggle_action(panel), keymap);
     let name = panel.as_str();
 
-    // Superscript in glow always (it's a hotkey); label follows focus.
+    // Superscript in glow always (it's a hotkey); label follows focus. The
+    // leading `─` keeps the corner rounded off before the label: `╭─¹player`.
     let title = Line::from(vec![
+        Span::styled("─", Style::default().fg(border_color)),
         Span::styled(super_hint, Style::default().fg(theme.color(Role::Glow))),
         Span::styled(name, Style::default().fg(border_color)),
     ]);

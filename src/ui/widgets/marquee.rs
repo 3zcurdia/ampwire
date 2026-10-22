@@ -14,8 +14,8 @@ pub struct Marquee<'a> {
     pub text: &'a str,
     pub offset: usize,
     pub style: Style,
-    /// Columns to pad with after the text before wrapping around.
-    pub gap: usize,
+    /// Text shown after the title before it wraps around (Winamp's ` *** `).
+    pub separator: &'a str,
 }
 
 impl Widget for Marquee<'_> {
@@ -44,8 +44,8 @@ impl Widget for Marquee<'_> {
 
         // Scrolls: index graphemes of text+gap by display column, then walk
         // the visible window [offset, offset+width) with wraparound.
-        let cycle = text_width + self.gap;
-        let doubled: String = format!("{}{}", self.text, " ".repeat(self.gap));
+        let cycle = text_width + self.separator.width();
+        let doubled: String = format!("{}{}", self.text, self.separator);
         let graphemes = unicode_segment_widths(&doubled);
         let mut columns: Vec<(&str, usize)> = Vec::with_capacity(cycle);
         for (g, w) in &graphemes {
@@ -115,7 +115,7 @@ mod tests {
                 text: "abc",
                 offset: 0,
                 style: Style::default(),
-                gap: 4,
+                separator: "    ",
             },
             6,
         );
@@ -129,7 +129,7 @@ mod tests {
                 text: "abcdefgh",
                 offset: 0,
                 style: Style::default(),
-                gap: 4,
+                separator: "    ",
             },
             4,
         );
@@ -139,11 +139,25 @@ mod tests {
                 text: "abcdefgh",
                 offset: 2,
                 style: Style::default(),
-                gap: 4,
+                separator: "    ",
             },
             4,
         );
         assert_eq!(second, "cdef");
+    }
+
+    #[test]
+    fn separator_shows_between_loops() {
+        let out = render(
+            Marquee {
+                text: "abcdef",
+                offset: 5,
+                style: Style::default(),
+                separator: " * ",
+            },
+            5,
+        );
+        assert_eq!(out, "f * a");
     }
 
     #[test]
@@ -155,7 +169,7 @@ mod tests {
                 text: "日本語テスト",
                 offset: 0,
                 style: Style::default(),
-                gap: 2,
+                separator: "  ",
             },
             5,
         );

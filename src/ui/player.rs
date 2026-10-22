@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
+use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
 use crate::app::App;
@@ -29,6 +30,39 @@ pub fn format_time(secs: u64) -> String {
     } else {
         format!("{m}:{s:02}")
     }
+}
+
+/// Format a sample rate in kHz, keeping the fraction only when there is one:
+/// 96000 → `96`, 44100 → `44.1`, 88200 → `88.2`.
+pub fn format_khz(rate: u32) -> String {
+    if rate.is_multiple_of(1000) {
+        format!("{}", rate / 1000)
+    } else {
+        let khz = format!("{:.1}", rate as f64 / 1000.0);
+        khz.trim_end_matches(".0").to_string()
+    }
+}
+
+/// Play-state glyph color: accent while playing, glow paused, muted stopped.
+fn state_color(state: PlayState, theme: &Theme) -> ratatui::style::Color {
+    match state {
+        PlayState::Playing => theme.color(Role::Accent),
+        PlayState::Paused => theme.color(Role::Glow),
+        PlayState::Stopped => theme.color(Role::Muted),
+    }
+}
+
+/// Seconds the LCD shows: elapsed, or remaining when toggled.
+fn shown_secs(app: &App) -> u64 {
+    let snapshot = app.snapshot();
+    let elapsed = snapshot.position.as_secs();
+    if !app.ui.time_remaining {
+        return elapsed;
+    }
+    snapshot
+        .current_track()
+        .map(|t| t.duration.as_secs().saturating_sub(elapsed))
+        .unwrap_or(0)
 }
 
 /// Render the player panel (full or compact, chosen by `compact`).
@@ -87,28 +121,11 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     ] = Layout::vertical(rows).areas(area);
 
     // --- Row 1: state glyph + LCD digits, spectrum on the right.
-    let glyph_color = match snapshot.state {
-        PlayState::Playing => theme.color(Role::Accent),
-        PlayState::Paused => theme.color(Role::Glow),
-        PlayState::Stopped => theme.color(Role::Muted),
-    };
     let glyph_cell = &mut buf[(time_area.x, time_area.y)];
     glyph_cell.set_symbol(&state_glyph(snapshot.state).to_string());
-    glyph_cell.set_fg(glyph_color);
+    glyph_cell.set_fg(state_color(snapshot.state, theme));
 
-    let shown = if ui.time_remaining {
-        snapshot
-            .current_track()
-            .map(|t| {
-                t.duration
-                    .as_secs()
-                    .saturating_sub(snapshot.position.as_secs())
-            })
-            .unwrap_or(0)
-    } else {
-        snapshot.position.as_secs()
-    };
-    let time_text = format_time(shown);
+    let time_text = format_time(shown_secs(app));
     let digit_width = lcd_width(&time_text);
     let digit_area = Rect {
         x: time_area.x + 2,
@@ -145,27 +162,23 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
         .render(spectrum_area, buf);
     }
 
-    // --- Row 2: marquee title.
+    // --- Row 2: marquee title, looping Winamp-style with ` *** ` between.
     let title = snapshot
         .current_track()
         .map(|t| {
-            let total = t.duration.as_secs();
             format!(
-                "{}. {} ({}) {}",
+                "{}. {} ({})",
                 snapshot.current.map(|i| i + 1).unwrap_or(0),
                 t.title,
-                format_time(total),
-                "*".repeat(if snapshot.shuffle { 3 } else { 0 })
+                format_time(t.duration.as_secs()),
             )
-            .trim_end()
-            .to_string()
         })
         .unwrap_or_else(|| "--- ampwire ---".into());
     Marquee {
         text: &title,
         offset: ui.marquee_offset,
         style: Style::default().fg(theme.color(Role::Fg)),
-        gap: 6,
+        separator: " *** ",
     }
     .render(marquee_area, buf);
 
@@ -173,52 +186,51 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     let fmt = &snapshot.format;
     let mut fmt_parts = vec![fmt.codec.clone()];
     match (fmt.bit_depth, fmt.sample_rate) {
-        (Some(depth), Some(rate)) => fmt_parts.push(format!("{depth}/{}", rate / 1000)),
+        (Some(depth), Some(rate)) => fmt_parts.push(format!("{depth}/{}", format_khz(rate))),
         (Some(depth), None) => fmt_parts.push(format!("{depth}-bit")),
-        (None, Some(rate)) => fmt_parts.push(format!("{}kHz", rate / 1000)),
+        (None, Some(rate)) => fmt_parts.push(format!("{}kHz", format_khz(rate))),
         (None, None) => {}
     }
     fmt_parts.push(fmt.channels.clone());
     if fmt.bit_perfect {
         fmt_parts.push("bit-perfect".into());
     }
+    // Flags right-aligned with a 3-column margin. When tight, give up the
+    // margin, then the double spacing, then the flags; the format text wins.
+    const FLAGS_WIDTH: usize = 9; // `shuf  rep`
+    const FLAGS_MARGIN: usize = 3;
+    const MIN_GAP: usize = 2;
+    let width = format_area.width as usize;
+    let roomy = fmt_parts.join("  ");
+    let tight = fmt_parts.join(" ");
+    let fits = |text: &str, margin: usize| text.width() + MIN_GAP + FLAGS_WIDTH + margin <= width;
+    let (text, margin, show_flags) = if fits(&roomy, FLAGS_MARGIN) {
+        (roomy, FLAGS_MARGIN, true)
+    } else if fits(&roomy, 0) {
+        (roomy, 0, true)
+    } else if fits(&tight, 0) {
+        (tight, 0, true)
+    } else {
+        (roomy, 0, false)
+    };
+    let filler = " ".repeat(width.saturating_sub(text.width() + FLAGS_WIDTH + margin));
     let mut spans: Vec<Span> = vec![Span::styled(
-        fmt_parts.join("  "),
+        text,
         Style::default().fg(theme.color(Role::Primary)),
     )];
-
-    // Flags, right-aligned-ish: push them after filler spaces.
-    let flags_width = 12u16;
-    let used: u16 = fmt_parts.join("  ").chars().count() as u16;
-    let filler = format!(
-        "{:width$}",
-        "",
-        width = (format_area.width.saturating_sub(used + flags_width) as usize).min(64)
-    );
-    spans.push(Span::styled(
-        filler,
-        Style::default().fg(theme.color(Role::Primary)),
-    ));
-    spans.push(Span::styled(
-        "shuf",
-        Style::default().fg(if snapshot.shuffle {
-            theme.color(Role::Accent)
-        } else {
-            theme.color(Role::Muted)
-        }),
-    ));
-    spans.push(Span::styled(
-        "  ",
-        Style::default().fg(theme.color(Role::Primary)),
-    ));
-    spans.push(Span::styled(
-        "rep",
-        Style::default().fg(if snapshot.repeat {
-            theme.color(Role::Accent)
-        } else {
-            theme.color(Role::Muted)
-        }),
-    ));
+    if show_flags {
+        let flag = |on: bool| {
+            Style::default().fg(if on {
+                theme.color(Role::Accent)
+            } else {
+                theme.color(Role::Muted)
+            })
+        };
+        spans.push(Span::raw(filler));
+        spans.push(Span::styled("shuf", flag(snapshot.shuffle)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("rep", flag(snapshot.repeat)));
+    }
     buf.set_style(format_area, Style::default());
     Line::from(spans).render(format_area, buf);
 
@@ -421,33 +433,23 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
     }
     let mut x = area.x;
 
-    // State glyph.
+    // State glyph, colored like the full player's.
     let glyph_cell = &mut buf[(x, area.y)];
     glyph_cell.set_symbol(&state_glyph(snapshot.state).to_string());
-    glyph_cell.set_fg(theme.color(Role::Accent));
+    glyph_cell.set_fg(state_color(snapshot.state, theme));
     x += 2;
 
-    // Small time: m:ss as plain text.
-    let shown = if ui.time_remaining {
-        snapshot
-            .current_track()
-            .map(|t| {
-                t.duration
-                    .as_secs()
-                    .saturating_sub(snapshot.position.as_secs())
-            })
-            .unwrap_or(0)
-    } else {
-        snapshot.position.as_secs()
-    };
-    let time_text = format_time(shown);
-    for c in time_text.chars() {
+    // Small time: m:ss as plain text, dimmed on the off phase while paused
+    // (the full player's LCD blinks the same way).
+    let lit = snapshot.state != PlayState::Paused || ui.blink_lit;
+    let time_color = theme.color(if lit { Role::Primary } else { Role::Muted });
+    for c in format_time(shown_secs(app)).chars() {
         if x >= area.x + area.width {
             return;
         }
         let cell = &mut buf[(x, area.y)];
         cell.set_symbol(&c.to_string());
-        cell.set_fg(theme.color(Role::Primary));
+        cell.set_fg(time_color);
         x += 1;
     }
     x += 1;
@@ -527,6 +529,43 @@ mod tests {
         assert_eq!(format_time(83), "1:23");
         assert_eq!(format_time(3600), "1:00:00");
         assert_eq!(format_time(0), "0:00");
+    }
+
+    #[test]
+    fn khz_keeps_fractions() {
+        assert_eq!(format_khz(44_100), "44.1");
+        assert_eq!(format_khz(88_200), "88.2");
+        assert_eq!(format_khz(48_000), "48");
+        assert_eq!(format_khz(96_000), "96");
+        assert_eq!(format_khz(352_800), "352.8");
+    }
+
+    /// The format line at a given panel width.
+    fn format_row(app: &App, width: u16) -> String {
+        let area = Rect::new(0, 0, width, 11);
+        let mut buf = Buffer::empty(area);
+        render(app, area, &mut buf, false);
+        (1..width - 1)
+            .map(|x| buf[(x, 4)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn format_flags_never_collide_with_the_format_text() {
+        let app = test_app();
+        for width in [40u16, 44, 52, 80, 160] {
+            let row = format_row(&app, width);
+            assert!(
+                row.contains("bit-perfect"),
+                "format kept at {width}: {row:?}"
+            );
+            assert!(
+                !row.contains("perfectshuf"),
+                "collision at {width}: {row:?}"
+            );
+        }
+        // Wide panels right-align the flags with a 3-column margin.
+        assert!(format_row(&app, 160).ends_with("shuf  rep   "));
     }
 
     #[test]
