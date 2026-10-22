@@ -132,19 +132,35 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let snapshot = app.snapshot();
     let focused = app.ui.focus == Scope::Playlist;
 
-    let total_secs: u64 = snapshot.tracks.iter().map(|t| t.duration.as_secs()).sum();
+    // Totals always count the *whole* playlist, filtered or not; unknown
+    // durations are excluded from the sum.
+    let total_secs: u64 = snapshot
+        .tracks
+        .iter()
+        .filter_map(|t| t.duration)
+        .map(|d| d.as_secs())
+        .sum();
     let totals = format!(
         "{} · {}",
         snapshot.tracks.len(),
         format_duration(total_secs)
     );
+    // The notice slot: an open prompt types here, else the active filter,
+    // else whatever notice was left (truncated; totals always fit).
+    let prompt_or_notice = match &app.ui.prompt {
+        Some(prompt) => Some(format!("{}: {}▏", prompt.label(), prompt.text)),
+        None => match &app.ui.filter {
+            Some(filter) => Some(format!("filter: {filter}")),
+            None => app.ui.notice.clone(),
+        },
+    };
     // Layout: `─ a add ─ d del ─ / find ── <notice…> ── 24 · 1:56:43 ─`.
     // The count and total always survive; the notice is truncated first, and
     // multi-line TOML errors collapse to their first line.
     let bottom = playlist_bottom_border(
         theme,
         keymap,
-        app.ui.notice.as_deref(),
+        prompt_or_notice.as_deref(),
         &totals,
         area.width.saturating_sub(2) as usize,
     );
@@ -157,17 +173,33 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     }
 
     let snapshot = app.snapshot();
-    let cursor = app
-        .ui
-        .playlist_cursor
-        .min(snapshot.tracks.len().saturating_sub(1));
-    let total = snapshot.tracks.len();
+    // The cursor addresses the visible (filtered) list, not raw tracks.
+    let visible = app.visible_indices();
+    let cursor = app.ui.playlist_cursor.min(visible.len().saturating_sub(1));
     let height = inner.height as usize;
     // The app keeps the scroll in sync before each frame; re-derive it here
     // so the cursor is visible even when rendered without that (tests).
-    let scroll = scroll_for(app.ui.playlist_scroll, cursor, height, total);
+    let scroll = scroll_for(app.ui.playlist_scroll, cursor, height, visible.len());
 
-    let overflow = snapshot.tracks.len() > inner.height as usize;
+    // Empty (or everything filtered out): one dim hint row, no scrollbar.
+    if visible.is_empty() {
+        let hint = if snapshot.tracks.is_empty() {
+            "empty — press l to open a file or folder"
+        } else {
+            "no matches"
+        };
+        for (i, c) in hint.chars().enumerate() {
+            if i >= inner.width as usize {
+                break;
+            }
+            let cell = &mut buf[(inner.x + i as u16, inner.y)];
+            cell.set_symbol(&c.to_string());
+            cell.set_fg(theme.color(Role::Muted));
+        }
+        return;
+    }
+
+    let overflow = visible.len() > inner.height as usize;
     let list_width = if overflow {
         inner.width.saturating_sub(1)
     } else {
@@ -175,7 +207,10 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     };
 
     for row in 0..inner.height {
-        let Some(index) = scroll.checked_add(row as usize) else {
+        let Some(visible_pos) = scroll.checked_add(row as usize) else {
+            break;
+        };
+        let Some(&index) = visible.get(visible_pos) else {
             break;
         };
         let Some(track) = snapshot.tracks.get(index) else {
@@ -183,8 +218,10 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         };
 
         let y = inner.y + row;
+        // The now-playing marker compares the *real* index to `current`;
+        // the cursor row is a position in the visible list.
         let is_current = snapshot.current == Some(index);
-        let is_cursor = cursor == index;
+        let is_cursor = cursor == visible_pos;
 
         // Cursor-row background tint (muted).
         if is_cursor {
@@ -193,7 +230,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
             }
         }
 
-        // Leading marker + number.
+        // Leading marker + number (the playlist's real track number).
         let marker = if is_current { glyphs::CURSOR } else { ' ' };
         let number = format!("{:>2}.", index + 1);
         let mut x = inner.x;
@@ -224,13 +261,18 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         }
         x += 1;
 
-        // Duration right-aligned; title truncated to the space between.
-        let duration = format_duration(track.duration.as_secs());
+        // Duration right-aligned (`--:--` when unknown); title truncated to
+        // the space between.
+        let duration = match track.duration {
+            Some(d) => format_duration(d.as_secs()),
+            None => "--:--".into(),
+        };
         let duration_width = duration.width();
         let title_x = x;
         let available =
             (inner.x + list_width).saturating_sub(title_x + duration_width as u16 + 1) as usize;
-        let truncated = crate::ui::player::truncate_to_width(&track.title, available);
+        let name = track.display_name();
+        let truncated = crate::ui::player::truncate_to_width(&name, available);
         for c in truncated.chars() {
             let cell = &mut buf[(x, y)];
             cell.set_symbol(&c.to_string());
@@ -252,7 +294,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
 
     // Scrollbar only when the list overflows.
     if overflow {
-        render_scrollbar(app, buf, scroll, snapshot.tracks.len(), inner);
+        render_scrollbar(app, buf, scroll, visible.len(), inner);
     }
 }
 

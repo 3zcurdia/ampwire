@@ -4,15 +4,16 @@ Terminal Winamp 2.0 replica with modern hi-fi playback.
 
 Retro Winamp anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look.
 
-> Status: Phase 1 UI shell. Mock player state only — no audio, no Jellyfin, no file loading yet. The UI renders from a `PlayerSnapshot`, so the real player/audio backend can replace the mock later without touching render code.
+> Status: Phase 2 — real playlists from disk. Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags; playlist edit (add/delete/clear/reorder/filter) works. Playback is still the mock player (fake clock over the real list) — no audio yet, no Jellyfin. The UI renders from a `PlayerSnapshot`, so the real player/audio backend can replace the mock later without touching render code.
 
 ## Quickstart
 
 Requirements: Rust (managed via `mise`, see `mise.toml`), a real TTY.
 
 ```sh
-cargo run
-cargo run -- --demo        # mock playlist + default layout, ignores your config
+cargo run -- ~/Music   # load a real playlist (files or folders) and start playing
+cargo run              # start empty: press `l` to open a file or folder
+cargo run -- --demo    # mock playlist + default layout, ignores your config
 cargo run -- --dump 104x18 # render one frame to stdout, no TUI (for tests / preview)
 cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 ```
@@ -45,7 +46,7 @@ Winamp-style defaults, Space for play/pause. Every action is remappable.
 |---|---|---|
 | `Space` | play / pause | global |
 | `z` `x` `c` `v` `b` | prev / play / pause / stop / next | global |
-| `l` | open / eject (stub) | global |
+| `l` | open: replace playlist from a path | global |
 | `s` / `r` | shuffle / repeat | global |
 | `←` / `→` | seek ∓5s | player, playlist |
 | `←` / `→` | select EQ band | eq |
@@ -54,7 +55,10 @@ Winamp-style defaults, Space for play/pause. Every action is remappable.
 | `↑` / `↓` | band gain ±1 dB | eq |
 | `+` `=` / `-` | volume | global |
 | `Enter`, `PgUp`/`PgDn`, `Home`/`End` | play under cursor, page, jump | playlist |
-| `a` / `d` / `/` | add / delete / find (stubs) | playlist |
+| `a` / `d` / `D` | add path / delete track / clear playlist | playlist |
+| `/` | find (live filter; `Esc` clears) | playlist |
+| `Shift+↑` / `Shift+↓` | move track up / down | playlist |
+| `Esc` | clear playlist filter | playlist |
 | `Ctrl+T` | elapsed ↔ remaining time | global |
 | `?` (`Esc` closes, `↑`/`↓` scroll) | key-help overlay from live keymap | global |
 | `q`, `Ctrl+C` | quit | global |
@@ -129,13 +133,16 @@ Notes:
 
 ```text
 src/
-  main.rs            --demo / --dump / theme resolution, ratatui::run
-  app.rs             App: UiState + snapshot, event loop (~30fps), tick, dispatch
+  main.rs            --demo / --dump / CLI load paths, theme resolution, ratatui::run
+  app.rs             App: UiState + snapshot, event loop (~30fps), tick, dispatch, prompts, scans
   action.rs          Action enum (every remappable command)
   keymap.rs          defaults, spec parsing, (scope, key) → Action
   config.rs          load/save config.toml, XDG paths
+  library/
+    mod.rs           audio-file scan (walkdir) + tag reading (lofty) on a thread
   player/
-    mod.rs           PlayerSnapshot view model + PlayerCommand
+    mod.rs           PlayerSnapshot view model + PlayerCommand + Track
+    playlist.rs       Playlist: append_sorted, remove, reorder, current bookkeeping
     mock.rs          MockPlayer: fake playlist, ticking clock, spectrum bins
   ui/
     mod.rs           render(frame, &App)
@@ -144,15 +151,15 @@ src/
     chrome.rs        rounded panel + superscript hotkey label + bottom hints
     player.rs        full + compact variants
     equalizer.rs     11 VSliders + braille curve
-    playlist.rs      playing/cursor styles, scroll, scrollbar, totals
+    playlist.rs      playing/cursor styles, scroll, scrollbar, totals, filter/prompt
     help.rs          ? overlay
     widgets/         lcd_digits, marquee, spectrum, slider, eq_curve
 tests/golden/        --dump snapshots at 5 sizes
-docs/plans/          design plan (01-winamp-layout.md)
+docs/plans/          design plans (01-winamp-layout.md, 02-playlist-loading.md, …)
 ```
 
-Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → PlayerCommand → MockPlayer`. `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
+Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → PlayerCommand → MockPlayer`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`. `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
 
 ## Roadmap
 
-Out of scope for this phase: real audio (Symphonia + cpal/rodio), gapless/bit-perfect output, Jellyfin client, playlist add/remove/search, mouse, media keys / MPRIS / Now Playing.
+Done: playlist loading + editing (plan 02). Next: real audio (Symphonia + cpal/rodio) with gapless/bit-perfect output (plan 03). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.

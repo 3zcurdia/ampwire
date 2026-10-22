@@ -178,6 +178,69 @@ mod tests {
         assert_eq!(buf.cell((60, 5)).unwrap().bg, bg, "playlist painted");
     }
 
+    #[test]
+    fn empty_playlist_renders_hint_and_no_panic() {
+        // Plan 02 step 10: an empty session shows the dim hint row, and the
+        // player panel + marquee must not panic with `current = None`.
+        let app = App::new_session(Config::default(), Keymap::defaults(), theme::neon());
+        assert!(app.snapshot().tracks.is_empty());
+        assert_eq!(app.snapshot().current, None);
+
+        for (w, h) in [(104u16, 18u16), (80, 24), (52, 12)] {
+            let buf = render_frame(&app, w, h);
+            let text: String = buf
+                .content()
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .collect();
+            assert!(
+                text.contains("empty — press l to open a file or folder"),
+                "{w}x{h}: {text}"
+            );
+        }
+        // The marquee fallback (current = None) shows in the *full* player;
+        // at 52x12 the player drops to compact, which has no marquee row.
+        let buf = render_frame(&app, 104, 18);
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("--- ampwire ---"), "marquee fallback: {text}");
+    }
+
+    #[test]
+    fn filter_row_shows_in_the_border_and_render_is_filtered() {
+        use crate::action::Action;
+        let mut app = App::new(Config::default(), Keymap::defaults(), theme::neon(), false);
+        app.dispatch(Action::Find);
+        for c in ['a', 'p', 'h'] {
+            app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char(c),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Enter,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        // Wide terminal: the full `filter: aph` line fits the notice slot.
+        let buf = render_frame(&app, 160, 45);
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            text.contains("filter: aph"),
+            "border shows the filter: {text:?}"
+        );
+        assert!(!text.contains("Roygbiv"), "filtered-out row not rendered");
+        assert!(text.contains("Aphex Twin - Xtal"), "match rendered");
+        // Totals stay unfiltered (24 tracks).
+        assert!(text.contains("24"), "unfiltered count: {text:?}");
+    }
+
     /// Render never panics (plan §3.2): sweep the golden sizes plus boundary
     /// cases across every layout-pref and visibility combination.
     #[test]

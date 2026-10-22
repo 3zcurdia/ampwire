@@ -24,7 +24,7 @@ pub enum Action {
     Pause,
     Stop,
     Next,
-    Open, // stub until file loading exists
+    Open, // prompt for a path; replaces the playlist (plan 02)
     ToggleShuffle,
     ToggleRepeat,
 
@@ -63,10 +63,14 @@ pub enum Action {
     Help,
     Quit,
 
-    // Stubs until playlist editing exists
+    // Playlist editing
     Add,
     Del,
     Find,
+    Clear,
+    MoveUp,
+    MoveDown,
+    ClearFilter,
 }
 
 impl Action {
@@ -110,6 +114,10 @@ impl Action {
             Action::Add => "add",
             Action::Del => "del",
             Action::Find => "find",
+            Action::Clear => "clear",
+            Action::MoveUp => "move_up",
+            Action::MoveDown => "move_down",
+            Action::ClearFilter => "clear_filter",
         }
     }
 
@@ -129,7 +137,11 @@ impl Action {
             | Action::JumpEnd
             | Action::Add
             | Action::Del
-            | Action::Find => Scope::Playlist,
+            | Action::Find
+            | Action::Clear
+            | Action::MoveUp
+            | Action::MoveDown
+            | Action::ClearFilter => Scope::Playlist,
             _ => Scope::Global,
         }
     }
@@ -143,7 +155,7 @@ impl Action {
             Action::Pause => "pause",
             Action::Stop => "stop",
             Action::Next => "next track",
-            Action::Open => "open / eject (stub)",
+            Action::Open => "open / eject",
             Action::ToggleShuffle => "shuffle",
             Action::ToggleRepeat => "repeat",
             Action::SeekBack => "seek back 5s",
@@ -171,9 +183,13 @@ impl Action {
             Action::FocusPrev => "focus previous panel",
             Action::Help => "key help",
             Action::Quit => "quit",
-            Action::Add => "add tracks (stub)",
-            Action::Del => "delete track (stub)",
-            Action::Find => "find in playlist (stub)",
+            Action::Add => "add tracks",
+            Action::Del => "delete track",
+            Action::Find => "find in playlist",
+            Action::Clear => "clear playlist",
+            Action::MoveUp => "move track up",
+            Action::MoveDown => "move track down",
+            Action::ClearFilter => "clear filter",
         }
     }
 
@@ -218,6 +234,10 @@ impl Action {
             Add,
             Del,
             Find,
+            Clear,
+            MoveUp,
+            MoveDown,
+            ClearFilter,
         ]
     }
 }

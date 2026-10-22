@@ -61,7 +61,8 @@ fn shown_secs(app: &App) -> u64 {
     }
     snapshot
         .current_track()
-        .map(|t| t.duration.as_secs().saturating_sub(elapsed))
+        .and_then(|t| t.duration)
+        .map(|d| d.as_secs().saturating_sub(elapsed))
         .unwrap_or(0)
 }
 
@@ -169,8 +170,10 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
             format!(
                 "{}. {} ({})",
                 snapshot.current.map(|i| i + 1).unwrap_or(0),
-                t.title,
-                format_time(t.duration.as_secs()),
+                t.display_name(),
+                t.duration
+                    .map(|d| format_time(d.as_secs()))
+                    .unwrap_or_else(|| "--:--".into()),
             )
         })
         .unwrap_or_else(|| "--- ampwire ---".into());
@@ -238,12 +241,11 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     let time_pair = format!(
         "{}/{}",
         format_time(snapshot.position.as_secs()),
-        format_time(
-            snapshot
-                .current_track()
-                .map(|t| t.duration.as_secs())
-                .unwrap_or(0)
-        )
+        snapshot
+            .current_track()
+            .and_then(|t| t.duration)
+            .map(|d| format_time(d.as_secs()))
+            .unwrap_or_else(|| "--:--".into())
     );
     render_seek(app, seek_area, buf, &time_pair);
 
@@ -263,7 +265,8 @@ fn render_seek(app: &App, area: Rect, buf: &mut Buffer, time_pair: &str) {
     let track_width = area.width - time_pair.len() as u16 - 2;
     let total = snapshot
         .current_track()
-        .map(|t| t.duration.as_secs())
+        .and_then(|t| t.duration)
+        .map(|d| d.as_secs())
         .unwrap_or(0);
     let value = if total == 0 {
         0.0
@@ -457,7 +460,7 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
     // Title, truncated by display width.
     let title = snapshot
         .current_track()
-        .map(|t| t.title.clone())
+        .map(|t| t.display_name())
         .unwrap_or_default();
     let rest = (area.x + area.width).saturating_sub(x);
     let seek_width = 12u16.min(rest / 2);
@@ -475,7 +478,8 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
     if seek_width > 0 && x + seek_width <= area.x + area.width {
         let total = snapshot
             .current_track()
-            .map(|t| t.duration.as_secs())
+            .and_then(|t| t.duration)
+            .map(|d| d.as_secs())
             .unwrap_or(0);
         let value = if total == 0 {
             0.0

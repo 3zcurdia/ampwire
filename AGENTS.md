@@ -15,13 +15,13 @@ playback: local lossless files + Jellyfin server streaming.
 - `cargo check --all-targets` — fastest verification loop.
 - `cargo clippy --all-targets -- -D warnings` before finishing.
 - `cargo fmt --check` / `cargo fmt` — rustfmt is the formatter, no extra config.
-- `cargo test` — 139 tests today (138 run, 1 `#[ignore]`d visual dump). Unit tests live next to the modules (`#[cfg(test)] mod tests`); integration tests and the golden frames live in `tests/`.
+- `cargo test` — 181 tests today (180 run, 1 `#[ignore]`d visual dump). Unit tests live next to the modules (`#[cfg(test)] mod tests`); integration tests and the golden frames live in `tests/`.
 
 ## Architecture direction
 
 - Keep audio decode/playback decoupled from the Ratatui render loop (dedicated audio thread/task, message-passing — never block `draw` on I/O or decoding).
-- Boundaries today: `player` (snapshot + commands; `mock.rs` fakes playback), `ui` (Winamp skin: main window, playlist, EQ, theme). Still to come: `audio` (local decode/output, e.g. Symphonia + cpal/rodio — not yet chosen), `jellyfin` (server client/stream URLs), `library` (file scanning).
-- The UI only ever reads a `PlayerSnapshot`; changes go `Action → App::dispatch → PlayerCommand`. Swap the mock for a channel to the audio thread without touching render code.
+- Boundaries today: `player` (snapshot + commands; `playlist.rs` owns the track list, `mock.rs` fakes playback), `library` (background file scan + lofty tags over `std::sync::mpsc`), `ui` (Winamp skin: main window, playlist, EQ, theme). Still to come: `audio` (local decode/output, e.g. Symphonia + cpal/rodio — not yet chosen), `jellyfin` (server client/stream URLs).
+- The UI only ever reads a `PlayerSnapshot`; changes go `Action → App::dispatch → PlayerCommand`. Disk work (scans) runs on a thread and returns over a channel polled from `App::tick`. Swap the mock for a channel to the audio thread without touching render code.
 - Hi-fi matters: preserve lossless/bit-perfect path, avoid resampling or volume normalization unless user opts in. Gapless support is expected.
 - No workspace, CI, or lint config yet — don't assume any exists.
 

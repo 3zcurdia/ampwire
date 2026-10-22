@@ -8,8 +8,9 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use crate::action::{Action, Scope};
 use crate::config::Config;
 use crate::keymap::Keymap;
+use crate::library::ScanMsg;
 use crate::player::mock::MockPlayer;
-use crate::player::{PlayerCommand, PlayerSnapshot};
+use crate::player::{PlayerCommand, PlayerSnapshot, Track};
 use crate::ui;
 use crate::ui::layout::{LayoutPrefs, Panel, PlaylistSide, Visibility, compute_layout};
 use crate::ui::theme::omarchy::OmarchyWatch;
@@ -24,6 +25,39 @@ const MARQUEE: Duration = Duration::from_millis(200);
 const BLINK: Duration = Duration::from_millis(500);
 /// Omarchy theme change check cadence.
 const OMARCHY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a text prompt was opened for (plan 02, step 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Open,
+    Add,
+    Find,
+}
+
+/// An open one-line text prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub text: String,
+}
+
+impl Prompt {
+    pub fn new(kind: PromptKind) -> Self {
+        Self {
+            kind,
+            text: String::new(),
+        }
+    }
+
+    /// Label shown in the playlist bottom border while typing.
+    pub fn label(&self) -> &'static str {
+        match self.kind {
+            PromptKind::Open => "open",
+            PromptKind::Add => "add",
+            PromptKind::Find => "find",
+        }
+    }
+}
 
 /// Per-frame UI state the panels read.
 #[derive(Debug, Clone)]
@@ -50,6 +84,10 @@ pub struct UiState {
     pub help_scroll: usize,
     /// One-line notice for the playlist bottom border.
     pub notice: Option<String>,
+    /// Open text prompt (`l` / `a` / `/`), if any.
+    pub prompt: Option<Prompt>,
+    /// Active playlist filter (from the Find prompt).
+    pub filter: Option<String>,
 }
 
 impl Default for UiState {
@@ -69,8 +107,19 @@ impl Default for UiState {
             show_help: false,
             help_scroll: 0,
             notice: None,
+            prompt: None,
+            filter: None,
         }
     }
+}
+
+/// Which scan to run over the playlist when the files arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    /// Replace the list, then play track 1 (`l`, CLI args).
+    Replace,
+    /// Append to the list without starting playback (`a`).
+    Append,
 }
 
 pub struct App {
@@ -102,6 +151,10 @@ pub struct App {
     last_area: Option<Rect>,
     /// Omarchy is unavailable and the neon fallback is already applied.
     omarchy_fallback: bool,
+    /// A background directory scan is in flight (plan 02, step 8).
+    scan_rx: Option<std::sync::mpsc::Receiver<ScanMsg>>,
+    /// What to do with the tracks when the running scan finishes.
+    scan_mode: ScanMode,
 }
 
 /// Fixed EQ state for `--dump` and the golden tests (plan §2.3 shape).
@@ -142,6 +195,8 @@ impl App {
             read_only: false,
             last_area: None,
             omarchy_fallback: false,
+            scan_rx: None,
+            scan_mode: ScanMode::Replace,
         }
     }
 
@@ -190,7 +245,20 @@ impl App {
             read_only: false,
             last_area: None,
             omarchy_fallback: false,
+            scan_rx: None,
+            scan_mode: ScanMode::Replace,
         }
+    }
+
+    /// A real (non-demo) session: the playlist starts empty; tracks arrive
+    /// from CLI paths or the `l`/`a` prompts (plan 02).
+    pub fn new_session(config: Config, keymap: Keymap, theme: Theme) -> Self {
+        let mut app =
+            Self::with_config_path(config, keymap, theme, false, crate::config::config_path());
+        app.player = MockPlayer::empty();
+        app.snapshot = app.player.snapshot();
+        app.ui.playlist_cursor = 0;
+        app
     }
 
     /// Mark the config read-only for this session (its load failed). Hotkeys
@@ -282,9 +350,32 @@ impl App {
                 self.ui.playlist_scroll,
                 self.ui.playlist_cursor,
                 rows,
-                self.snapshot.tracks.len(),
+                self.visible_indices().len(),
             );
         }
+    }
+
+    /// Real track indices currently shown, in order: everything when no
+    /// filter is active, else the case-insensitive `display_name` matches.
+    /// The playlist cursor addresses *this* list, not the raw tracks.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let Some(filter) = self.ui.filter.as_deref() else {
+            return (0..self.snapshot.tracks.len()).collect();
+        };
+        let needle = filter.to_lowercase();
+        self.snapshot
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.display_name().to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Keep the cursor inside the visible list after it changes shape.
+    fn clamp_cursor(&mut self) {
+        let max = self.visible_indices().len().saturating_sub(1);
+        self.ui.playlist_cursor = self.ui.playlist_cursor.min(max);
     }
 
     /// Panels the layout actually draws: the visibility toggles minus any
@@ -301,8 +392,8 @@ impl App {
         }
     }
 
-    /// Feed a pressed key into the app. `Esc` closes the help overlay (the
-    /// footer promises it); everything else goes through the keymap.
+    /// Feed a pressed key into the app. The help overlay and an open text
+    /// prompt take keys before the keymap; everything else goes through it.
     pub fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         use ratatui::crossterm::event::KeyCode;
         // While the help overlay is open, Esc closes it and ↑/↓ scroll it.
@@ -324,8 +415,90 @@ impl App {
                 _ => {}
             }
         }
+        // A text prompt swallows every key except its own controls.
+        if self.ui.prompt.is_some() {
+            self.handle_prompt_key(key);
+            return;
+        }
         if let Some(action) = self.keymap.resolve(self.ui.focus, key) {
             self.dispatch(action);
+        }
+    }
+
+    /// Keys while a prompt is open: Enter submits, Esc closes (Find also
+    /// clears its filter), Backspace pops, plain chars type. Ctrl+C still
+    /// quits; everything else is swallowed.
+    fn handle_prompt_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        let Some(prompt) = self.ui.prompt.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                let prompt = self.ui.prompt.take().expect("prompt is open");
+                self.submit_prompt(prompt);
+            }
+            KeyCode::Esc => {
+                let kind = prompt.kind;
+                self.ui.prompt = None;
+                if kind == PromptKind::Find {
+                    // Closing Find discards the filter.
+                    self.ui.filter = None;
+                    self.ui.playlist_cursor = 0;
+                }
+            }
+            KeyCode::Backspace => {
+                prompt.text.pop();
+                if prompt.kind == PromptKind::Find {
+                    self.live_filter();
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                prompt.text.push(c);
+                if prompt.kind == PromptKind::Find {
+                    self.live_filter();
+                }
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Find filters live: every keystroke re-narrows the list and rewinds
+    /// the cursor.
+    fn live_filter(&mut self) {
+        let filter = self
+            .ui
+            .prompt
+            .as_ref()
+            .map(|p| p.text.clone())
+            .unwrap_or_default();
+        self.ui.filter = Some(filter);
+        self.ui.playlist_cursor = 0;
+        self.ui.playlist_scroll = 0;
+    }
+
+    /// A submitted `l` / `a` prompt: expand `~`, check the path exists,
+    /// then kick off the scan (replace or append).
+    fn submit_prompt(&mut self, prompt: Prompt) {
+        match prompt.kind {
+            // Enter in Find keeps the filter and just closed the prompt.
+            PromptKind::Find => {}
+            PromptKind::Open | PromptKind::Add => {
+                let path = expand_tilde(&prompt.text);
+                if !path.exists() {
+                    self.ui.notice = Some(format!("not found: {}", path.display()));
+                    return;
+                }
+                let mode = if prompt.kind == PromptKind::Open {
+                    ScanMode::Replace
+                } else {
+                    ScanMode::Append
+                };
+                self.load_paths(vec![path], mode);
+            }
         }
     }
 
@@ -334,6 +507,7 @@ impl App {
     pub fn tick(&mut self, dt: Duration) {
         self.player.tick(dt);
         self.snapshot = self.player.snapshot();
+        self.poll_scan();
 
         // Marquee: one step every 200 ms.
         self.marquee_acc += dt;
@@ -355,6 +529,65 @@ impl App {
                 self.check_omarchy();
             }
         }
+    }
+
+    /// Kick off a background scan of `paths` (plan 02, step 8). Refuses when
+    /// one is already running; the results land via [`App::poll_scan`].
+    pub fn load_paths(&mut self, paths: Vec<std::path::PathBuf>, mode: ScanMode) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.scan_rx.is_some() {
+            self.ui.notice = Some("already loading".into());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::library::spawn_scan(paths, tx);
+        self.scan_rx = Some(rx);
+        self.scan_mode = mode;
+    }
+
+    /// Drain pending scan messages. `Done` applies the tracks according to
+    /// the scan mode; an empty result leaves the playlist alone.
+    fn poll_scan(&mut self) {
+        let Some(rx) = self.scan_rx.take() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(ScanMsg::Progress { found }) => {
+                    self.ui.notice = Some(format!("loading… {found} files"));
+                }
+                Ok(ScanMsg::Done { tracks, skipped }) => {
+                    self.finish_scan(tracks, skipped);
+                    return; // scan complete: rx stays dropped
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        self.scan_rx = Some(rx);
+    }
+
+    fn finish_scan(&mut self, tracks: Vec<Track>, skipped: usize) {
+        if tracks.is_empty() {
+            // Nothing found: leave whatever was in the playlist alone.
+            self.ui.notice = Some("no audio files found".into());
+        } else {
+            let loaded = tracks.len();
+            match self.scan_mode {
+                ScanMode::Replace => {
+                    self.player.handle(PlayerCommand::ReplaceTracks(tracks));
+                    self.ui.playlist_cursor = 0;
+                    self.ui.playlist_scroll = 0;
+                }
+                ScanMode::Append => {
+                    self.player.handle(PlayerCommand::AddTracks(tracks));
+                }
+            }
+            self.ui.notice = Some(format!("loaded {loaded} tracks ({skipped} skipped)"));
+        }
+        self.snapshot = self.player.snapshot();
     }
 
     /// Poll the Omarchy theme once and adopt it if it changed. If Omarchy is
@@ -422,9 +655,6 @@ impl App {
                 };
                 self.player.handle(cmd);
             }
-            Open => {
-                self.ui.notice = Some("open: not implemented in this phase".into());
-            }
             ToggleShuffle => self.player.handle(PlayerCommand::ToggleShuffle),
             ToggleRepeat => self.player.handle(PlayerCommand::ToggleRepeat),
 
@@ -445,26 +675,67 @@ impl App {
                 self.ui.playlist_cursor = self.ui.playlist_cursor.saturating_sub(1);
             }
             CursorDown => {
-                let max = self.snapshot.tracks.len().saturating_sub(1);
+                let max = self.visible_indices().len().saturating_sub(1);
                 self.ui.playlist_cursor = (self.ui.playlist_cursor + 1).min(max);
             }
             Select => {
-                if !self.snapshot.tracks.is_empty() {
-                    self.player
-                        .handle(PlayerCommand::PlayTrack(self.ui.playlist_cursor));
+                // The cursor is a position in the *visible* (filtered) list.
+                if let Some(&track) = self.visible_indices().get(self.ui.playlist_cursor) {
+                    self.player.handle(PlayerCommand::PlayTrack(track));
                 }
             }
-            PageUp => self.ui.playlist_cursor = self.ui.playlist_cursor.saturating_sub(10),
+            PageUp => {
+                self.ui.playlist_cursor = self.ui.playlist_cursor.saturating_sub(10);
+            }
             PageDown => {
-                let max = self.snapshot.tracks.len().saturating_sub(1);
+                let max = self.visible_indices().len().saturating_sub(1);
                 self.ui.playlist_cursor = (self.ui.playlist_cursor + 10).min(max);
             }
             JumpHome => self.ui.playlist_cursor = 0,
             JumpEnd => {
-                self.ui.playlist_cursor = self.snapshot.tracks.len().saturating_sub(1);
+                self.ui.playlist_cursor = self.visible_indices().len().saturating_sub(1);
             }
-            Add | Del | Find => {
-                self.ui.notice = Some(format!("{}: not implemented in this phase", action.name()));
+            Open => self.ui.prompt = Some(Prompt::new(PromptKind::Open)),
+            Add => self.ui.prompt = Some(Prompt::new(PromptKind::Add)),
+            Find => {
+                // Reopen with the active filter pre-filled.
+                let mut prompt = Prompt::new(PromptKind::Find);
+                prompt.text = self.ui.filter.clone().unwrap_or_default();
+                self.ui.prompt = Some(prompt);
+            }
+            Del => {
+                if let Some(&track) = self.visible_indices().get(self.ui.playlist_cursor) {
+                    self.player.handle(PlayerCommand::RemoveTrack(track));
+                }
+                self.clamp_cursor();
+            }
+            Clear => {
+                self.player.handle(PlayerCommand::ClearPlaylist);
+                self.ui.playlist_cursor = 0;
+                self.ui.playlist_scroll = 0;
+                self.ui.filter = None;
+            }
+            MoveUp | MoveDown => {
+                let up = matches!(action, MoveUp);
+                if self.ui.filter.is_some() {
+                    self.ui.notice = Some("clear the filter to reorder".into());
+                } else {
+                    // Playlist::move_* no-ops at the edge; the cursor's own
+                    // saturating/clamped arithmetic keeps it put there.
+                    let from = self.ui.playlist_cursor;
+                    self.player.handle(PlayerCommand::MoveTrack { from, up });
+                    if up {
+                        self.ui.playlist_cursor = from.saturating_sub(1);
+                    } else {
+                        let max = self.snapshot.tracks.len().saturating_sub(1);
+                        self.ui.playlist_cursor = (from + 1).min(max);
+                    }
+                }
+            }
+            ClearFilter => {
+                self.ui.filter = None;
+                self.ui.playlist_cursor = 0;
+                self.ui.playlist_scroll = 0;
             }
             // Layout (saved)
             TogglePlayer => self.toggle_panel(Panel::Player),
@@ -507,7 +778,10 @@ impl App {
             FocusPrev => self.cycle_focus(-1),
         }
 
+        // Every dispatch ends with a fresh snapshot and a cursor that still
+        // points inside the visible list ("always clamp after the change").
         self.snapshot = self.player.snapshot();
+        self.clamp_cursor();
     }
 
     fn change_volume(&mut self, delta: i32) {
@@ -600,6 +874,21 @@ fn panel_for(scope: Scope) -> Panel {
         Scope::Player => Panel::Player,
         Scope::Eq => Panel::Eq,
         _ => Panel::Playlist,
+    }
+}
+
+/// Expand a leading `~` (bare or `~/…`) with `$HOME`. Anything else —
+/// including `~user` — is left for the filesystem to reject.
+fn expand_tilde(text: &str) -> std::path::PathBuf {
+    let Some(rest) = text.strip_prefix('~') else {
+        return std::path::PathBuf::from(text);
+    };
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return std::path::PathBuf::from(text);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home).join(rest.trim_start_matches('/')),
+        None => std::path::PathBuf::from(text),
     }
 }
 
@@ -922,5 +1211,303 @@ mod tests {
         );
         app.handle_key(esc);
         assert!(!app.ui.show_help, "esc closes the overlay");
+    }
+
+    // --- Plan 02: filter, prompts, playlist controls ---
+
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn find_filter_narrows_visible_indices() {
+        let (mut app, _dir) = test_app();
+        assert_eq!(app.visible_indices().len(), 24, "no filter → everything");
+
+        app.dispatch(Action::Find);
+        assert_eq!(
+            app.ui.prompt.as_ref().map(|p| p.kind),
+            Some(crate::app::PromptKind::Find)
+        );
+        app.handle_key(press(KeyCode::Char('a')));
+        app.handle_key(press(KeyCode::Char('p')));
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('e')));
+        app.handle_key(press(KeyCode::Char('x')));
+        // Live filter: matches update on every keystroke, cursor rewinds.
+        assert_eq!(app.ui.filter.as_deref(), Some("aphex"));
+        let visible = app.visible_indices();
+        assert_eq!(visible, vec![0, 17], "Aphex Twin ×2: {visible:?}");
+        assert_eq!(app.ui.playlist_cursor, 0);
+
+        // Enter keeps the filter and closes the prompt.
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.ui.prompt.is_none());
+        assert_eq!(app.ui.filter.as_deref(), Some("aphex"));
+
+        // Esc (with no prompt) clears it via ClearFilter.
+        app.ui.focus = crate::action::Scope::Playlist;
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.ui.filter, None);
+        assert_eq!(app.visible_indices().len(), 24);
+    }
+
+    #[test]
+    fn select_on_a_filtered_row_plays_the_real_track() {
+        let (mut app, _dir) = test_app();
+        app.ui.filter = Some("boards".into());
+        // "boards of canada": Roygbiv (1) and Dayvan Cowboy (16).
+        assert_eq!(app.visible_indices(), vec![1, 16]);
+        app.ui.playlist_cursor = 1;
+        app.dispatch(Action::Select);
+        assert_eq!(app.snapshot().current, Some(16), "second visible row");
+        assert_eq!(
+            app.snapshot().current_track().unwrap().display_name(),
+            "Boards of Canada - Dayvan Cowboy"
+        );
+    }
+
+    #[test]
+    fn del_with_a_filter_removes_the_right_track() {
+        let (mut app, _dir) = test_app();
+        app.ui.filter = Some("boards".into());
+        app.ui.playlist_cursor = 1; // visible 1 = real 16 (Dayvan Cowboy)
+        app.dispatch(Action::Del);
+        let names: Vec<String> = app
+            .snapshot()
+            .tracks
+            .iter()
+            .map(|t| t.display_name())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains("Dayvan Cowboy")),
+            "removed the filtered row's real track"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("Roygbiv")),
+            "the other match survives"
+        );
+        assert_eq!(app.snapshot().tracks.len(), 23);
+        // Cursor clamped into the shrunken visible list.
+        assert!(app.ui.playlist_cursor < app.visible_indices().len());
+    }
+
+    #[test]
+    fn prompt_keys_type_backspace_and_escape() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::Open);
+        assert_eq!(app.ui.prompt.as_ref().map(|p| p.label()), Some("open"));
+
+        for c in "music".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        assert_eq!(app.ui.prompt.as_ref().unwrap().text, "music");
+
+        app.handle_key(press(KeyCode::Backspace));
+        assert_eq!(app.ui.prompt.as_ref().unwrap().text, "musi");
+
+        // Prompt swallows keys the keymap would otherwise act on.
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert!(!app.should_quit, "space didn't reach the keymap");
+        app.handle_key(press(KeyCode::Char('q')));
+        assert!(!app.should_quit, "q didn't reach the keymap");
+
+        // Esc closes without touching the playlist.
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.ui.prompt.is_none());
+        assert_eq!(app.snapshot().tracks.len(), 24);
+    }
+
+    #[test]
+    fn enter_on_a_missing_path_notices_and_scans_nothing() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::Add);
+        for c in "no/nope".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.ui.prompt.is_none());
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("not found: no/nope"),
+            "notice reports the path that failed"
+        );
+        assert_eq!(app.snapshot().tracks.len(), 24, "playlist untouched");
+    }
+
+    #[test]
+    fn ctrl_c_quits_while_a_prompt_is_open() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::Open);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn clear_empties_the_playlist_and_filter() {
+        let (mut app, _dir) = test_app();
+        app.ui.filter = Some("aphex".into());
+        app.ui.playlist_cursor = 1;
+        app.dispatch(Action::Clear);
+        assert_eq!(app.snapshot().tracks.len(), 0);
+        assert_eq!(app.snapshot().current, None);
+        assert_eq!(app.ui.playlist_cursor, 0);
+        assert_eq!(app.ui.filter, None);
+    }
+
+    #[test]
+    fn move_up_down_swaps_tracks_and_carries_the_cursor() {
+        let (mut app, _dir) = test_app();
+        app.ui.playlist_cursor = 3;
+        let first = app.snapshot().tracks[0].display_name();
+        let third = app.snapshot().tracks[3].display_name();
+        let fourth = app.snapshot().tracks[4].display_name();
+
+        app.dispatch(Action::MoveDown);
+        assert_eq!(app.snapshot().tracks[4].display_name(), third, "swapped");
+        assert_eq!(app.snapshot().tracks[3].display_name(), fourth);
+        assert_eq!(app.ui.playlist_cursor, 4, "cursor followed the track");
+
+        app.dispatch(Action::MoveUp);
+        assert_eq!(app.snapshot().tracks[3].display_name(), third, "back");
+        assert_eq!(app.ui.playlist_cursor, 3);
+
+        // Edges: no move, cursor stays put, no panic.
+        app.ui.playlist_cursor = 0;
+        app.dispatch(Action::MoveUp);
+        assert_eq!(app.ui.playlist_cursor, 0);
+        assert_eq!(
+            app.snapshot().tracks[0].display_name(),
+            first,
+            "top edge holds"
+        );
+
+        app.dispatch(Action::JumpEnd);
+        app.dispatch(Action::MoveDown);
+        let last = app.snapshot().tracks.len() - 1;
+        assert_eq!(app.ui.playlist_cursor, last, "bottom edge holds");
+    }
+
+    #[test]
+    fn move_is_refused_while_filtered() {
+        let (mut app, _dir) = test_app();
+        app.ui.filter = Some("aphex".into());
+        app.ui.playlist_cursor = 0;
+        let before: Vec<String> = app
+            .visible_indices()
+            .iter()
+            .map(|&i| app.snapshot().tracks[i].display_name())
+            .collect();
+        app.dispatch(Action::MoveDown);
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("clear the filter to reorder")
+        );
+        let after: Vec<String> = app
+            .visible_indices()
+            .iter()
+            .map(|&i| app.snapshot().tracks[i].display_name())
+            .collect();
+        assert_eq!(before, after, "order untouched");
+    }
+
+    #[test]
+    fn cursor_bounds_use_the_visible_list() {
+        let (mut app, _dir) = test_app();
+        app.ui.filter = Some("boards".into()); // 2 matches
+        app.dispatch(Action::JumpEnd);
+        assert_eq!(app.ui.playlist_cursor, 1, "last *visible* row");
+        app.dispatch(Action::CursorDown);
+        assert_eq!(app.ui.playlist_cursor, 1, "clamped to visible len");
+        app.dispatch(Action::JumpHome);
+        app.dispatch(Action::CursorUp);
+        assert_eq!(app.ui.playlist_cursor, 0);
+    }
+
+    #[test]
+    fn open_prompt_replaces_and_starts_playing_via_scan() {
+        let (mut app, dir) = test_app();
+        // A tiny real library: one file in a temp dir.
+        let music = dir.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("a.mp3"), b"").unwrap();
+        std::fs::write(music.join("b.flac"), b"").unwrap();
+
+        app.dispatch(Action::Open);
+        // Type the path.
+        for c in music.to_string_lossy().chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.ui.prompt.is_none());
+        // Scan runs on a thread; drain it deterministically.
+        for _ in 0..200 {
+            app.tick(Duration::from_millis(1));
+            if app
+                .ui
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("loaded"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.snapshot().tracks.len(), 2, "scan replaced the list");
+        assert_eq!(app.snapshot().current, Some(0), "Open starts at track 1");
+        assert_eq!(app.snapshot().state, crate::player::PlayState::Playing);
+        assert!(
+            app.ui
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("loaded")),
+            "notice: {:?}",
+            app.ui.notice
+        );
+    }
+
+    #[test]
+    fn second_load_is_refused_while_scanning() {
+        let (mut app, dir) = test_app();
+        // Hold a scan open by loading a big tree, then race a second load.
+        let music = dir.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("a.mp3"), b"").unwrap();
+        app.load_paths(vec![music.clone()], ScanMode::Append);
+        app.load_paths(vec![music], ScanMode::Replace);
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("already loading"),
+            "second load refused"
+        );
+        // Drain.
+        for _ in 0..200 {
+            app.tick(Duration::from_millis(1));
+            if app.ui.notice.as_deref() == Some("loaded 1 tracks (0 skipped)") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn empty_playlist_canonical_start_renders_and_reports_no_files() {
+        // `ampwire <dir with no audio>`: playlist untouched + notice.
+        let (mut app, dir) = test_app();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("cover.jpg"), b"").unwrap();
+        app.load_paths(vec![empty], ScanMode::Replace);
+        for _ in 0..200 {
+            app.tick(Duration::from_millis(1));
+            if app.ui.notice.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.ui.notice.as_deref(), Some("no audio files found"));
+        assert_eq!(app.snapshot().tracks.len(), 24, "playlist left alone");
     }
 }

@@ -1,6 +1,7 @@
 # Plan 02 — Load playlist from files/directories + playlist controls
 
-**Status:** ⬜ not started — safe to pick up.
+**Status:** ✅ done — 2026-10-22. Implemented in this working tree (uncommitted);
+180 tests pass, goldens unchanged. See **Deviations** at the end.
 
 Goal: the user can launch `ampwire ~/Music` (or press `l` / `a` in the app and
 type a path) and get a real playlist read from disk. Each row shows
@@ -229,3 +230,61 @@ and the three cargo checks pass.
 - `Open` autoplays; `Add` does not.
 - Live filter (not "jump to match").
 - Playlist is not persisted between runs.
+
+## Deviations (implemented 2026-10-22)
+
+Annotated at the end as requested (normally plans-README rule 11 says stop and
+ask; the implementer instruction was to annotate instead):
+
+1. **Files outside the plan's list.** `src/ui/player.rs` — the enriched `Track`
+   (`title: String` → tags + `display_name()`, `duration` → `Option<Duration>`)
+   forced edits in the marquee, seek bar, compact title, and remaining-time
+   code. Also touched: `AGENTS.md` (test count + boundaries, plans-README rule
+   10) and `docs/plans/README.md` (index status row), plus this status header.
+2. **`App::new_session()` added.** Plan step 8 says "in non-demo mode build the
+   app with `MockPlayer::empty()`", but existing tests construct non-demo apps
+   (`App::new(…, false)` / `with_config_path(…, false, …)`) and depend on the
+   24-track mock playlist, so `App::new` keeps the mock; only the real
+   entrypoint uses the new constructor. `--demo` / `--dump` unchanged.
+3. **`Playlist` extras beyond the listed API**: `from_tracks()` (wraps without
+   sorting — the mock's authored track order must survive or the golden frames
+   change; `append_sorted` would reorder the fake tracks), `is_empty()`, and
+   `#[cfg(test)] set_title()` (backs `MockPlayer::set_track_title`).
+4. **`MockPlayer::handle` split** into playlist-mutation commands +
+   `handle_transport()`: the old blanket `if len == 0 { return; }` would make
+   Add/Replace dead on the empty playlist that sessions now start with.
+5. **`Key::matches` tightened** (not in the plan, required by its step 7): the
+   SHIFT tolerance for `+`-style chars used to apply to *any* non-alphabetic
+   key, so plain `up` would match a `shift+up` press — `MoveUp`/`MoveDown`
+   could never fire and the defaults would self-conflict. Tolerance now applies
+   only to non-alphabetic **chars**; `shift+up`/`shift+down`, `D`, and letters
+   match modifiers strictly. Tests cover both directions (`+`/`?` still
+   shifted-tolerant).
+6. **`SeekBy` also clamps to the 180 s assumed length** when the duration is
+   unknown (plan specified only the end-of-track check).
+7. **A filter with zero matches** renders a dim `no matches` row (the plan
+   specifies only the empty-playlist hint); the border totals still show the
+   unfiltered count.
+8. **`~` expansion**: only a bare `~` or a leading `~/` expands via `$HOME`;
+   `~user/…` is left literal (plan: "expand a leading `~` using HOME").
+9. **The scroll resets together with the cursor** on Replace / Clear /
+   ClearFilter and while typing a live filter (plan mentions only the cursor) —
+   keeps `scroll_for` consistent after the list reshapes.
+10. **lofty resolved to 0.25.4**: `tag.artist()`/`title()` return `Cow<str>`
+    (`.as_deref()` needed). API detail only; behavior as planned.
+11. **Post-plan fix, user-approved: `._*` AppleDouble sidecars are skipped**
+    (`is_apple_double()` in `library/mod.rs`). Loading an external volume
+    (`/Volumes/…`) surfaced macOS metadata stubs that inherit the `.flac`
+    extension — they doubled the row count and would fail to decode in plan 03.
+    The plan's "hidden files are included" decision otherwise stands: a
+    deliberately hidden `.track.flac` still loads; an explicit `._…` argument
+    counts as `skipped`.
+
+Extra verification beyond the checklist: the real TUI was driven in a pty —
+CLI load of `~/Music/aepi` (`loaded 10 tracks (0 skipped)`, `10 · 30:00`),
+`l` prompt + `~` path, `a` append (→ `20 · 1:00:00`), `d` (10→9), `D` → empty
+hint, `/` live filter + `Esc` clear, `Shift+↑/↓` reorder, not-found notice,
+and a clean `q` exit.
+
+The plan's Assumptions block above stands unchanged — nothing in it was
+overridden.

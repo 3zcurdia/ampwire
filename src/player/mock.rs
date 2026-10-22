@@ -5,9 +5,11 @@
 //! freezes that seed's spectrum so `--dump` and the golden tests reproduce
 //! exactly.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, Track};
+use super::playlist::Playlist;
+use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, Track, TrackSource};
 
 /// Tiny xorshift PRNG — enough for spectrum wobble, no dependency.
 struct Rng(u64);
@@ -27,12 +29,13 @@ const SPECTRUM_BINS: usize = 24;
 const ANIMATED_SEED: u64 = 42;
 /// Seed for the frozen `--dump` / golden-test spectrum.
 const DETERMINISTIC_SEED: u64 = 0x5EED_C0DE;
+/// Assumed length when a track's duration is unknown (end-of-track check).
+const UNKNOWN_DURATION: Duration = Duration::from_secs(180);
 
 pub struct MockPlayer {
     state: PlayState,
-    current: Option<usize>,
+    playlist: Playlist,
     position: Duration,
-    tracks: Vec<Track>,
     shuffle: bool,
     repeat: bool,
     volume: u8,
@@ -66,7 +69,9 @@ fn seeded_spectrum(seed: u64) -> (Vec<f32>, Vec<f32>, Rng) {
     (spectrum, peaks, rng)
 }
 
-/// 24 fake tracks of imaginary downtempo.
+/// 24 fake tracks of imaginary downtempo. The rendered text must stay
+/// identical to the raw `"artist - title"` strings, so golden frames don't
+/// change: split on `" - "` into tags.
 fn fake_tracks() -> Vec<Track> {
     let raw = [
         ("Aphex Twin - Xtal", 291),
@@ -95,9 +100,17 @@ fn fake_tracks() -> Vec<Track> {
         ("DJ Shadow - Midnight in a Perfect World", 290),
     ];
     raw.into_iter()
-        .map(|(title, secs)| Track {
-            title: title.into(),
-            duration: Duration::from_secs(secs),
+        .map(|(raw_title, secs)| {
+            let (artist, title) = raw_title
+                .split_once(" - ")
+                .expect("fake titles look like `artist - title`");
+            Track {
+                id: Track::next_id(),
+                source: TrackSource::Local(PathBuf::from(format!("/mock/{raw_title}.flac"))),
+                artist: Some(artist.into()),
+                title: Some(title.into()),
+                duration: Some(Duration::from_secs(secs)),
+            }
         })
         .collect()
 }
@@ -114,9 +127,8 @@ impl MockPlayer {
         let (spectrum, peaks, rng) = seeded_spectrum(ANIMATED_SEED);
         Self {
             state: PlayState::Playing,
-            current: Some(2),
             position: Duration::from_secs(84),
-            tracks: fake_tracks(),
+            playlist: Playlist::from_tracks(fake_tracks()),
             shuffle: false,
             repeat: false,
             volume: 68,
@@ -127,6 +139,7 @@ impl MockPlayer {
             rng,
             frozen: false,
         }
+        .with_current(2)
     }
 
     /// Frozen state for `--dump` and the golden tests: 1:24 into track 3 with
@@ -136,9 +149,8 @@ impl MockPlayer {
         let (spectrum, peaks, rng) = seeded_spectrum(DETERMINISTIC_SEED);
         Self {
             state: PlayState::Playing,
-            current: Some(2),
             position: Duration::from_secs(84),
-            tracks: fake_tracks(),
+            playlist: Playlist::from_tracks(fake_tracks()),
             shuffle: false,
             repeat: false,
             volume: 68,
@@ -149,6 +161,7 @@ impl MockPlayer {
             rng,
             frozen: true,
         }
+        .with_current(2)
     }
 
     /// Seed-controlled mock for tests (the spectrum depends on the seed).
@@ -157,9 +170,28 @@ impl MockPlayer {
         let (spectrum, peaks, rng) = seeded_spectrum(seed);
         Self {
             state: PlayState::Playing,
-            current: Some(2),
             position: Duration::from_secs(84),
-            tracks: fake_tracks(),
+            playlist: Playlist::from_tracks(fake_tracks()),
+            shuffle: false,
+            repeat: false,
+            volume: 68,
+            balance: 0,
+            format: FormatInfo::default(),
+            spectrum,
+            peaks,
+            rng,
+            frozen: false,
+        }
+        .with_current(2)
+    }
+
+    /// A stopped, empty-player mock: no tracks, nothing current (plan 02).
+    pub fn empty() -> Self {
+        let (spectrum, peaks, rng) = seeded_spectrum(ANIMATED_SEED);
+        Self {
+            state: PlayState::Stopped,
+            position: Duration::ZERO,
+            playlist: Playlist::new(),
             shuffle: false,
             repeat: false,
             volume: 68,
@@ -172,12 +204,17 @@ impl MockPlayer {
         }
     }
 
+    fn with_current(mut self, current: usize) -> Self {
+        self.playlist.set_current(Some(current));
+        self
+    }
+
     pub fn snapshot(&self) -> PlayerSnapshot {
         PlayerSnapshot {
             state: self.state,
-            current: self.current,
+            current: self.playlist.current(),
             position: self.position,
-            tracks: self.tracks.clone(),
+            tracks: self.playlist.tracks().clone(),
             shuffle: self.shuffle,
             repeat: self.repeat,
             volume: self.volume,
@@ -189,14 +226,61 @@ impl MockPlayer {
     }
 
     pub fn handle(&mut self, cmd: PlayerCommand) {
-        let len = self.tracks.len();
+        // Playlist-mutating commands work even when the list is empty.
+        match cmd {
+            PlayerCommand::AddTracks(new) => {
+                self.playlist.append_sorted(new);
+                return;
+            }
+            PlayerCommand::ReplaceTracks(new) => {
+                self.playlist.replace(new);
+                if self.playlist.is_empty() {
+                    self.state = PlayState::Stopped;
+                    self.position = Duration::ZERO;
+                } else {
+                    self.playlist.set_current(Some(0));
+                    self.position = Duration::ZERO;
+                    self.state = PlayState::Playing;
+                }
+                return;
+            }
+            PlayerCommand::RemoveTrack(i) => {
+                if self.playlist.remove(i) {
+                    // The current track was deleted: stop at zero.
+                    self.state = PlayState::Stopped;
+                    self.position = Duration::ZERO;
+                }
+                return;
+            }
+            PlayerCommand::ClearPlaylist => {
+                self.playlist.clear();
+                self.state = PlayState::Stopped;
+                self.position = Duration::ZERO;
+                return;
+            }
+            PlayerCommand::MoveTrack { from, up } => {
+                if up {
+                    self.playlist.move_up(from);
+                } else {
+                    self.playlist.move_down(from);
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.handle_transport(cmd);
+    }
+
+    /// Transport and seek — everything that needs a non-empty playlist.
+    fn handle_transport(&mut self, cmd: PlayerCommand) {
+        let len = self.playlist.len();
         if len == 0 {
             return;
         }
         match cmd {
             PlayerCommand::Play => {
-                if self.current.is_none() {
-                    self.current = Some(0);
+                if self.playlist.current().is_none() {
+                    self.playlist.set_current(Some(0));
                     self.position = Duration::ZERO;
                 }
                 self.state = PlayState::Playing;
@@ -211,12 +295,12 @@ impl MockPlayer {
                 self.position = Duration::ZERO;
             }
             PlayerCommand::TogglePlayPause => match self.state {
-                PlayState::Playing => self.handle(PlayerCommand::Pause),
-                _ => self.handle(PlayerCommand::Play),
+                PlayState::Playing => self.handle_transport(PlayerCommand::Pause),
+                _ => self.handle_transport(PlayerCommand::Play),
             },
             PlayerCommand::Next => {
-                let next = self.current.map_or(0, |i| (i + 1) % len);
-                self.current = Some(next);
+                let next = self.playlist.current().map_or(0, |i| (i + 1) % len);
+                self.playlist.set_current(Some(next));
                 self.position = Duration::ZERO;
             }
             PlayerCommand::Prev => {
@@ -225,21 +309,22 @@ impl MockPlayer {
                     self.position = Duration::ZERO;
                 } else {
                     let prev = self
-                        .current
+                        .playlist
+                        .current()
                         .map_or(0, |i| i.checked_sub(1).unwrap_or(len - 1));
-                    self.current = Some(prev);
+                    self.playlist.set_current(Some(prev));
                     self.position = Duration::ZERO;
                 }
             }
             PlayerCommand::PlayTrack(i) if i < len => {
-                self.current = Some(i);
+                self.playlist.set_current(Some(i));
                 self.position = Duration::ZERO;
                 self.state = PlayState::Playing;
             }
             PlayerCommand::PlayTrack(_) => {}
             PlayerCommand::SeekBy(delta) => {
                 if let Some(track) = self.current_track() {
-                    let track_len = track.duration.as_secs();
+                    let track_len = track.duration.unwrap_or(UNKNOWN_DURATION).as_secs();
                     let target = self
                         .position
                         .as_secs()
@@ -251,11 +336,15 @@ impl MockPlayer {
             PlayerCommand::SetVolume(v) => self.volume = v.min(100),
             PlayerCommand::ToggleShuffle => self.shuffle = !self.shuffle,
             PlayerCommand::ToggleRepeat => self.repeat = !self.repeat,
+            // Handled by `handle`.
+            _ => {}
         }
     }
 
     fn current_track(&self) -> Option<&Track> {
-        self.current.and_then(|i| self.tracks.get(i))
+        self.playlist
+            .current()
+            .and_then(|i| self.playlist.tracks().get(i))
     }
 
     /// Advance the clock, spectrum, and peaks. Called from `App::tick` with
@@ -269,13 +358,15 @@ impl MockPlayer {
         }
 
         self.position += dt;
-        if let Some(track) = self.current_track()
-            && self.position >= track.duration
-        {
-            if self.repeat {
-                self.position = Duration::ZERO;
-            } else {
-                self.handle(PlayerCommand::Next);
+        if let Some(track) = self.current_track() {
+            // Durations can be unknown → assume a plausible 3 minutes.
+            let track_len = track.duration.unwrap_or(UNKNOWN_DURATION);
+            if self.position >= track_len {
+                if self.repeat {
+                    self.position = Duration::ZERO;
+                } else {
+                    self.handle(PlayerCommand::Next);
+                }
             }
         }
 
@@ -320,9 +411,7 @@ impl MockPlayer {
     /// Replace a track title (test support).
     #[cfg(test)]
     pub fn set_track_title(&mut self, index: usize, title: &str) {
-        if let Some(track) = self.tracks.get_mut(index) {
-            track.title = title.into();
-        }
+        self.playlist.set_title(index, title);
     }
 }
 
@@ -333,8 +422,19 @@ mod tests {
     #[test]
     fn fake_playlist_is_in_range() {
         let p = MockPlayer::new(1);
-        assert!((15..=50).contains(&p.tracks.len()));
-        assert_eq!(p.snapshot().tracks.len(), p.tracks.len());
+        assert!((15..=50).contains(&p.playlist.len()));
+        assert_eq!(p.snapshot().tracks.len(), p.playlist.len());
+    }
+
+    #[test]
+    fn fake_tracks_render_their_original_text() {
+        // Golden frames depend on `display_name` reproducing the raw string.
+        let tracks = fake_tracks();
+        assert_eq!(tracks[0].display_name(), "Aphex Twin - Xtal");
+        assert_eq!(
+            tracks[23].display_name(),
+            "DJ Shadow - Midnight in a Perfect World"
+        );
     }
 
     #[test]
@@ -354,10 +454,10 @@ mod tests {
     #[test]
     fn track_end_wraps_to_next() {
         let mut p = MockPlayer::new(1);
-        p.current = Some(0);
+        p.playlist.set_current(Some(0));
         p.position = Duration::from_secs(290);
         p.tick(Duration::from_secs(2));
-        assert_eq!(p.current, Some(1));
+        assert_eq!(p.playlist.current(), Some(1));
         assert_eq!(p.position, Duration::ZERO);
     }
 
@@ -377,5 +477,84 @@ mod tests {
         for bin in &p.spectrum {
             assert!((0.0..=1.0).contains(bin));
         }
+    }
+
+    #[test]
+    fn empty_player_is_stopped_and_empty() {
+        let mut p = MockPlayer::empty();
+        assert_eq!(p.state, PlayState::Stopped);
+        assert_eq!(p.playlist.current(), None);
+        assert!(p.playlist.is_empty());
+        assert_eq!(p.volume, 68);
+        assert_eq!(p.balance, 0);
+        // Transport on an empty list is a no-op, never a panic.
+        p.handle(PlayerCommand::Next);
+        p.handle(PlayerCommand::Play);
+        p.tick(Duration::from_secs(100));
+        assert_eq!(p.playlist.current(), None);
+    }
+
+    #[test]
+    fn remove_current_track_stops_playback() {
+        let mut p = MockPlayer::new(1);
+        assert_eq!(p.playlist.current(), Some(2));
+        p.handle(PlayerCommand::RemoveTrack(2));
+        assert_eq!(p.state, PlayState::Stopped);
+        assert_eq!(p.position, Duration::ZERO);
+        assert_eq!(p.playlist.current(), None);
+
+        // Removing a *non*-current track keeps the state and shifts current.
+        let mut p = MockPlayer::new(1);
+        p.handle(PlayerCommand::RemoveTrack(0));
+        assert_eq!(p.state, PlayState::Playing);
+        assert_eq!(p.playlist.current(), Some(1));
+    }
+
+    #[test]
+    fn add_and_replace_commands_rewire_the_playlist() {
+        let mut p = MockPlayer::new(1);
+        let extra = fake_tracks()[0].clone();
+        p.handle(PlayerCommand::AddTracks(vec![extra.clone()]));
+        assert_eq!(p.playlist.len(), 25);
+
+        p.handle(PlayerCommand::ReplaceTracks(vec![extra]));
+        assert_eq!(p.playlist.len(), 1);
+        assert_eq!(p.playlist.current(), Some(0), "replace starts at track 1");
+        assert_eq!(p.state, PlayState::Playing);
+
+        // Replace with nothing → stopped, empty.
+        p.handle(PlayerCommand::ReplaceTracks(vec![]));
+        assert!(p.playlist.is_empty());
+        assert_eq!(p.state, PlayState::Stopped);
+    }
+
+    #[test]
+    fn unknown_duration_falls_back_to_three_minutes() {
+        // A playing track with no duration reaches its end after the assumed
+        // 180 s → the player wraps to the next track (here: wraps to 0).
+        let mut p = MockPlayer::new(1);
+        let mut t = fake_tracks()[0].clone();
+        t.duration = None;
+        p.handle(PlayerCommand::ReplaceTracks(vec![t]));
+        p.position = Duration::from_secs(179);
+        p.tick(Duration::from_secs(2));
+        assert_eq!(p.position, Duration::ZERO, "wrapped at the 180 s mark");
+        assert_eq!(
+            p.playlist.current(),
+            Some(0),
+            "single track wraps to itself"
+        );
+
+        // With a second track it advances instead of wrapping.
+        let mut p = MockPlayer::new(1);
+        let mut a = fake_tracks()[0].clone();
+        a.duration = None;
+        p.handle(PlayerCommand::ReplaceTracks(vec![
+            a,
+            fake_tracks()[1].clone(),
+        ]));
+        p.position = Duration::from_secs(180);
+        p.tick(Duration::from_secs(1));
+        assert_eq!(p.playlist.current(), Some(1));
     }
 }

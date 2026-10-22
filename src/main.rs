@@ -6,10 +6,11 @@ mod action;
 mod app;
 mod config;
 mod keymap;
+mod library;
 mod player;
 mod ui;
 
-use app::{App, FRAME};
+use app::{App, FRAME, ScanMode};
 use config::Config;
 use keymap::Keymap;
 use ui::theme::{ColorDepth, Theme, omarchy};
@@ -101,6 +102,15 @@ fn main() -> std::io::Result<()> {
 
     let demo = args.iter().any(|arg| arg == "--demo");
 
+    // Positional args are load paths (`ampwire ~/Music`), but only outside
+    // `--dump` (which returns above) — every arg not starting with `--`.
+    let paths: Vec<std::path::PathBuf> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .map(std::path::PathBuf::from)
+        .collect();
+
     let loaded = Config::load();
     let mut config = loaded.config;
     if demo {
@@ -113,7 +123,13 @@ fn main() -> std::io::Result<()> {
     let mut theme = resolve_theme(&config);
     theme.apply_depth(ColorDepth::detect());
 
-    let mut app = App::new(config, keymap, theme, demo);
+    // Non-demo sessions start with an empty playlist; demo/--dump keep the
+    // fake one (plan 02, step 8).
+    let mut app = if demo {
+        App::new(config, keymap, theme, true)
+    } else {
+        App::new_session(config, keymap, theme)
+    };
     // If the on-disk config failed to load, mark it read-only so layout
     // hotkeys never overwrite the broken file.
     if !demo {
@@ -125,6 +141,11 @@ fn main() -> std::io::Result<()> {
     }
     if demo {
         app.ui.notice = Some("demo mode: mock player, default layout".into());
+    }
+    // CLI paths behave like Open: replace the playlist and start at track 1.
+    // `--demo` keeps the fake playlist untouched.
+    if !demo && !paths.is_empty() {
+        app.load_paths(paths, ScanMode::Replace);
     }
 
     ratatui::run(|terminal| app.run(terminal))

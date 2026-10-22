@@ -127,10 +127,13 @@ impl Key {
         if self == event {
             return true;
         }
-        // `+` and friends are often delivered as `Char('+') + SHIFT`.
+        // `+` and friends are often delivered as `Char('+') + SHIFT`. Only
+        // non-alphabetic *chars* get that tolerance: named keys (`up`, `esc`)
+        // and letters must match modifiers exactly, or `up` would swallow
+        // `shift+up`.
         if self.modifiers.is_empty()
             && event.modifiers == KeyModifiers::SHIFT
-            && !matches!(self.code, KeyCode::Char(c) if c.is_ascii_alphabetic())
+            && matches!(self.code, KeyCode::Char(c) if !c.is_ascii_alphabetic())
             && self.code == event.code
         {
             return true;
@@ -214,7 +217,11 @@ fn defaults() -> Vec<(Scope, Key, Action)> {
         (Scope::Playlist, "end", JumpEnd),
         (Scope::Playlist, "a", Add),
         (Scope::Playlist, "d", Del),
+        (Scope::Playlist, "D", Clear),
+        (Scope::Playlist, "shift+up", MoveUp),
+        (Scope::Playlist, "shift+down", MoveDown),
         (Scope::Playlist, "/", Find),
+        (Scope::Playlist, "esc", ClearFilter),
         // Layout and misc
         (Scope::Global, "1", TogglePlayer),
         (Scope::Global, "2", ToggleEq),
@@ -482,6 +489,71 @@ mod tests {
         );
     }
 
+    /// Plan 02 checklist: the shipped defaults must never self-conflict —
+    /// especially `d` vs `D` and `up` vs `shift+up`.
+    #[test]
+    fn default_bindings_have_no_conflicts() {
+        let conflicts = find_conflicts(&defaults());
+        let described: Vec<String> = conflicts
+            .iter()
+            .map(|(scope, key, actions)| {
+                format!(
+                    "{scope:?} {} → {}",
+                    key.display(),
+                    actions
+                        .iter()
+                        .map(|a| a.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect();
+        assert!(described.is_empty(), "conflicts: {described:?}");
+    }
+
+    /// `d`/`D` and `↑`/`Shift+↑` resolve to their own actions (the SHIFT
+    /// tolerance for `+`-style chars must not swallow shifted letters or
+    /// named keys).
+    #[test]
+    fn shifted_defaults_resolve_distinctly() {
+        let map = Keymap::defaults();
+        assert_eq!(
+            map.resolve(Scope::Playlist, press(KeyCode::Char('d'))),
+            Some(Action::Del)
+        );
+        assert_eq!(
+            map.resolve(Scope::Playlist, shift(KeyCode::Char('d'))),
+            Some(Action::Clear)
+        );
+        assert_eq!(
+            map.resolve(Scope::Playlist, shift(KeyCode::Up)),
+            Some(Action::MoveUp)
+        );
+        assert_eq!(
+            map.resolve(Scope::Playlist, shift(KeyCode::Down)),
+            Some(Action::MoveDown)
+        );
+        assert_eq!(
+            map.resolve(Scope::Playlist, press(KeyCode::Up)),
+            Some(Action::CursorUp)
+        );
+    }
+
+    /// Non-letter chars keep the SHIFT tolerance: `+` arrives shifted from
+    /// many terminals but must still hit VolumeUp.
+    #[test]
+    fn shifted_symbols_still_match_unshifted_bindings() {
+        let map = Keymap::defaults();
+        assert_eq!(
+            map.resolve(Scope::Global, shift(KeyCode::Char('+'))),
+            Some(Action::VolumeUp)
+        );
+        assert_eq!(
+            map.resolve(Scope::Global, shift(KeyCode::Char('?'))),
+            Some(Action::Help)
+        );
+    }
+
     #[test]
     fn remap_shows_in_hints_and_works() {
         let mut overrides = HashMap::new();
@@ -628,6 +700,14 @@ mod tests {
             (Scope::Playlist, press(KeyCode::PageDown), Action::PageDown),
             (Scope::Playlist, press(KeyCode::Home), Action::JumpHome),
             (Scope::Playlist, press(KeyCode::End), Action::JumpEnd),
+            (Scope::Playlist, press(c('a')), Action::Add),
+            (Scope::Playlist, press(c('d')), Action::Del),
+            (Scope::Playlist, press(c('/')), Action::Find),
+            // Plan 02 actions
+            (Scope::Playlist, shift(c('d')), Action::Clear),
+            (Scope::Playlist, shift(KeyCode::Up), Action::MoveUp),
+            (Scope::Playlist, shift(KeyCode::Down), Action::MoveDown),
+            (Scope::Playlist, press(KeyCode::Esc), Action::ClearFilter),
             // Global misc
             (
                 Scope::Global,
