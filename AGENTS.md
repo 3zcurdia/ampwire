@@ -15,7 +15,7 @@ playback: local lossless files + Jellyfin server streaming.
 - `cargo check --all-targets` — fastest verification loop.
 - `cargo clippy --all-targets -- -D warnings` before finishing.
 - `cargo fmt --check` / `cargo fmt` — rustfmt is the formatter, no extra config.
-- `cargo test` — 218 tests today (216 run, 2 `#[ignore]`d: a visual dump and the audio-device smoke test). Unit tests live next to the modules (`#[cfg(test)] mod tests`); integration tests and the golden frames live in `tests/`.
+- `cargo test` — 241 tests today (239 run, 2 `#[ignore]`d: a visual dump and the audio-device smoke test). Unit tests live next to the modules (`#[cfg(test)] mod tests`); integration tests and the golden frames live in `tests/`.
 
 ## Architecture direction
 
@@ -30,5 +30,6 @@ playback: local lossless files + Jellyfin server streaming.
 
 - Ratatui 0.30 requires explicit `Terminal::draw` + crossterm event polling; there is no framework auto-refresh.
 - `cpal` is wired up: Linux builds need the ALSA dev headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS CoreAudio needs no extra setup. The cpal `Stream` is `!Send` on macOS — keep it on the engine thread (`src/audio/engine.rs`).
+- Sync (plan 04): the clock is **frames played**, not wall time — the audio callback counts what it really pops into an `AtomicU64` (pausing/buffering freezes it for free), and taps one mono sample per frame into a second small `rtrb` ring. The FFT (`src/audio/analysis.rs`) runs on the UI thread inside `RealPlayer::tick` over that tap — never on the audio thread, which stays atomics-and-ring-buffers only. Seeking reloads the stream at an offset (`Decoder::open_at`); the engine's pause flag survives a `Load`, so every load re-asserts Pause/Resume right after it.
 - `cargo test` never opens a sound card; the end-to-end device test is `#[ignore]`d (`cargo test -- --ignored`, it plays an audible tone).
 - `Cargo.lock` is committed (binary crate) — keep it that way.

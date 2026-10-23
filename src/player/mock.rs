@@ -1,8 +1,8 @@
 //! Mock player: fake playlist, ticking clock, animated spectrum.
 //!
 //! Stands in for [`RealPlayer`](super::real::RealPlayer) in `--demo`,
-//! `--dump` and the tests — it owns the clock and spectrum the real player
-//! only gets in plan 04. The RNG is seeded so
+//! `--dump` and the tests — same clock/spectrum contract, faked data (the
+//! real one counts audio frames and runs an FFT). The RNG is seeded so
 //! a given seed always yields the same spectrum; [`MockPlayer::deterministic`]
 //! freezes that seed's spectrum so `--dump` and the golden tests reproduce
 //! exactly.

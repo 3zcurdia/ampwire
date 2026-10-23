@@ -132,4 +132,15 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn thirty_two_bins_span_every_column_of_a_wide_panel() {
+        // Plan 04: the real player reports 32 bands (the mock's 24 was
+        // never baked in — the widget resamples bins to columns).
+        let mut values = [0.0f32; 32];
+        values[31] = 1.0; // only the top band is hot
+        let buf = render(&values, &[0.0f32; 32], 100, 2);
+        assert_eq!(buf.cell((99, 1)).unwrap().symbol(), "█");
+        assert_eq!(buf.cell((0, 1)).unwrap().symbol(), " ", "bin 0 stays flat");
+    }
 }

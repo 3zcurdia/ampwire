@@ -1,6 +1,6 @@
 # Plan 04 — Live timer, seeking and FFT spectrum in sync with the audio
 
-**Status:** ⬜ not started — safe to pick up (needs plan 03 done).
+**Status:** ✅ done (implemented in full; deviations annotated at the end).
 
 Goal: the LCD clock, seek bar and spectrum bars follow what is *actually being
 heard*. Pausing freezes them, stopping zeroes them, seeking jumps the clock.
@@ -105,3 +105,61 @@ The clock, seek bar and bars track the music; pause/stop/seek behave as above; t
 - Seek reloads the stream (brief glitch) rather than flushing in place.
 - Bars are 32 log bands, −60…0 dB.
 - Bars show the signal *before* volume (plan 05 keeps the tap ahead of the gain stage).
+
+## Deviations from the plan (implementation notes)
+
+1. **`start_offset` is refined from the first decoded packet, not just the
+   seek result.** The plan says to use `SeekedTo.actual_ts`. That is still
+   the primary source, but symphonia's FLAC/MP3/ALAC demuxers report the
+   frame *containing* the target while the reader can land mid-frame, so the
+   first packet that actually decodes may be the next one (FLAC fixture:
+   `actual_ts` = frame 8192, first decoded packet = 16384). `Decoder` now
+   keeps the time base and overwrites `start_offset` with the `pts` of the
+   first successfully decoded packet, so `offset + decoded == duration`
+   holds exactly (unit-tested for every fixture). Without this the clock
+   after a seek ran ~185 ms behind the audio.
+2. **`EngineCmd::Load` no longer resets the engine's pause flag, and every
+   load re-asserts `Pause`/`Resume`.** The plan asks that the flag "survive
+   a `Load`" so a paused seek stays paused (Load + Pause, race-free). The
+   flip side: a plain load after an earlier pause (e.g. Pause → Next) would
+   start the next track muted, so `RealPlayer::load_track` always follows
+   the `Load` with `Resume` (or `Pause` when keeping the pause). Same
+   mechanism, both directions.
+3. **`RealPlayer` keeps a `pending_start` offset while a `Load` is in
+   flight.** The plan doesn't mention the ~5–50 ms window between `Load` and
+   the engine's `Started`, during which there is no handle. Without this the
+   LCD flashed `0:00` on every seek and a second `→` within one round-trip
+   counted from zero (seeking +5, +5 twice landed at 5 s, not 10 s). The
+   pending offset stands in for the clock until `Started` replaces the
+   handle (regression-tested).
+4. **Seek-past-the-end returns a clean error, and the "restart from 0"
+   fallback is wired through `EngineEvent::Error(SEEK_UNSUPPORTED)`.** The
+   plan describes this but leaves the channel open; the decoder maps any
+   seek failure to the exact string `seek not supported` (exported as
+   `SEEK_UNSUPPORTED`), and `RealPlayer::on_error` special-cases it:
+   notice `seek not supported for this file`, same track reloaded at 0 —
+   never counted as a `fail_streak` skip.
+5. **`Decoder::open` was folded into `open_at(path, Duration::ZERO)`** (the
+   only caller left was tests); the engine always calls `open_at`.
+6. **The ±10 % seek tolerance from the plan's test only holds for WAV.**
+   The compressed fixtures use 8192-sample frames (≈186 ms on a 0.5 s
+   file), so an accurate seek legitimately starts up to one frame early.
+   Instead of a ratio the tests assert the honest invariant: the seek never
+   starts *after* the target, and `offset + decoded == full duration` (±50 ms).
+   The WAV test keeps the plan's exact ±10 % ratio.
+7. **The Analyzer is boxed inside `RealPlayer`** (`Box<Analyzer>`): its
+   inline window + ring (~16 KB) tripped `clippy::large_enum_variant` on
+   `app::Backend`.
+8. **The spectrum widget needed no change for 32 bins** — it already
+   resamples bins to columns — but a regression test now pins that
+   behaviour (`thirty_two_bins_span_every_column_of_a_wide_panel`).
+9. **Extra tests beyond the plan**: the audio callback `fill()` is now
+   unit-tested directly (counts only popped frames, taps mono, freezes the
+   clock while paused), plus the seek-while-stopped no-op, the
+   double-seek-without-`Started` case, and duration override. Golden frames
+   are untouched (mock only), as the plan required.
+
+Manual checks from step 7 remain for a human with ears (bars pulse with a
+bass beat, stopwatch vs. clock over a minute); the automated `--ignored`
+device test (`real_engine_plays_a_fixture_end_to_end`) passes on this
+machine, exercising the rewritten callback end to end.

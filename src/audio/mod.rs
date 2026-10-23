@@ -13,9 +13,16 @@
 //! Sample path: `Decoder` → interleaved `f32` → [`rtrb`] ring buffer → cpal
 //! callback. No resampling: the stream opens at the track's own sample rate
 //! and channel count.
+//!
+//! Plan 04 sync: the callback counts the frames it really delivered into an
+//! `AtomicU64` (the clock cannot drift, and pauses freeze it for free) and
+//! taps one mono sample per frame into a second small ring — the UI thread
+//! runs the FFT ([`analysis::Analyzer`]) on those, never on the audio thread.
 
+pub mod analysis;
 pub mod decoder;
 pub mod engine;
 
-pub use decoder::{Decoder, StreamInfo};
-pub use engine::{AudioOut, Engine, EngineCmd, EngineEvent};
+pub use analysis::{Analyzer, BANDS};
+pub use decoder::{Decoder, SEEK_UNSUPPORTED, StreamInfo};
+pub use engine::{AudioOut, Engine, EngineCmd, EngineEvent, PlaybackHandle};

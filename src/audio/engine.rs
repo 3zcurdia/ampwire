@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -30,22 +30,45 @@ const MIN_CHUNK: usize = 1024;
 /// Ring capacity in samples: the plan's ≈0.5 s (`rate * channels / 2`), with a
 /// floor so the `MIN_CHUNK` feed threshold can never deadlock a small ring.
 const RING_SECONDS_DIVISOR: usize = 2;
+/// Mono sample-tap capacity: ≈0.37 s at 44.1 kHz. The UI drains it every
+/// frame; when it overflows the excess is dropped (never blocks the callback).
+const TAP_CAPACITY: usize = 16384;
 
 /// Commands from the UI thread to the engine thread.
 #[derive(Debug, Clone)]
 pub enum EngineCmd {
-    Load { path: PathBuf },
+    Load {
+        path: PathBuf,
+        /// Start offset; `Duration::ZERO` for a plain load, `≈ position ± 5 s`
+        /// for a seek (the engine reloads the stream at that point).
+        start: Duration,
+    },
     Pause,
     Resume,
     Stop,
     Shutdown,
 }
 
+/// Everything the UI needs from a live stream to read the clock and draw the
+/// spectrum (plan 04): frames really played, and a mono sample tap.
+#[derive(Debug)]
+pub struct PlaybackHandle {
+    /// Frames the audio callback really delivered — *not* wall time, so the
+    /// clock cannot drift and stops by itself while buffering or paused.
+    pub played: Arc<AtomicU64>,
+    pub sample_rate: u32,
+    /// Where the decoder actually landed after a seek (packet-rounded).
+    pub start_offset: Duration,
+    /// Consumer end of the mono sample tap: one sample per played frame.
+    pub tap: Consumer<f32>,
+}
+
 /// Events from the engine thread back to the UI thread.
 #[derive(Debug)]
 pub enum EngineEvent {
-    /// The track opened and playback started (format info for the hi-fi line).
-    Started(StreamInfo),
+    /// The track opened and playback started: format info for the hi-fi
+    /// line, plus the handle that makes position and spectrum readable.
+    Started(StreamInfo, PlaybackHandle),
     /// The decoder hit EOF **and** the ring buffer drained: auto-advance.
     Finished,
     /// The track could not be played (bad file, unsupported device config…).
@@ -163,6 +186,10 @@ impl Playing {
 /// The engine thread loop: commands → feed the ring → sleep.
 fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>) {
     let mut state: Option<Playing> = None;
+    // Pause flag shared with the callback. It deliberately lives *outside*
+    // the per-track state and survives a `Load`, so a seek-while-paused
+    // (Load + Pause) never audibly blips: whoever wants playback re-sends
+    // Resume (or the player re-sends Pause right after the seek Load).
     let paused = Arc::new(AtomicBool::new(false));
 
     loop {
@@ -170,15 +197,14 @@ fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>) {
         let mut shutdown = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                EngineCmd::Load { path } => {
+                EngineCmd::Load { path, start } => {
                     // Drop the old stream first: its ring buffer dies with it,
                     // so no stale audio survives into the next track.
                     state = None;
-                    paused.store(false, Ordering::Relaxed);
-                    match start(&path, &paused) {
-                        Ok(playing) => {
-                            let _ =
-                                ev_tx.send(EngineEvent::Started(playing.decoder.info().clone()));
+                    match start_track(&path, start, &paused) {
+                        Ok((playing, handle)) => {
+                            let _ = ev_tx
+                                .send(EngineEvent::Started(playing.decoder.info().clone(), handle));
                             state = Some(playing);
                         }
                         Err(reason) => {
@@ -233,10 +259,16 @@ fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>) {
     }
 }
 
-/// Open a track end-to-end: decode it, find a device config it fits, pre-fill
-/// the ring (so playback starts on sound, not silence), then `play()`.
-fn start(path: &Path, paused: &Arc<AtomicBool>) -> Result<Playing, String> {
-    let decoder = Decoder::open(path)?;
+/// Open a track end-to-end: decode it (seeking first when `start` is
+/// non-zero), find a device config it fits, pre-fill the ring (so playback
+/// starts on sound, not silence), then `play()`. Returns the live state plus
+/// the handle that lets the UI read the clock and tap samples.
+fn start_track(
+    path: &Path,
+    start: Duration,
+    paused: &Arc<AtomicBool>,
+) -> Result<(Playing, PlaybackHandle), String> {
+    let decoder = Decoder::open_at(path, start)?;
     let info = decoder.info().clone();
 
     let host = cpal::default_host();
@@ -250,13 +282,32 @@ fn start(path: &Path, paused: &Arc<AtomicBool>) -> Result<Playing, String> {
         .max(MIN_CHUNK * 2);
     let (producer, mut consumer) = RingBuffer::<f32>::new(capacity);
 
+    // The spectrum tap: one mono sample per played frame, dropped (never
+    // blocked on) when the UI falls behind.
+    let (tap_producer, tap_consumer) = RingBuffer::<f32>::new(TAP_CAPACITY);
+    let mut tap_producer = tap_producer;
+
+    // Frames the callback really delivered: the clock source (plan 04).
+    let played = Arc::new(AtomicU64::new(0));
+    let callback_played = Arc::clone(&played);
+
     let device_error = Arc::new(AtomicBool::new(false));
     let callback_error = Arc::clone(&device_error);
     let callback_paused = Arc::clone(paused);
+    let channels = info.channels as usize;
     let stream = device
         .build_output_stream(
             config,
-            move |data: &mut [f32], _| fill(data, &mut consumer, &callback_paused),
+            move |data: &mut [f32], _| {
+                fill(
+                    data,
+                    &mut consumer,
+                    &mut tap_producer,
+                    &callback_paused,
+                    &callback_played,
+                    channels,
+                )
+            },
             move |_err| callback_error.store(true, Ordering::Relaxed),
             None,
         )
@@ -288,18 +339,56 @@ fn start(path: &Path, paused: &Arc<AtomicBool>) -> Result<Playing, String> {
         ._stream
         .play()
         .map_err(|e| format!("audio device error: {e}"))?;
-    Ok(playing)
+
+    let handle = PlaybackHandle {
+        played,
+        sample_rate: info.sample_rate,
+        start_offset: playing.decoder.start_offset(),
+        tap: tap_consumer,
+    };
+    Ok((playing, handle))
 }
 
-/// cpal's audio callback: atoms + ring buffer only (plans-README rule 6).
-fn fill(data: &mut [f32], consumer: &mut Consumer<f32>, paused: &AtomicBool) {
+/// cpal's audio callback: atoms + ring buffers only (plans-README rule 6).
+///
+/// Counts the frames it *really* popped — padded silence is not counted, and
+/// pausing writes silence without popping, so the counter stops by itself.
+fn fill(
+    data: &mut [f32],
+    consumer: &mut Consumer<f32>,
+    tap: &mut Producer<f32>,
+    paused: &AtomicBool,
+    played: &AtomicU64,
+    channels: usize,
+) {
     if paused.load(Ordering::Relaxed) {
         data.fill(0.0);
         return;
     }
-    for sample in data.iter_mut() {
-        *sample = consumer.pop().unwrap_or(0.0);
+    let channels = channels.max(1);
+    let mut frames_popped: u64 = 0;
+    for frame in data.chunks_mut(channels) {
+        let mut sum = 0.0;
+        let mut popped = 0;
+        for sample in frame.iter_mut() {
+            match consumer.pop() {
+                Ok(value) => {
+                    *sample = value;
+                    sum += value;
+                    popped += 1;
+                }
+                // Ring drained: pad with silence, count nothing.
+                Err(_) => *sample = 0.0,
+            }
+        }
+        if popped == channels {
+            frames_popped += 1;
+            // Mono tap for the spectrum: (L + R) / 2 (or the single channel).
+            // A full ring drops the sample — the callback never blocks.
+            let _ = tap.push(sum / channels as f32);
+        }
     }
+    played.fetch_add(frames_popped, Ordering::Relaxed);
 }
 
 /// The one output config this track can play through unchanged: right channel
@@ -359,7 +448,10 @@ mod tests {
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.wav");
         let engine = Engine::spawn();
-        engine.send(EngineCmd::Load { path: fixture });
+        engine.send(EngineCmd::Load {
+            path: fixture,
+            start: Duration::ZERO,
+        });
 
         // 0.5 s of audio + drain, with generous slack for a slow device.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -368,7 +460,7 @@ mod tests {
         while outcome.is_none() && std::time::Instant::now() < deadline {
             for event in engine.poll() {
                 match event {
-                    EngineEvent::Started(info) => {
+                    EngineEvent::Started(info, _handle) => {
                         started = true;
                         eprintln!("started: {info:?}");
                     }
@@ -385,5 +477,66 @@ mod tests {
         let outcome = outcome.expect("the 0.5 s tone must finish within 10 s");
         assert_eq!(outcome, "Finished");
         assert!(started, "Started must arrive before Finished");
+    }
+
+    // --- the callback: the clock source and the spectrum tap (pure) ---
+
+    /// A stereo ring with `frames` of `(left, right)` = `(1.0, 0.0)`.
+    fn stereo_ring(frames: usize) -> (Producer<f32>, Consumer<f32>) {
+        let (mut producer, consumer) = RingBuffer::<f32>::new(frames * 2);
+        for _ in 0..frames {
+            producer.push(1.0).expect("ring has room");
+            producer.push(0.0).expect("ring has room");
+        }
+        (producer, consumer)
+    }
+
+    #[test]
+    fn fill_counts_only_real_frames_and_taps_mono() {
+        let (producer, mut consumer) = stereo_ring(3);
+        let (mut tap_producer, mut tap_consumer) = RingBuffer::<f32>::new(8);
+        let paused = AtomicBool::new(false);
+        let played = AtomicU64::new(0);
+        let mut data = [9.9f32; 8]; // 4 stereo frames requested, only 3 available
+
+        fill(
+            &mut data,
+            &mut consumer,
+            &mut tap_producer,
+            &paused,
+            &played,
+            2,
+        );
+        // 3 frames popped, the 4th padded with silence and not counted.
+        assert_eq!(played.load(Ordering::Relaxed), 3);
+        assert_eq!(&data[6..], &[0.0, 0.0], "drained tail is padded");
+        // The tap carries one mono sample per frame: (1 + 0) / 2.
+        let tapped: Vec<f32> = std::iter::from_fn(|| tap_consumer.pop().ok()).collect();
+        assert_eq!(tapped, vec![0.5, 0.5, 0.5]);
+        drop(producer);
+    }
+
+    #[test]
+    fn fill_while_paused_writes_silence_and_freezes_the_clock() {
+        let (producer, mut consumer) = stereo_ring(4);
+        let (mut tap_producer, mut tap_consumer) = RingBuffer::<f32>::new(8);
+        let paused = AtomicBool::new(true);
+        let played = AtomicU64::new(7); // already 7 frames in
+        let mut data = [9.9f32; 8];
+
+        fill(
+            &mut data,
+            &mut consumer,
+            &mut tap_producer,
+            &paused,
+            &played,
+            2,
+        );
+        assert_eq!(data, [0.0; 8], "pause writes silence");
+        assert_eq!(played.load(Ordering::Relaxed), 7, "no frames counted");
+        assert!(tap_consumer.pop().is_err(), "nothing tapped while paused");
+        // The ring is untouched: resuming picks up exactly where it left off.
+        assert_eq!(consumer.slots(), 8);
+        drop(producer);
     }
 }

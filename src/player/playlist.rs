@@ -2,6 +2,7 @@
 //! (plan 03). Pure data + bookkeeping: no I/O, no rendering.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::Track;
 
@@ -34,6 +35,15 @@ impl Playlist {
     pub fn set_title(&mut self, index: usize, title: &str) {
         if let Some(track) = Arc::make_mut(&mut self.tracks).get_mut(index) {
             track.title = Some(title.into());
+        }
+    }
+
+    /// Record the decoder's duration for track `index` (plan 04, step 3):
+    /// the container's frame count is accurate where tag durations lie or
+    /// are missing, which is what makes the remaining-time display work.
+    pub fn set_duration(&mut self, index: usize, duration: Duration) {
+        if let Some(track) = Arc::make_mut(&mut self.tracks).get_mut(index) {
+            track.duration = Some(duration);
         }
     }
 
@@ -207,6 +217,17 @@ mod tests {
         // Out of range: no-op, false.
         assert!(!p.remove(99));
         assert_eq!(p.len(), 2, "out-of-range remove left the list alone");
+    }
+
+    #[test]
+    fn set_duration_fills_in_the_decoder_length() {
+        let mut p = playlist(&["a", "b"]);
+        assert_eq!(p.tracks()[0].duration, Some(Duration::from_secs(60)));
+        p.set_duration(1, Duration::from_millis(2_500));
+        assert_eq!(p.tracks()[1].duration, Some(Duration::from_millis(2_500)));
+        // Out of range: no-op, never a panic.
+        p.set_duration(99, Duration::from_secs(1));
+        assert_eq!(p.len(), 2);
     }
 
     #[test]

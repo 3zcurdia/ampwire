@@ -53,6 +53,7 @@ dependencies = [
  "lofty",
  "ratatui",
  "rtrb",
+ "rustfft",
  "serde",
  "symphonia",
  "tempfile",

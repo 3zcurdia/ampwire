@@ -4,7 +4,7 @@ Terminal Winamp 2.0 replica with modern hi-fi playback.
 
 Retro Winamp anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look.
 
-> Status: Phase 3 — **real audio playback.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track, ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The timer/seek/spectrum still read `0:00` and zeros (plan 04), volume/balance are stored but not yet applied (plan 05), no Jellyfin yet. `--demo` / `--dump` keep the mock player.
+> Status: Phase 4 — **live sync.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track, ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume/balance are stored but not yet applied (plan 05), no Jellyfin yet. `--demo` / `--dump` keep the mock player.
 
 ## Quickstart
 
@@ -24,8 +24,9 @@ cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 
 - Formats: WAV/PCM, FLAC, MP3, M4A (AAC or ALAC) — decoded with Symphonia and played through cpal **at the track's own sample rate and channel count** (no resampling; lossless sources show `bit-perfect`).
 - Play order: ordered (default) or full-permutation shuffle (`s` — every track plays once per round), repeat (`r`). Tracks auto-advance; the last track stops, or wraps to track 1 with repeat on. `z`/`b` follow the same rule at the end of the playlist.
+- Live sync: the LCD clock, seek bar and spectrum follow what is actually being heard. The clock counts frames the audio callback delivered (no drift, freezes on pause), `←`/`→` seek ±5 s by reloading the stream at that offset (a brief glitch; unsupported files restart with `seek not supported for this file`), and the bars are a 2048-point Hann FFT over the played samples in 32 log-spaced bands (40 Hz → 16 kHz).
 - Failures never stop the run: a bad file shows `skipped <name>: <reason>` and playback moves on; if every track fails → `no playable tracks`.
-- Not yet: the timer/seek/spectrum (plan 04), volume/balance (plan 05), gapless playback, and resampling for device-unsupported rates (such a track is skipped with `device cannot play 48000 Hz 8ch`).
+- Not yet: volume/balance (plan 05), gapless playback, and resampling for device-unsupported rates (such a track is skipped with `device cannot play 48000 Hz 8ch`).
 
 ## Layout
 
@@ -47,7 +48,7 @@ Automatic fallbacks (never overwrite your saved preference):
 
 ## Keys
 
-Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real.
+Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Since plan 04 so are `←` / `→` (seek ±5 s) — the clock and bars follow the audio.
 
 | Key | Action | Scope |
 |---|---|---|
@@ -177,4 +178,4 @@ Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Ba
 
 ## Roadmap
 
-Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03). Next: real timer, seeking and an FFT spectrum synced to the audio (plan 04). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.
+Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04). Next: volume, balance and EQ applied to the samples (plan 05). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.
