@@ -462,6 +462,11 @@ mod tests {
         let mut p = MockPlayer::new(1);
         p.handle(PlayerCommand::SetVolume(200));
         assert_eq!(p.volume, 100);
+        // Balance: out-of-range for the ±100 law, still inside i8.
+        p.handle(PlayerCommand::SetBalance(127));
+        assert_eq!(p.balance, 100);
+        p.handle(PlayerCommand::SetBalance(-128));
+        assert_eq!(p.balance, -100);
     }
 
     #[test]

@@ -197,6 +197,9 @@ fn defaults() -> Vec<(Scope, Key, Action)> {
         (Scope::Global, "-", VolumeDown),
         (Scope::Player, "up", VolumeUp),
         (Scope::Player, "down", VolumeDown),
+        // Balance: pan left/right from any focus
+        (Scope::Global, "[", BalanceLeft),
+        (Scope::Global, "]", BalanceRight),
         // Seek: player and playlist focus
         (Scope::Player, "left", SeekBack),
         (Scope::Player, "right", SeekFwd),
@@ -677,6 +680,9 @@ mod tests {
             // Volume: +/- anywhere
             (Scope::Global, press(c('+')), Action::VolumeUp),
             (Scope::Global, press(c('-')), Action::VolumeDown),
+            // Balance: [ ] anywhere (plan 05)
+            (Scope::Global, press(c('[')), Action::BalanceLeft),
+            (Scope::Global, press(c(']')), Action::BalanceRight),
             // Seek: player and playlist focus
             (Scope::Player, press(KeyCode::Left), Action::SeekBack),
             (Scope::Player, press(KeyCode::Right), Action::SeekFwd),

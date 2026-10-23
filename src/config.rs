@@ -74,8 +74,30 @@ impl Default for ThemeConfig {
 pub struct Config {
     pub layout: LayoutConfig,
     pub theme: ThemeConfig,
+    pub audio: AudioConfig,
     /// `[keys]` action → list of key specs.
     pub keys: HashMap<String, Vec<String>>,
+}
+
+/// Volume/balance, saved 500 ms after the last change (debounced) and on
+/// quit. Defaults keep a fresh install bit-perfect: volume 100 (unity),
+/// balance centered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// 0–=100.
+    pub volume: u8,
+    /// −100..=100.
+    pub balance: i8,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            volume: 100,
+            balance: 0,
+        }
+    }
 }
 
 pub struct LoadedConfig {
@@ -169,6 +191,14 @@ impl Config {
             set_preserving_decor(t, "preset", toml_edit::value(self.theme.preset.clone()));
             set_preserving_decor(t, "transparent", toml_edit::value(self.theme.transparent));
         });
+        set_table(&mut doc, "audio", |t| {
+            set_preserving_decor(t, "volume", toml_edit::value(i64::from(self.audio.volume)));
+            set_preserving_decor(
+                t,
+                "balance",
+                toml_edit::value(i64::from(self.audio.balance)),
+            );
+        });
 
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -240,6 +270,10 @@ fn sanitize(mut config: Config) -> Config {
     } else {
         visible
     };
+    // Volume/balance ranges: serde accepts any in-range integer type, so
+    // out-of-range values (e.g. volume = 250) are clamped here.
+    config.audio.volume = config.audio.volume.min(100);
+    config.audio.balance = config.audio.balance.clamp(-100, 100);
     config
 }
 
@@ -372,5 +406,63 @@ mod tests {
         if let Some(p) = path {
             assert!(p.ends_with("ampwire/config.toml"));
         }
+    }
+
+    // --- `[audio]` (plan 05, step 6 + 7) ---
+
+    #[test]
+    fn audio_defaults_are_bit_perfect() {
+        let audio = AudioConfig::default();
+        assert_eq!(audio.volume, 100, "fresh install: unity gain");
+        assert_eq!(audio.balance, 0, "fresh install: centered");
+    }
+
+    #[test]
+    fn audio_round_trips_through_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.audio.volume = 55;
+        config.audio.balance = -30;
+        config.save(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[audio]"), "{text}");
+        assert!(text.contains("volume = 55"), "{text}");
+        assert!(text.contains("balance = -30"), "{text}");
+
+        let reloaded = Config::load_from(&path).config;
+        assert_eq!(reloaded.audio, config.audio);
+    }
+
+    #[test]
+    fn out_of_range_audio_values_are_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // 250 fits u8, 120 fits i8 — both outside the musical range.
+        fs::write(&path, "[audio]\nvolume = 250\nbalance = 120\n").unwrap();
+        let config = Config::load_from(&path).config;
+        assert_eq!(config.audio.volume, 100);
+        assert_eq!(config.audio.balance, 100);
+    }
+
+    #[test]
+    fn saving_audio_keeps_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# my ampwire config\n[audio]\nvolume = 70 # not too loud\n",
+        )
+        .unwrap();
+        let mut config = Config::load_from(&path).config;
+        config.audio.volume = 40;
+        config.save(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my ampwire config"), "{text}");
+        assert!(text.contains("# not too loud"), "{text}");
+        assert!(text.contains("volume = 40"), "{text}");
+        assert_eq!(Config::load_from(&path).config.audio, config.audio);
     }
 }

@@ -224,7 +224,7 @@ mod tests {
         for _ in 0..2000 {
             buffer.fill(1.0); // fresh input: read the gain off, not a product
             dsp.process(&mut buffer);
-            for frame in buffer.chunks_exact(2) {
+            for frame in buffer.as_chunks::<2>().0 {
                 min = min.min(frame[0]);
                 max = max.max(frame[0]);
             }
@@ -247,7 +247,7 @@ mod tests {
             buffer.fill(0.75);
             dsp.process(&mut buffer);
         }
-        for frame in buffer.chunks_exact(2) {
+        for frame in buffer.as_chunks::<2>().0 {
             assert_eq!(frame[0], 0.0, "left fully attenuated");
             assert_eq!(frame[1], 0.75, "right untouched (gain exactly 1.0)");
         }

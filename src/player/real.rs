@@ -962,7 +962,8 @@ mod tests {
         assert_eq!(format.bit_depth, Some(16));
         assert_eq!(format.sample_rate, Some(44_100));
         assert_eq!(format.channels, "stereo");
-        assert!(format.bit_perfect, "lossless → bit-perfect flag");
+        assert!(format.lossless);
+        assert!(format.bit_perfect, "lossless at 100 % / centered");
         // Lossy start → no bit-perfect flag.
         let mut lossy = fake_started();
         lossy.codec = "MP3".into();
@@ -1127,6 +1128,133 @@ mod tests {
             "toggling order/repeat never interrupts playback"
         );
         assert_eq!(player.state, PlayState::Playing);
+    }
+
+    // --- volume/balance → shared DSP targets (plan 05) ---
+
+    /// Read one of the shared targets back as an f32.
+    fn gain_at(params: &SharedParams, which: &str) -> f32 {
+        let bits = match which {
+            "volume" => params.volume_gain.load(Ordering::Relaxed),
+            "left" => params.balance_left.load(Ordering::Relaxed),
+            "right" => params.balance_right.load(Ordering::Relaxed),
+            other => panic!("unknown target {other}"),
+        };
+        f32::from_bits(bits)
+    }
+
+    #[test]
+    fn volume_and_balance_write_the_shared_dsp_targets() {
+        let (mut player, _cmds, _events, params) = three_tracks();
+        // Defaults: everything unity.
+        assert_eq!(gain_at(&params, "volume"), 1.0);
+        assert_eq!(
+            (gain_at(&params, "left"), gain_at(&params, "right")),
+            (1.0, 1.0)
+        );
+
+        // Volume 50 → gain 0.25 (the squared law), balance untouched.
+        player.handle(PlayerCommand::SetVolume(50));
+        assert_eq!(gain_at(&params, "volume"), 0.25);
+        assert_eq!(
+            (gain_at(&params, "left"), gain_at(&params, "right")),
+            (1.0, 1.0)
+        );
+
+        // Balance +50 → only the left channel is attenuated.
+        player.handle(PlayerCommand::SetBalance(50));
+        assert_eq!(gain_at(&params, "volume"), 0.25, "volume stays");
+        assert_eq!(
+            (gain_at(&params, "left"), gain_at(&params, "right")),
+            (0.5, 1.0)
+        );
+
+        // Back to 100 / 0 → exactly unity again (bit-perfect fast path).
+        player.handle(PlayerCommand::SetVolume(100));
+        player.handle(PlayerCommand::SetBalance(0));
+        assert_eq!(gain_at(&params, "volume"), 1.0);
+        assert_eq!(
+            (gain_at(&params, "left"), gain_at(&params, "right")),
+            (1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn balance_clamps_and_works_with_an_empty_playlist() {
+        // The real session restores the config before any track is loaded,
+        // so these must land on an empty player too. (`App` clamps the ±5
+        // arithmetic; the command itself carries an in-range i8.)
+        let (mut player, _cmds, _events, params) = fake_player();
+        player.handle(PlayerCommand::SetBalance(127)); // out of range, fits i8
+        assert_eq!(player.snapshot().balance, 100);
+        assert_eq!(gain_at(&params, "left"), 0.0);
+        player.handle(PlayerCommand::SetBalance(-100));
+        assert_eq!(player.snapshot().balance, -100);
+        assert_eq!(gain_at(&params, "right"), 0.0);
+        assert_eq!(gain_at(&params, "left"), 1.0, "only the opposite side");
+    }
+
+    #[test]
+    fn bit_perfect_disappears_below_full_volume_or_off_center() {
+        let (mut player, _cmds, events, _params) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert!(player.snapshot().format.bit_perfect, "lossless at 100 / 0");
+
+        player.handle(PlayerCommand::SetVolume(95));
+        assert!(
+            !player.snapshot().format.bit_perfect,
+            "volume below 100 touches the samples"
+        );
+        player.handle(PlayerCommand::SetVolume(100));
+        player.handle(PlayerCommand::SetBalance(5));
+        assert!(
+            !player.snapshot().format.bit_perfect,
+            "an off-center balance touches the samples"
+        );
+        player.handle(PlayerCommand::SetBalance(0));
+        assert!(
+            player.snapshot().format.bit_perfect,
+            "back to 100 / 0: bit-perfect again"
+        );
+    }
+
+    #[test]
+    fn a_lossy_source_is_never_bit_perfect() {
+        let (mut player, _cmds, events, _params) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        let mut lossy = fake_started();
+        lossy.codec = "MP3".into();
+        lossy.lossless = false;
+        lossy.bit_depth = None;
+        queue(&events, EngineEvent::Started(lossy, fake_handle(0)));
+        player.tick(Duration::ZERO);
+        let format = player.snapshot().format;
+        assert!(!format.bit_perfect, "lossy, even at 100 / 0");
+        assert!(!format.lossless);
+    }
+
+    #[test]
+    fn started_copies_the_tagged_bitrate_for_lossy_tracks() {
+        let (mut player, _cmds, events, _params) = fake_player();
+        let mut list = tracks(1);
+        list[0].bitrate_kbps = Some(320);
+        player.handle(PlayerCommand::ReplaceTracks(list));
+        let mut lossy = fake_started();
+        lossy.codec = "MP3".into();
+        lossy.lossless = false;
+        lossy.bit_depth = None;
+        queue(&events, EngineEvent::Started(lossy, fake_handle(0)));
+        player.tick(Duration::ZERO);
+        let format = player.snapshot().format;
+        assert_eq!(format.bitrate_kbps, Some(320));
+        assert_eq!(format.describe(), "MP3  320kbps  44.1kHz  stereo");
+        // A lossless source never carries a bitrate into the line.
+        player.handle(PlayerCommand::PlayTrack(0));
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert_eq!(player.snapshot().format.bitrate_kbps, None);
     }
 
     #[test]

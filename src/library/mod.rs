@@ -291,6 +291,22 @@ mod tests {
     }
 
     #[test]
+    fn wav_bitrate_is_estimated_from_size_and_duration() {
+        // The hand-written WAV has no bitrate tag: 8000 Hz × 1 ch × 16 bit
+        // = 128 kbps, which the estimate must recover.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("beep.wav");
+        write_wav(&path, 1);
+
+        let track = read_track(&path);
+        let kbps = track.bitrate_kbps.expect("bitrate estimate");
+        assert!(
+            (120..=135).contains(&kbps),
+            "≈128 kbps from size/duration, got {kbps}"
+        );
+    }
+
+    #[test]
     fn spawn_scan_reports_progress_every_50_files() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..120 {

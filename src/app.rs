@@ -26,6 +26,9 @@ const MARQUEE: Duration = Duration::from_millis(200);
 const BLINK: Duration = Duration::from_millis(500);
 /// Omarchy theme change check cadence.
 const OMARCHY_INTERVAL: Duration = Duration::from_secs(1);
+/// Save the config this long after the last volume/balance change (the
+/// slider emits one command per keypress; writing TOML each time is waste).
+const CONFIG_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// What a text prompt was opened for (plan 02, step 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +190,10 @@ pub struct App {
     config_path: Option<std::path::PathBuf>,
     /// True when the on-disk config failed to load: never write back.
     read_only: bool,
+    /// When the config last changed in a way worth persisting (volume,
+    /// balance; plan 06 adds the EQ). `tick` saves once it has aged
+    /// [`CONFIG_SAVE_DEBOUNCE`], and quitting flushes it immediately.
+    config_dirty_since: Option<Instant>,
     /// Terminal area of the frame about to be drawn; `None` until the first
     /// frame (tests, `--dump`). Focus uses it to skip auto-dropped panels.
     last_area: Option<Rect>,
@@ -234,6 +241,7 @@ impl App {
             omarchy_acc: Duration::ZERO,
             config_path: None,
             read_only: false,
+            config_dirty_since: None,
             last_area: None,
             omarchy_fallback: false,
             scan_rx: None,
@@ -288,6 +296,7 @@ impl App {
             // Demo mode never writes: layout changes stay in memory only.
             config_path: if demo { None } else { config_path },
             read_only: false,
+            config_dirty_since: None,
             last_area: None,
             omarchy_fallback: false,
             scan_rx: None,
@@ -303,6 +312,10 @@ impl App {
         // The real session starts empty and plays for real: this backend owns
         // the engine thread (dropped → Shutdown + join, so `q` exits fast).
         app.player = Backend::Real(RealPlayer::new());
+        // Restore the remembered volume/balance before anything plays.
+        let (volume, balance) = (app.config.audio.volume, app.config.audio.balance);
+        app.player.handle(PlayerCommand::SetVolume(volume));
+        app.player.handle(PlayerCommand::SetBalance(balance));
         app.snapshot = app.player.snapshot();
         app.ui.playlist_cursor = 0;
         app
@@ -382,6 +395,7 @@ impl App {
             self.last_tick = after_poll;
 
             if self.should_quit {
+                self.flush_config(); // a prompt's Ctrl+C lands here, not in dispatch
                 return Ok(());
             }
         }
@@ -585,6 +599,14 @@ impl App {
                 self.check_omarchy();
             }
         }
+        // Debounced config save (volume/balance; plan 06 reuses it for EQ).
+        if self
+            .config_dirty_since
+            .is_some_and(|since| since.elapsed() >= CONFIG_SAVE_DEBOUNCE)
+        {
+            self.config_dirty_since = None;
+            self.save_config();
+        }
     }
 
     /// Kick off a background scan of `paths` (plan 02, step 8). Refuses when
@@ -692,7 +714,10 @@ impl App {
 
         use Action::*;
         match action {
-            Quit => self.should_quit = true,
+            Quit => {
+                self.should_quit = true;
+                self.flush_config();
+            }
             Help => {
                 self.ui.show_help = !self.ui.show_help;
                 self.ui.help_scroll = 0;
@@ -719,6 +744,8 @@ impl App {
             SeekFwd => self.player.handle(PlayerCommand::SeekBy(5)),
             VolumeUp => self.change_volume(5),
             VolumeDown => self.change_volume(-5),
+            BalanceLeft => self.change_balance(-5),
+            BalanceRight => self.change_balance(5),
 
             // EQ scope
             BandLeft => self.ui.eq_focus = self.ui.eq_focus.saturating_sub(1),
@@ -841,9 +868,17 @@ impl App {
     }
 
     fn change_volume(&mut self, delta: i32) {
-        let volume = self.snapshot.volume as i32 + delta;
-        self.player
-            .handle(PlayerCommand::SetVolume(volume.clamp(0, 100) as u8));
+        let volume = (self.snapshot.volume as i32 + delta).clamp(0, 100) as u8;
+        self.player.handle(PlayerCommand::SetVolume(volume));
+        self.config.audio.volume = volume;
+        self.config_dirty_since = Some(Instant::now());
+    }
+
+    fn change_balance(&mut self, delta: i32) {
+        let balance = (self.snapshot.balance as i32 + delta).clamp(-100, 100) as i8;
+        self.player.handle(PlayerCommand::SetBalance(balance));
+        self.config.audio.balance = balance;
+        self.config_dirty_since = Some(Instant::now());
     }
 
     fn change_band(&mut self, delta: i8) {
@@ -897,6 +932,13 @@ impl App {
             && let Err(err) = self.config.save(&path)
         {
             self.ui.notice = Some(format!("config save failed: {err}"));
+        }
+    }
+
+    /// Save immediately if a debounced save is pending (on quit).
+    fn flush_config(&mut self) {
+        if self.config_dirty_since.take().is_some() {
+            self.save_config();
         }
     }
 
@@ -1565,5 +1607,123 @@ mod tests {
         }
         assert_eq!(app.ui.notice.as_deref(), Some("no audio files found"));
         assert_eq!(app.snapshot().tracks.len(), 24, "playlist left alone");
+    }
+
+    // --- Plan 05: volume, balance, debounced persistence ---
+
+    #[test]
+    fn bracket_keys_move_the_balance_by_five() {
+        let (mut app, _dir) = test_app();
+        assert_eq!(app.snapshot().balance, 0);
+        // `]` ×3 → +15.
+        app.dispatch(Action::BalanceRight);
+        app.dispatch(Action::BalanceRight);
+        app.dispatch(Action::BalanceRight);
+        assert_eq!(app.snapshot().balance, 15);
+        // `[` ×6 → back past center to −15.
+        for _ in 0..6 {
+            app.dispatch(Action::BalanceLeft);
+        }
+        assert_eq!(app.snapshot().balance, -15);
+        // Clamped at full left / full right.
+        for _ in 0..50 {
+            app.dispatch(Action::BalanceLeft);
+        }
+        assert_eq!(app.snapshot().balance, -100);
+        for _ in 0..100 {
+            app.dispatch(Action::BalanceRight);
+        }
+        assert_eq!(app.snapshot().balance, 100, "clamped at the right edge");
+    }
+
+    #[test]
+    fn volume_clamps_at_100_and_balance_changes_mark_the_config_dirty() {
+        let (mut app, _dir) = test_app();
+        // Drive the volume up past the ceiling: it stays at 100.
+        for _ in 0..100 {
+            app.dispatch(Action::VolumeUp);
+        }
+        assert_eq!(app.snapshot().volume, 100, "clamped at 100");
+        for _ in 0..100 {
+            app.dispatch(Action::VolumeDown);
+        }
+        assert_eq!(app.snapshot().volume, 0, "clamped at 0");
+        // Both changes copied into the config and set the debounce flag.
+        assert_eq!(app.config.audio.volume, 0);
+        assert!(app.config_dirty_since.is_some(), "debounce flag set");
+    }
+
+    #[test]
+    fn a_dirty_config_saves_once_the_debounce_ages() {
+        let (mut app, dir) = test_app();
+        app.dispatch(Action::BalanceRight);
+        assert_eq!(app.config.audio.balance, 5);
+        // Not yet: a fresh flag never saves on its first tick.
+        app.tick(Duration::from_millis(33));
+        assert!(!dir.path().join("config.toml").exists());
+
+        // Age the flag past the debounce window, then tick.
+        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.tick(Duration::from_millis(33));
+        assert!(
+            dir.path().join("config.toml").exists(),
+            "debounced save fires from tick"
+        );
+        assert!(app.config_dirty_since.is_none(), "flag cleared after save");
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(text.contains("balance = 5"), "{text}");
+    }
+
+    #[test]
+    fn quitting_flushes_a_pending_config_save() {
+        let (mut app, dir) = test_app();
+        app.dispatch(Action::BalanceLeft);
+        assert!(app.config_dirty_since.is_some());
+        app.dispatch(Action::Quit);
+        assert!(app.should_quit);
+        assert!(app.config_dirty_since.is_none(), "flushed on quit");
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(text.contains("balance = -5"), "{text}");
+    }
+
+    #[test]
+    fn demo_mode_never_saves_audio_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut app = App::with_config_path(
+            Config::default(),
+            Keymap::defaults(),
+            crate::ui::theme::neon(),
+            true, // demo
+            Some(path.clone()),
+        );
+        app.dispatch(Action::VolumeDown);
+        app.dispatch(Action::BalanceRight);
+        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.tick(Duration::from_millis(33));
+        assert!(!path.exists(), "demo mode never writes the config");
+    }
+
+    #[test]
+    fn read_only_config_is_never_overwritten_by_audio_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this is not toml [").unwrap();
+        let mut app = App::with_config_path(
+            Config::default(),
+            Keymap::defaults(),
+            crate::ui::theme::neon(),
+            false,
+            Some(path.clone()),
+        );
+        app.set_read_only(true, None);
+        app.dispatch(Action::VolumeDown);
+        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.tick(Duration::from_millis(33));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "this is not toml [",
+            "the broken file is untouched"
+        );
     }
 }

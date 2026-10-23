@@ -189,26 +189,25 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     const FLAGS_MARGIN: usize = 3;
     const MIN_GAP: usize = 2;
     let width = format_area.width as usize;
-    // Candidate part lists, widest first: everything, minus channels,
-    // minus channels and rate. The marker rides along at the end.
+    // Candidate texts, widest first: the full `describe()` line, then
+    // narrower rebuilds without channels, then without channels and rate.
+    let mut candidates: Vec<String> = vec![describe_with_marker(fmt, fmt.bit_perfect)];
     let format_part_count = fmt_parts.len() - usize::from(fmt.bit_perfect);
-    let mut candidates: Vec<Vec<String>> = vec![fmt_parts.clone()];
     let droppable = usize::from(!fmt.channels.is_empty()) + usize::from(fmt.sample_rate.is_some());
     for drop in 1..=droppable.min(format_part_count.saturating_sub(1)) {
         let mut parts: Vec<String> = fmt_parts[..format_part_count - drop].to_vec();
         parts.extend(fmt_parts[format_part_count..].iter().cloned());
-        candidates.push(parts);
+        candidates.push(parts.join("  "));
     }
     let fits = |text: &str, margin: usize| text.width() + MIN_GAP + FLAGS_WIDTH + margin <= width;
     let mut chosen: Option<(String, usize, bool)> = None;
-    for parts in &candidates {
-        let roomy = parts.join("  ");
-        let tight = parts.join(" ");
-        if fits(&roomy, FLAGS_MARGIN) {
-            chosen = Some((roomy, FLAGS_MARGIN, true));
+    for text in &candidates {
+        let tight = text.replace("  ", " ");
+        if fits(text, FLAGS_MARGIN) {
+            chosen = Some((text.clone(), FLAGS_MARGIN, true));
             break;
-        } else if fits(&roomy, 0) {
-            chosen = Some((roomy, 0, true));
+        } else if fits(text, 0) {
+            chosen = Some((text.clone(), 0, true));
             break;
         } else if fits(&tight, 0) {
             chosen = Some((tight, 0, true));
@@ -217,7 +216,7 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     }
     let (text, margin, show_flags) = chosen.unwrap_or_else(|| {
         // Nothing fits with flags: the full format text still wins.
-        (fmt_parts.join("  "), 0, false)
+        (candidates[0].clone(), 0, false)
     });
     let filler = " ".repeat(width.saturating_sub(text.width() + FLAGS_WIDTH + margin));
     let mut spans: Vec<Span> = vec![Span::styled(
@@ -257,6 +256,21 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
 
     // --- Row 6: transport with accent hotkey letters.
     render_transport(app, transport_area, buf);
+}
+
+/// The format line's full text: [`FormatInfo::describe`], with the
+/// `bit-perfect` marker appended (kept exactly where it always was).
+fn describe_with_marker(fmt: &crate::player::FormatInfo, bit_perfect: bool) -> String {
+    let text = fmt.describe();
+    if bit_perfect {
+        if text.is_empty() {
+            "bit-perfect".into()
+        } else {
+            format!("{text}  bit-perfect")
+        }
+    } else {
+        text
+    }
 }
 
 fn render_seek(app: &App, area: Rect, buf: &mut Buffer, time_pair: &str) {
