@@ -34,6 +34,11 @@ pub struct MockPlayer {
     /// Last `SetEq` the mock received (plan 06): it has no audio to shape,
     /// but the app tests read it back as a recorder.
     last_eq: Option<(bool, [i8; 11])>,
+    /// Every command the mock received (test builds only), so app tests can
+    /// assert *what* was sent — e.g. that `RemoveRemote` fires once per `j`
+    /// reload (plan 08, step 7).
+    #[cfg(test)]
+    pub commands: Vec<PlayerCommand>,
     format: FormatInfo,
     spectrum: Vec<f32>,
     /// Peaks slowly fall back toward the bar height, btop-style.
@@ -129,6 +134,8 @@ impl MockPlayer {
             volume: 68,
             balance: 0,
             last_eq: None,
+            #[cfg(test)]
+            commands: Vec::new(),
             format: FormatInfo::default(),
             spectrum,
             peaks,
@@ -152,6 +159,8 @@ impl MockPlayer {
             volume: 68,
             balance: 0,
             last_eq: None,
+            #[cfg(test)]
+            commands: Vec::new(),
             format: FormatInfo::default(),
             spectrum,
             peaks,
@@ -174,6 +183,8 @@ impl MockPlayer {
             volume: 68,
             balance: 0,
             last_eq: None,
+            #[cfg(test)]
+            commands: Vec::new(),
             format: FormatInfo::default(),
             spectrum,
             peaks,
@@ -197,6 +208,8 @@ impl MockPlayer {
             volume: 68,
             balance: 0,
             last_eq: None,
+            #[cfg(test)]
+            commands: Vec::new(),
             format: FormatInfo::default(),
             spectrum,
             peaks,
@@ -234,10 +247,25 @@ impl MockPlayer {
     }
 
     pub fn handle(&mut self, cmd: PlayerCommand) {
+        #[cfg(test)]
+        self.commands.push(cmd.clone());
         // Playlist-mutating commands work even when the list is empty.
         match cmd {
             PlayerCommand::AddTracks(new) => {
                 self.playlist.append_sorted(new);
+                return;
+            }
+            PlayerCommand::AppendInOrder(new) => {
+                self.playlist.append_in_order(new);
+                return;
+            }
+            PlayerCommand::RemoveRemote => {
+                // The mock playlist is all-local, but keep the semantics
+                // identical so app tests can observe the command (plan 08).
+                if self.playlist.remove_where(|track| track.is_remote()) {
+                    self.state = PlayState::Stopped;
+                    self.position = Duration::ZERO;
+                }
                 return;
             }
             PlayerCommand::ReplaceTracks(new) => {

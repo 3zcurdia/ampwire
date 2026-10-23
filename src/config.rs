@@ -288,10 +288,7 @@ impl Config {
                 Ok(config) => {
                     // A bad `[jellyfin] mode` is downgraded to `cache` with a
                     // one-line notice; everything else still loads.
-                    let notice = config
-                        .jellyfin
-                        .as_ref()
-                        .and_then(|jf| jf.notice.clone());
+                    let notice = config.jellyfin.as_ref().and_then(|jf| jf.notice.clone());
                     LoadedConfig {
                         config: sanitize(config),
                         notice,

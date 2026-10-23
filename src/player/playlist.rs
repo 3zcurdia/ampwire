@@ -74,6 +74,39 @@ impl Playlist {
         Arc::make_mut(&mut self.tracks).extend(new);
     }
 
+    /// Append exactly as given (plan 08): server pages arrive already
+    /// sorted by `Artist, SortName`, so the client must not re-sort them.
+    pub fn append_in_order(&mut self, new: Vec<Track>) {
+        Arc::make_mut(&mut self.tracks).extend(new);
+    }
+
+    /// Remove every track matching `f` in one pass. Returns `true` when the
+    /// *current* track was among them (then `current` clears, exactly like
+    /// [`Playlist::remove`]); otherwise it keeps pointing at the same track,
+    /// with the indices before it closed up.
+    pub fn remove_where(&mut self, f: impl Fn(&Track) -> bool) -> bool {
+        let current = self.current;
+        let tracks = Arc::make_mut(&mut self.tracks);
+        let mut kept: Vec<Track> = Vec::with_capacity(tracks.len());
+        let mut new_current = None;
+        let mut removed_current = false;
+        for (index, track) in tracks.drain(..).enumerate() {
+            if f(&track) {
+                if current == Some(index) {
+                    removed_current = true;
+                }
+                continue;
+            }
+            if current == Some(index) {
+                new_current = Some(kept.len());
+            }
+            kept.push(track);
+        }
+        *tracks = kept;
+        self.current = new_current;
+        removed_current
+    }
+
     /// Remove track `i`. Returns `true` when the removed track was the
     /// current one. Indices after the hole close up.
     pub fn remove(&mut self, i: usize) -> bool {
@@ -282,5 +315,76 @@ mod tests {
         let p = playlist(&["a"]);
         let snap: Arc<Vec<Track>> = Arc::clone(p.tracks());
         assert!(Arc::ptr_eq(&snap, p.tracks()));
+    }
+
+    // --- server order + remote removal (plan 08, step 3) ---
+
+    /// A remote (Jellyfin) track keyed on its item id.
+    fn remote(id: &str) -> Track {
+        Track {
+            id: Track::next_id(),
+            source: TrackSource::Remote {
+                item_id: id.to_string(),
+                container: Some("flac".into()),
+            },
+            artist: Some(format!("artist-{id}")),
+            title: Some(format!("title-{id}")),
+            duration: None,
+            bitrate_kbps: None,
+        }
+    }
+
+    #[test]
+    fn append_in_order_keeps_the_server_order_and_existing_tracks() {
+        let mut p = playlist(&["b", "c"]);
+        p.set_current(Some(0));
+        // Deliberately unsorted: the server already sorted by Artist,SortName
+        // and plan 08 forbids a second client-side sort.
+        p.append_in_order(vec![remote("zz"), remote("aa")]);
+        assert_eq!(
+            p.tracks()
+                .iter()
+                .map(|t| t.display_name())
+                .collect::<Vec<_>>(),
+            [
+                "b - ",
+                "c - ",
+                "artist-zz - title-zz",
+                "artist-aa - title-aa",
+            ],
+            "appended exactly as given"
+        );
+        assert_eq!(p.current(), Some(0), "current untouched by an append");
+    }
+
+    #[test]
+    fn remove_where_reports_and_clears_a_removed_current_track() {
+        let mut p = Playlist::new();
+        p.append_in_order(vec![remote("a"), track("local"), remote("b")]);
+        p.set_current(Some(2)); // playing remote "b"
+
+        // Removing the remote batch takes the current track too.
+        assert!(
+            p.remove_where(|t| t.is_remote()),
+            "the current track was removed"
+        );
+        assert_eq!(p.current(), None, "current clears, like `remove`");
+        assert_eq!(keys_of(&p), ["local"], "only the local track survives");
+
+        // With the current track *not* matching, it survives and its index
+        // closes up around the holes.
+        let mut p = Playlist::new();
+        p.append_in_order(vec![remote("a"), track("local"), remote("b")]);
+        p.set_current(Some(1));
+        assert!(!p.remove_where(|t| t.is_remote()));
+        assert_eq!(p.current(), Some(0), "still pointing at the local track");
+        assert_eq!(p.len(), 1);
+
+        // No match at all: nothing moves, `false` comes back.
+        let mut p = playlist(&["x", "y"]);
+        p.set_current(Some(1));
+        assert!(!p.remove_where(|t| t.is_remote()));
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.current(), Some(1));
     }
 }

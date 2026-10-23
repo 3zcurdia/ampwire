@@ -102,9 +102,11 @@ impl Client {
     pub fn user_id(&self, name: Option<&str>) -> Result<String, String> {
         let users: Vec<User> = self.get_json("/Users")?;
         if let Some(name) = name
-            && let Some(found) = users
-                .iter()
-                .find(|u| u.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+            && let Some(found) = users.iter().find(|u| {
+                u.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
         {
             return Ok(found.id.clone());
         }
@@ -125,7 +127,12 @@ impl Client {
 
     /// One page of audio items, server-sorted (`Artist, SortName`), mapped
     /// to [`Track`]s. Returns the tracks plus `TotalRecordCount`.
-    pub fn page(&self, user_id: &str, start: usize, limit: usize) -> Result<(Vec<Track>, usize), String> {
+    pub fn page(
+        &self,
+        user_id: &str,
+        start: usize,
+        limit: usize,
+    ) -> Result<(Vec<Track>, usize), String> {
         let path = format!(
             "/Items?userId={user_id}&Recursive=true&IncludeItemTypes=Audio\
              &SortBy=Artist,SortName&SortOrder=Ascending&Fields=MediaSources\
@@ -140,7 +147,11 @@ impl Client {
     /// `GET /Audio/{id}/stream?static=true` — the original file, optionally
     /// from `range_from` bytes on (`Range: bytes=N-`). Callers inspect the
     /// status: `206` proves range support, `200` (whole body) does not.
-    pub fn open_original(&self, item_id: &str, range_from: Option<u64>) -> Result<Response, String> {
+    pub fn open_original(
+        &self,
+        item_id: &str,
+        range_from: Option<u64>,
+    ) -> Result<Response, String> {
         let url = format!("{}/Audio/{item_id}/stream?static=true", self.base);
         let mut request = self
             .agent
@@ -292,7 +303,9 @@ fn track_from_item(item: Item) -> Option<Track> {
     // The media source's container (`m4a`, `flac`, …) is a usable file
     // extension; the item-level one is a comma list (`mov,mp4,m4a,…`), of
     // which only the first segment can stand in.
-    let media = item.media_sources.and_then(|sources| sources.into_iter().next());
+    let media = item
+        .media_sources
+        .and_then(|sources| sources.into_iter().next());
     let container = media
         .as_ref()
         .and_then(|source| source.container.clone())

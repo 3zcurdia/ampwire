@@ -196,6 +196,21 @@ impl RealPlayer {
                 self.rebuild_order();
                 return;
             }
+            PlayerCommand::AppendInOrder(new) => {
+                self.playlist.append_in_order(new);
+                self.rebuild_order();
+                return;
+            }
+            PlayerCommand::RemoveRemote => {
+                // Reload rule (plan 08): drop the old remote batch; stop if
+                // one of them was playing (mirrors `RemoveTrack`).
+                let was_current = self.playlist.remove_where(|track| track.is_remote());
+                self.rebuild_order();
+                if was_current {
+                    self.stop_playback();
+                }
+                return;
+            }
             PlayerCommand::ReplaceTracks(new) => {
                 self.playlist.replace(new);
                 if self.playlist.is_empty() {

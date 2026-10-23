@@ -265,6 +265,13 @@ pub enum PlayerCommand {
     ToggleRepeat,
     /// Append, sorted among themselves.
     AddTracks(Vec<Track>),
+    /// Append without sorting (plan 08): remote tracks keep the server's
+    /// `Artist, SortName` order instead of being re-sorted client-side.
+    AppendInOrder(Vec<Track>),
+    /// Remove every Jellyfin track (the `j` reload rule: drop the old
+    /// remote batch before the new one arrives). Stops playback when the
+    /// current track was one of them — same as [`RemoveTrack`].
+    RemoveRemote,
     /// Replace the playlist, then behave like `PlayTrack(0)` if non-empty.
     ReplaceTracks(Vec<Track>),
     RemoveTrack(usize),
