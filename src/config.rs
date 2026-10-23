@@ -79,9 +79,9 @@ pub struct Config {
     pub keys: HashMap<String, Vec<String>>,
 }
 
-/// Volume/balance, saved 500 ms after the last change (debounced) and on
-/// quit. Defaults keep a fresh install bit-perfect: volume 100 (unity),
-/// balance centered.
+/// Volume/balance/channel-routing, saved 500 ms after the last change
+/// (debounced) and on quit. Defaults keep a fresh install bit-perfect:
+/// volume 100 (unity), balance centered, channels as decoded.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AudioConfig {
@@ -89,6 +89,9 @@ pub struct AudioConfig {
     pub volume: u8,
     /// −100..=100.
     pub balance: i8,
+    /// Send the decoded channels to the opposite ears — for headsets/DACs
+    /// with reversed L/R wiring.
+    pub swap_channels: bool,
 }
 
 impl Default for AudioConfig {
@@ -96,6 +99,7 @@ impl Default for AudioConfig {
         Self {
             volume: 100,
             balance: 0,
+            swap_channels: false,
         }
     }
 }
@@ -197,6 +201,11 @@ impl Config {
                 t,
                 "balance",
                 toml_edit::value(i64::from(self.audio.balance)),
+            );
+            set_preserving_decor(
+                t,
+                "swap_channels",
+                toml_edit::value(self.audio.swap_channels),
             );
         });
 
@@ -415,6 +424,7 @@ mod tests {
         let audio = AudioConfig::default();
         assert_eq!(audio.volume, 100, "fresh install: unity gain");
         assert_eq!(audio.balance, 0, "fresh install: centered");
+        assert!(!audio.swap_channels, "fresh install: channels as decoded");
     }
 
     #[test]
@@ -424,12 +434,14 @@ mod tests {
         let mut config = Config::default();
         config.audio.volume = 55;
         config.audio.balance = -30;
+        config.audio.swap_channels = true;
         config.save(&path).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[audio]"), "{text}");
         assert!(text.contains("volume = 55"), "{text}");
         assert!(text.contains("balance = -30"), "{text}");
+        assert!(text.contains("swap_channels = true"), "{text}");
 
         let reloaded = Config::load_from(&path).config;
         assert_eq!(reloaded.audio, config.audio);

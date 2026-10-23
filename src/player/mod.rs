@@ -225,6 +225,9 @@ pub enum PlayerCommand {
     SetVolume(u8),
     /// Absolute balance, −100..=100.
     SetBalance(i8),
+    /// Route L/R to the opposite ears (`[audio] swap_channels`) — for
+    /// headsets/DACs with reversed channel wiring.
+    SetSwapChannels(bool),
     ToggleShuffle,
     ToggleRepeat,
     /// Append, sorted among themselves.

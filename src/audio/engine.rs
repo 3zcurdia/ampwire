@@ -279,7 +279,14 @@ fn start_track(
     let device = host
         .default_output_device()
         .ok_or_else(|| "no audio output device".to_string())?;
-    let config = pick_config(&device, &info)?;
+    // Name the device in every failure below: "CX31993 ...: cannot play
+    // 96000 Hz 2ch" tells the user *why* silence happened (e.g. a headset
+    // jack that only advertises 44.1/48 kHz fed from a 96 kHz file).
+    let label = device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "default output".into());
+    let config = pick_config(&device, &info).map_err(|e| format!("{label}: {e}"))?;
 
     // ≈0.5 s of the track's *own* rate and channel count: no resampling.
     let capacity = (info.sample_rate as usize * info.channels as usize / RING_SECONDS_DIVISOR)
@@ -319,7 +326,7 @@ fn start_track(
             move |_err| callback_error.store(true, Ordering::Relaxed),
             None,
         )
-        .map_err(|e| format!("audio device error: {e}"))?;
+        .map_err(|e| format!("{label}: stream error: {e}"))?;
 
     let mut playing = Playing {
         _stream: stream,
@@ -346,7 +353,7 @@ fn start_track(
     playing
         ._stream
         .play()
-        .map_err(|e| format!("audio device error: {e}"))?;
+        .map_err(|e| format!("{label}: stream error: {e}"))?;
 
     let handle = PlaybackHandle {
         played,
@@ -413,7 +420,7 @@ fn pick_config(device: &cpal::Device, info: &StreamInfo) -> Result<StreamConfig,
     let channels = info.channels;
     let ranges = device
         .supported_output_configs()
-        .map_err(|e| format!("audio device error: {e}"))?;
+        .map_err(|e| format!("stream error: {e}"))?;
     for range in ranges {
         if range.channels() != channels
             || range.sample_format() != SampleFormat::F32
@@ -424,7 +431,10 @@ fn pick_config(device: &cpal::Device, info: &StreamInfo) -> Result<StreamConfig,
         }
         return Ok(range.with_sample_rate(rate).into());
     }
-    Err(format!("device cannot play {rate} Hz {channels}ch"))
+    // The common silence case: the device exists and is the default, but
+    // advertises no config holding this exact rate/channels (no resampling
+    // by design). The caller prefixes the device name.
+    Err(format!("cannot play {rate} Hz {channels}ch"))
 }
 
 #[cfg(test)]

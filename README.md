@@ -25,10 +25,10 @@ cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 - Formats: WAV/PCM, FLAC, MP3, M4A (AAC or ALAC) — decoded with Symphonia and played through cpal **at the track's own sample rate and channel count** (no resampling; lossless sources show `bit-perfect`).
 - Play order: ordered (default) or full-permutation shuffle (`s` — every track plays once per round), repeat (`r`). Tracks auto-advance; the last track stops, or wraps to track 1 with repeat on. `z`/`b` follow the same rule at the end of the playlist.
 - Live sync: the LCD clock, seek bar and spectrum follow what is actually being heard. The clock counts frames the audio callback delivered (no drift, freezes on pause), `←`/`→` seek ±5 s by reloading the stream at that offset (a brief glitch; unsupported files restart with `seek not supported for this file`), and the bars are a 2048-point Hann FFT over the played samples in 32 log-spaced bands (40 Hz → 16 kHz).
-- Failures never stop the run: a bad file shows `skipped <name>: <reason>` and playback moves on; if every track fails → `no playable tracks`.
-- Volume & balance are real (plan 05): software gain in the audio callback with click-free smoothing, volume 0–100 (squared law, default 100 = unity), balance −100…+100 (attenuates only the opposite channel, stereo only). Both live in `config.toml` `[audio]` and are restored on startup. At volume 100 / balance 0 the DSP is skipped entirely — lossless stays bit-perfect, as the format line's `bit-perfect` marker shows.
+- Failures never stop the run: a bad file shows `skipped <name>: <reason>` and playback moves on; if every track fails → `no playable tracks: <last reason>` (the reason names the output device, e.g. `External Headphones: cannot play 96000 Hz 2ch`).
+- Volume & balance are real (plan 05): software gain in the audio callback with click-free smoothing, volume 0–100 (squared law, default 100 = unity), balance −100…+100 (attenuates only the opposite channel, stereo only). Both live in `config.toml` `[audio]` and are restored on startup, together with `swap_channels` (L/R to opposite ears — for headsets/DACs with reversed wiring; it fixes the balance direction and the stereo image). At volume 100 / balance 0 / swap off the DSP is skipped entirely — lossless stays bit-perfect, as the format line's `bit-perfect` marker shows.
 - The format line is per-codec: `FLAC 24/96 stereo` (lossless: depth + rate) vs `MP3 320kbps 44.1kHz stereo` (lossy: bitrate + rate, bitrate from tags). Codec/depth/rate/channels come from the decoder, never the tags.
-- Not yet: gapless playback, and resampling for device-unsupported rates (such a track is skipped with `device cannot play 48000 Hz 8ch`).
+- Not yet: gapless playback, and resampling for device-unsupported rates (such a track is skipped with `<device>: cannot play 48000 Hz 8ch` — ampwire plays only at the device's own rates, no fallback to a second device).
 
 ## Layout
 
@@ -105,8 +105,9 @@ transparent = true   # false → paint panel background
 accent = "#00E5FF"
 
 [audio]
-volume = 100         # 0–100, default 100 = unity (bit-perfect)
-balance = 0          # −100 (full left) … +100 (full right)
+volume = 100               # 0–100, default 100 = unity (bit-perfect)
+balance = 0                # −100 (full left) … +100 (full right)
+swap_channels = false      # true → L/R to opposite ears (reversed-wiring headsets/DACs)
 
 [keys]
 next = ["n"]
@@ -144,6 +145,7 @@ Notes:
 - `crossterm` is imported as `ratatui::crossterm` — no direct dependency.
 - `Cargo.lock` is committed (binary crate).
 - Audio on Linux builds against ALSA (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS needs nothing. `cargo test` never opens a sound card — the end-to-end device test is `#[ignore]`d: `cargo test -- --ignored` (it plays an audible tone).
+- Silent playback on a device? `cargo run --example devices` lists every output device with the channel counts and sample rates it advertises — ampwire plays a track only at an *exact* match on the default device (no resampling, no fallback), so a `no playable tracks: <device>: cannot play 96000 Hz 2ch` notice means the file's rate isn't in that list.
 
 ## Project structure
 

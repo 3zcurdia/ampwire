@@ -8,7 +8,7 @@
 //! single sample (plans-README rule 7: bit-perfect stays bit-perfect).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Smoothing factor per frame: `cur += (target - cur) * SMOOTHING`. Small
 /// enough to be click-free, large enough to settle in ~100 ms.
@@ -30,6 +30,12 @@ pub struct SharedParams {
     pub volume_gain: AtomicU32,
     pub balance_left: AtomicU32,
     pub balance_right: AtomicU32,
+    /// Route the channels to the opposite ears (`[audio] swap_channels`):
+    /// for DACs/headsets whose L/R wiring is reversed. Applied *after* the
+    /// gains, so it fixes the stereo image and the balance direction even
+    /// at unity — it reorders samples, it never changes their values.
+    pub swap_channels: AtomicBool,
+    // plan 06 adds the EQ fields
 }
 
 impl SharedParams {
@@ -40,12 +46,13 @@ impl SharedParams {
             volume_gain: AtomicU32::new(unity),
             balance_left: AtomicU32::new(unity),
             balance_right: AtomicU32::new(unity),
+            swap_channels: AtomicBool::new(false),
         }
     }
 
-    /// Write all three targets at once (UI thread). Any `Relaxed` store is
-    /// picked up by the next callback; a torn combination self-heals on the
-    /// following frame.
+    /// Write all three gain targets at once (UI thread). Any `Relaxed`
+    /// store is picked up by the next callback; a torn combination
+    /// self-heals on the following frame.
     pub fn set(&self, volume_gain: f32, balance_left: f32, balance_right: f32) {
         self.volume_gain
             .store(volume_gain.to_bits(), Ordering::Relaxed);
@@ -53,6 +60,11 @@ impl SharedParams {
             .store(balance_left.to_bits(), Ordering::Relaxed);
         self.balance_right
             .store(balance_right.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Turn the L/R swap on or off (read once per `Dsp::process` call).
+    pub fn set_swap_channels(&self, swap: bool) {
+        self.swap_channels.store(swap, Ordering::Relaxed);
     }
 }
 
@@ -87,8 +99,10 @@ impl Dsp {
     /// Apply volume and balance to `samples` (interleaved, `channels` wide).
     ///
     /// - stereo: volume on both, balance attenuates only the *opposite*
-    ///   channel (`b > 0` lowers left, `b < 0` lowers right),
-    /// - any other channel count: volume only (balance is ignored).
+    ///   channel (`b > 0` lowers left, `b < 0` lowers right) — by **content**
+    ///   position — then `swap_channels` (if on) exchanges the pair, so a
+    ///   reversed-wired DAC still hears the intended image and balance,
+    /// - any other channel count: volume only (balance and swap ignored).
     ///
     /// Call this **after** the spectrum tap and only over the frames that
     /// were really popped — never over the callback's padding silence.
@@ -96,28 +110,42 @@ impl Dsp {
         let target_vol = f32::from_bits(self.params.volume_gain.load(Ordering::Relaxed));
         let target_l = f32::from_bits(self.params.balance_left.load(Ordering::Relaxed));
         let target_r = f32::from_bits(self.params.balance_right.load(Ordering::Relaxed));
+        let swap = self.params.swap_channels.load(Ordering::Relaxed);
 
-        // Bit-perfect fast path: nothing targeted, nothing in flight → the
-        // samples pass through completely untouched.
+        // Bit-perfect fast path: nothing targeted, nothing in flight and no
+        // reordering → the samples pass through completely untouched. A swap
+        // on its own does *not* qualify: it reorders (and therefore must
+        // still run), but it never changes a sample's value.
         let unity = target_vol == 1.0
             && target_l == 1.0
             && target_r == 1.0
             && self.cur_vol == 1.0
             && self.cur_l == 1.0
             && self.cur_r == 1.0;
-        if unity {
+        if unity && !swap {
             return;
         }
 
         let channels = self.channels.max(1);
+        let stereo = channels == 2;
         for frame in samples.chunks_mut(channels) {
             step(&mut self.cur_vol, target_vol);
             step(&mut self.cur_l, target_l);
             step(&mut self.cur_r, target_r);
-            if channels == 2 {
-                frame[0] *= self.cur_vol * self.cur_l;
-                frame[1] *= self.cur_vol * self.cur_r;
-            } else {
+            if stereo {
+                // A trailing partial frame (odd length) is left alone.
+                if let [left, right] = frame {
+                    if !unity {
+                        *left *= self.cur_vol * self.cur_l;
+                        *right *= self.cur_vol * self.cur_r;
+                    }
+                    // Gains ran on content first; the swap routes the pair
+                    // to reversed wiring *after* them (balance stays right).
+                    if swap {
+                        std::mem::swap(left, right);
+                    }
+                }
+            } else if !unity {
                 for sample in frame {
                     *sample *= self.cur_vol;
                 }
@@ -295,5 +323,65 @@ mod tests {
         let mut buffer = vec![0.9f32; 8];
         run(&mut dsp, &mut buffer, 100);
         assert_eq!(buffer, vec![0.9f32; 8]);
+    }
+
+    // --- channel swap for reversed-wiring devices ---
+
+    #[test]
+    fn swap_reorders_pairs_even_at_unity_without_changing_values() {
+        let (mut dsp, params) = dsp(2);
+        params.set_swap_channels(true);
+        let mut buffer = vec![0.25, -0.75, 0.5, 1.0];
+        // One pass = one callback: each pair is swapped exactly once (in a
+        // real session the samples then move on and never come back).
+        dsp.process(&mut buffer);
+        assert_eq!(
+            buffer,
+            vec![-0.75, 0.25, 1.0, 0.5],
+            "reordered, values untouched"
+        );
+        // Turning it back off restores the untouched fast path.
+        params.set_swap_channels(false);
+        dsp.process(&mut buffer);
+        assert_eq!(buffer, vec![-0.75, 0.25, 1.0, 0.5], "swap off: alone");
+    }
+
+    #[test]
+    fn swap_applies_after_the_gains_so_balance_stays_correct() {
+        // Content: left 1.0, right 0.5. Balance fully left → gains (1, 0),
+        // so the right content is silenced *before* the reorder; a
+        // reversed-wiring DAC then hears [0.0, 1.0] on the wire, i.e. the
+        // loud content on the ear's left. Swap-before-gains would instead
+        // silence the left content and pan the wrong way.
+        let (mut dsp, params) = dsp(2);
+        let (left, right) = balance_to_gains(-100);
+        params.set(1.0, left, right);
+        let mut scratch = vec![0.0f32; 2048];
+        for _ in 0..4000 {
+            scratch.fill(0.0);
+            dsp.process(&mut scratch); // settle the smoothing (swap still off)
+        }
+        params.set_swap_channels(true);
+        let mut buffer = vec![1.0, 0.5, 1.0, 0.5];
+        dsp.process(&mut buffer); // the one pass that carries the samples
+        assert_eq!(
+            buffer,
+            vec![0.0, 1.0, 0.0, 1.0],
+            "gains first (right silenced), swap second"
+        );
+    }
+
+    #[test]
+    fn swap_is_ignored_for_non_stereo_streams() {
+        for channels in [1usize, 6] {
+            let (mut dsp, params) = dsp(channels);
+            params.set_swap_channels(true);
+            let mut buffer = vec![0.5f32; channels * 4];
+            run(&mut dsp, &mut buffer, 10);
+            assert!(
+                buffer.iter().all(|s| *s == 0.5),
+                "{channels}ch: no reordering without a stereo pair"
+            );
+        }
     }
 }

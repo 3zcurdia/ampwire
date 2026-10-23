@@ -180,3 +180,30 @@ and the `bit-perfect` marker shows at 100 / 0. The automated `--ignored`
 device test (`real_engine_plays_a_fixture_end_to_end`) passes on this
 machine — the tone plays through the new DSP-wired callback — and the
 config round-trip + startup restore are unit-tested.
+
+## Post-plan fixes (user bug report, after ✅)
+
+Two follow-ups from real listening on the author's hardware, made after the
+plan was marked done (fixes to plan-05 behavior, not re-implementation):
+
+1. **`[audio] swap_channels = false` (new option).** The balance was
+   reversed on a CX31993 USB dongle (its L/R wiring is backwards — the
+   direction convention itself is standard and unit-pinned). When true,
+   `Dsp::process` exchanges each stereo pair **after** applying the gains to
+   content positions, so balance semantics stay correct and the stereo image
+   follows the ears even at unity; mono/multichannel ignore it, and the
+   `bit-perfect` marker goes off while it is on (a reorder is processing).
+   `PlayerCommand::SetSwapChannels(bool)`; restored/saved like volume and
+   balance. No key — config-only, by user decision (chose it over device
+   fallback or resampling for issue 2).
+2. **Silence is now explained.** Root cause of "nothing plays on the
+   EarPods": CoreAudio devices advertise *discrete* rates (verified with the
+   new `cargo run --example devices` probe) and ampwire requires an exact
+   match on the default device with no fallback (plan 03's no-resampling
+   rule) — a 96 kHz file into a 44.1/48 kHz headset jack fails every track.
+   Per the user's choice: no fallback, but the error now names the device
+   (`External Headphones: cannot play 96000 Hz 2ch`) and the give-up notice
+   keeps the reason (`no playable tracks: <last reason>`) instead of
+   discarding it. README documents the probe and the message.
+
+`cargo test`: 272 tests (270 run + 2 `#[ignore]`d, both passing here).

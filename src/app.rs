@@ -312,10 +312,12 @@ impl App {
         // The real session starts empty and plays for real: this backend owns
         // the engine thread (dropped → Shutdown + join, so `q` exits fast).
         app.player = Backend::Real(RealPlayer::new());
-        // Restore the remembered volume/balance before anything plays.
-        let (volume, balance) = (app.config.audio.volume, app.config.audio.balance);
-        app.player.handle(PlayerCommand::SetVolume(volume));
-        app.player.handle(PlayerCommand::SetBalance(balance));
+        // Restore the remembered audio settings before anything plays.
+        let audio = app.config.audio;
+        app.player.handle(PlayerCommand::SetVolume(audio.volume));
+        app.player.handle(PlayerCommand::SetBalance(audio.balance));
+        app.player
+            .handle(PlayerCommand::SetSwapChannels(audio.swap_channels));
         app.snapshot = app.player.snapshot();
         app.ui.playlist_cursor = 0;
         app

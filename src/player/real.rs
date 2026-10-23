@@ -46,6 +46,8 @@ pub struct RealPlayer {
     volume: u8,
     /// Balance −100..=100 (default 0). Same path as `volume`.
     balance: i8,
+    /// L/R swap for reversed-wiring devices (`[audio] swap_channels`).
+    swap_channels: bool,
     /// Volume/balance targets shared with the audio callback (lock-free).
     params: Arc<SharedParams>,
     /// From [`EngineEvent::Started`]; blank while stopped.
@@ -95,10 +97,12 @@ impl RealPlayer {
             state: PlayState::Stopped,
             shuffle: false,
             repeat: false,
-            // Full volume, centered balance: unity targets, so the callback's
-            // DSP lets samples pass through untouched (plans-README rule 7).
+            // Full volume, centered balance, no swap: unity targets, so the
+            // callback's DSP lets samples pass through untouched
+            // (plans-README rule 7).
             volume: 100,
             balance: 0,
+            swap_channels: false,
             params,
             format: FormatInfo::blank(),
             handle: None,
@@ -121,9 +125,12 @@ impl RealPlayer {
         } else {
             let mut format = self.format.clone();
             // Bit-perfect marker (plan 05): only a lossless source with no
-            // DSP touching the samples. Plan 06 adds `&& !eq_active` (the
-            // shared params gain EQ fields).
-            format.bit_perfect = format.lossless && self.volume == 100 && self.balance == 0;
+            // DSP touching the samples. A channel swap reorders the stream —
+            // sample *values* survive, but the device no longer receives the
+            // decoded layout — so it counts as processing too. Plan 06 adds
+            // `&& !eq_active`.
+            format.bit_perfect =
+                format.lossless && self.volume == 100 && self.balance == 0 && !self.swap_channels;
             format
         };
         PlayerSnapshot {
@@ -217,10 +224,11 @@ impl RealPlayer {
                 self.rebuild_order();
                 return;
             }
-            // Volume/balance work even with an empty playlist (they are
+            // Volume/balance/swap work even with an empty playlist (they are
             // applied at startup from the config, before any track loads).
             PlayerCommand::SetVolume(v) => self.set_volume(v),
             PlayerCommand::SetBalance(b) => self.set_balance(b),
+            PlayerCommand::SetSwapChannels(swap) => self.set_swap_channels(swap),
             _ => {}
         }
         self.handle_transport(cmd);
@@ -238,6 +246,13 @@ impl RealPlayer {
         self.balance = b.clamp(-100, 100);
         let (left, right) = balance_to_gains(self.balance);
         self.params.set(volume_to_gain(self.volume), left, right);
+    }
+
+    /// L/R swap for reversed-wiring devices: forwarded to the callback,
+    /// which reorders every stereo pair after the gain stage.
+    fn set_swap_channels(&mut self, swap: bool) {
+        self.swap_channels = swap;
+        self.params.set_swap_channels(swap);
     }
 
     /// Transport — everything that needs a non-empty playlist.
@@ -408,11 +423,14 @@ impl RealPlayer {
             .and_then(|i| self.playlist.tracks().get(i))
             .map(|t| t.display_name())
             .unwrap_or_else(|| "track".into());
-        self.notice = Some(format!("skipped {name}: {reason}"));
         if self.fail_streak >= self.playlist.len() {
+            // Keep the last reason in the give-up notice: without it the
+            // user only sees silence and "no playable tracks" — e.g. a
+            // headset jack that cannot hold the file's rate is invisible.
             self.stop_playback();
-            self.notice = Some("no playable tracks".into());
+            self.notice = Some(format!("no playable tracks: {reason}"));
         } else {
+            self.notice = Some(format!("skipped {name}: {reason}"));
             self.advance_after_end();
         }
     }
@@ -942,7 +960,11 @@ mod tests {
         }
         assert_eq!(player.state, PlayState::Stopped);
         assert_eq!(load_paths(&cmds).len(), 3, "two skips, then give up");
-        assert_eq!(player.notice.as_deref(), Some("no playable tracks"));
+        // The give-up notice keeps the last reason (device + why).
+        assert_eq!(
+            player.notice.as_deref(),
+            Some("no playable tracks: bad file")
+        );
         assert!(matches!(log_of(&cmds).last(), Some(EngineCmd::Stop)));
     }
 
@@ -1233,6 +1255,29 @@ mod tests {
         let format = player.snapshot().format;
         assert!(!format.bit_perfect, "lossy, even at 100 / 0");
         assert!(!format.lossless);
+    }
+
+    #[test]
+    fn swap_channels_is_forwarded_and_clears_bit_perfect() {
+        let (mut player, _cmds, events, params) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert!(player.snapshot().format.bit_perfect, "default: no swap");
+
+        player.handle(PlayerCommand::SetSwapChannels(true));
+        assert!(params.swap_channels.load(Ordering::Relaxed), "flag set");
+        assert!(
+            !player.snapshot().format.bit_perfect,
+            "a reorder is processing: marker off"
+        );
+
+        player.handle(PlayerCommand::SetSwapChannels(false));
+        assert!(!params.swap_channels.load(Ordering::Relaxed));
+        assert!(
+            player.snapshot().format.bit_perfect,
+            "swap off: marker back"
+        );
     }
 
     #[test]

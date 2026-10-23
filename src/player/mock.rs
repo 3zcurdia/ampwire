@@ -260,9 +260,12 @@ impl MockPlayer {
                 }
                 return;
             }
-            // Volume/balance are stored only — the mock has no samples.
+            // Volume/balance are stored (the sliders read them back); the
+            // swap has no representation in the mock — no samples to reorder
+            // and no widget shows it.
             PlayerCommand::SetVolume(v) => self.volume = v.min(100),
             PlayerCommand::SetBalance(b) => self.balance = b.clamp(-100, 100),
+            PlayerCommand::SetSwapChannels(_) => {}
             _ => {}
         }
         self.handle_transport(cmd);
