@@ -5,6 +5,7 @@
 //! (demo / `--dump` / tests) and [`real::RealPlayer`] (a real session, whose
 //! audio thread is [`crate::audio::Engine`]) — the UI cannot tell them apart.
 
+pub mod eq_presets;
 pub mod mock;
 pub mod order;
 pub mod playlist;

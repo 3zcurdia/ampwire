@@ -107,7 +107,13 @@ fn render_toggles_and_curve(app: &App, area: Rect, buf: &mut Buffer) {
         if ui.eq_auto { on_color } else { off_color },
         toggle_stop,
     );
-    put(&mut x, "  presets", theme.color(Role::Muted), toggle_stop);
+    // The `presets` label lights up while the picker (plan 07) is open.
+    let presets_color = if ui.presets.is_some() {
+        theme.color(Role::Accent)
+    } else {
+        theme.color(Role::Muted)
+    };
+    put(&mut x, "  presets", presets_color, toggle_stop);
 
     // 2. Readout right after the toggles; never clipped (falls back to
     //    right-aligning if the panel is too narrow for both).
@@ -404,6 +410,35 @@ mod tests {
             assert!(row.contains("pre"), "{row:?}");
             assert!(row.contains("16k"), "{row:?}");
         }
+    }
+
+    #[test]
+    fn presets_label_lights_up_while_the_picker_is_open() {
+        let mut app = test_app();
+        let area = Rect::new(0, 0, 52, 9);
+        let mut buf = Buffer::empty(area);
+        render(&app, area, &mut buf);
+        // The `presets` label on the toggle row (y=1) is muted while closed.
+        let label_color = |buf: &Buffer| {
+            (1..52u16)
+                .map(|x| buf.cell((x, 1)).unwrap())
+                .find(|c| c.fg == theme::neon().color(Role::Muted) && c.symbol() == "p")
+                .map(|c| c.fg)
+        };
+        assert!(label_color(&buf).is_some(), "muted while closed");
+
+        app.dispatch(crate::action::Action::EqPresets);
+        let mut buf = Buffer::empty(area);
+        render(&app, area, &mut buf);
+        let neon = theme::neon();
+        let mut accent = false;
+        for x in 1..52u16 {
+            let c = buf.cell((x, 1)).unwrap();
+            if c.symbol() == "p" && c.fg == neon.color(Role::Accent) {
+                accent = true;
+            }
+        }
+        assert!(accent, "presets label uses accent while the picker is open");
     }
 
     #[test]

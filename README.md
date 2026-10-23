@@ -65,6 +65,7 @@ Winamp-style defaults, Space for play/pause. Every action is remappable. Since p
 | `↑` / `↓` | band gain ±1 dB | eq |
 | `o` | equalizer on / off | eq |
 | `0` | reset equalizer to flat | eq |
+| `p` (`Esc` cancels, `Enter` applies, `p` too) | EQ preset picker (`↑`/`↓` preview live) | global |
 | `+` `=` / `-` | volume | global |
 | `[` / `]` | balance left / right | global |
 | `Enter`, `PgUp`/`PgDn`, `Home`/`End` | play under cursor, page, jump | playlist |
@@ -173,6 +174,7 @@ src/
     mod.rs           audio-file scan (walkdir) + tag reading (lofty) on a thread
   player/
     mod.rs           PlayerSnapshot view model + PlayerCommand + Track + FormatInfo
+    eq_presets.rs    10 named EQ presets (preamp + 10 gains) + find_matching
     playlist.rs      Playlist: append_sorted, remove, reorder, current bookkeeping
     order.rs         PlayOrder: ordered/shuffle permutation (next, prev, jump, look-ahead)
     real.rs          RealPlayer: playlist + play order + AudioOut engine seam
@@ -185,6 +187,7 @@ src/
     chrome.rs        rounded panel + superscript hotkey label + bottom hints
     player.rs        full + compact variants
     equalizer.rs     11 VSliders + braille curve
+    eq_presets.rs    p-key preset picker overlay (live preview, esc cancel)
     playlist.rs      playing/cursor styles, scroll, scrollbar, totals, filter/prompt
     help.rs          ? overlay
     widgets/         lcd_digits, marquee, spectrum, slider, eq_curve
@@ -197,4 +200,4 @@ Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Ba
 
 ## Roadmap
 
-Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05), 10-band equalizer + preamp that really shapes the sound (plan 06). Next: EQ presets screen (plan 07). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.
+Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05), 10-band equalizer + preamp that really shapes the sound (plan 06), EQ presets screen with live preview (plan 07). Next: Jellyfin client (plan 08). Still out of scope: mouse, media keys / MPRIS / Now Playing.

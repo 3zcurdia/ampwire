@@ -63,6 +63,15 @@ impl Prompt {
     }
 }
 
+/// An open preset picker (plan 07): the cursor plus the EQ state to restore
+/// on cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresetPicker {
+    pub cursor: usize,
+    pub saved_gains: [i8; 11],
+    pub saved_on: bool,
+}
+
 /// Per-frame UI state the panels read.
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -83,6 +92,8 @@ pub struct UiState {
     pub eq_bands: [i8; 11],
     pub eq_on: bool,
     pub eq_auto: bool,
+    /// Open preset picker (`p`), if any. While open it takes the keys.
+    pub presets: Option<PresetPicker>,
     pub show_help: bool,
     /// Scroll offset into the `?` overlay, in rows.
     pub help_scroll: usize,
@@ -108,6 +119,7 @@ impl Default for UiState {
             eq_bands: [0; 11],
             eq_on: true,
             eq_auto: false,
+            presets: None,
             show_help: false,
             help_scroll: 0,
             notice: None,
@@ -465,10 +477,22 @@ impl App {
         }
     }
 
-    /// Feed a pressed key into the app. The help overlay and an open text
-    /// prompt take keys before the keymap; everything else goes through it.
+    /// Feed a pressed key into the app. The preset picker, the help overlay
+    /// and an open text prompt take keys before the keymap; everything else
+    /// goes through it.
     pub fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
-        use ratatui::crossterm::event::KeyCode;
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        // The preset picker swallows every key except its own controls
+        // (and Ctrl+C, which still quits) — it sits above the help overlay.
+        if self.ui.presets.is_some() {
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.should_quit = true;
+                }
+                _ => self.handle_preset_key(key),
+            }
+            return;
+        }
         // While the help overlay is open, Esc closes it and ↑/↓ scroll it.
         if self.ui.show_help {
             match key.code {
@@ -495,6 +519,72 @@ impl App {
         }
         if let Some(action) = self.keymap.resolve(self.ui.focus, key) {
             self.dispatch(action);
+        }
+    }
+
+    /// Keys while the preset picker is open: ↑/↓ move + preview, Home/End/
+    /// PgUp/PgDn jump, Enter applies, Esc or the picker key cancels.
+    /// Everything else is swallowed.
+    fn handle_preset_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        use crate::player::eq_presets::PRESETS;
+        use ratatui::crossterm::event::KeyCode;
+        let max = PRESETS.len().saturating_sub(1);
+        let Some(picker) = self.ui.presets.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => {
+                picker.cursor = picker.cursor.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                picker.cursor = (picker.cursor + 1).min(max);
+            }
+            KeyCode::Home => picker.cursor = 0,
+            KeyCode::End => picker.cursor = max,
+            KeyCode::PageUp => picker.cursor = picker.cursor.saturating_sub(10),
+            KeyCode::PageDown => picker.cursor = (picker.cursor + 10).min(max),
+            KeyCode::Enter => {
+                let name = PRESETS[self.ui.presets.take().expect("picker is open").cursor].name;
+                self.ui.notice = Some(format!("eq preset: {name}"));
+                // The previewed values stay applied (and persist via send_eq).
+                return;
+            }
+            KeyCode::Esc => {
+                self.cancel_presets();
+                return;
+            }
+            // The key bound to EqPresets (default `p`) also cancels.
+            _ => {
+                if self.keymap.resolve(self.ui.focus, key) == Some(Action::EqPresets) {
+                    self.cancel_presets();
+                }
+                return; // everything else is swallowed
+            }
+        }
+        self.preview_preset();
+    }
+
+    /// Push the cursor's preset into the live EQ (plan 07): the sliders and
+    /// the sound change immediately. Turns the EQ on; the on/off state saved
+    /// on open is restored by [`App::cancel_presets`].
+    fn preview_preset(&mut self) {
+        use crate::player::eq_presets::PRESETS;
+        let Some(picker) = self.ui.presets.as_ref() else {
+            return;
+        };
+        let gains = PRESETS[picker.cursor].gains();
+        self.ui.eq_bands = gains;
+        self.ui.eq_on = true;
+        self.send_eq();
+    }
+
+    /// `Esc` / `p` on the picker: restore the EQ as it was when the picker
+    /// opened, and close it.
+    fn cancel_presets(&mut self) {
+        if let Some(picker) = self.ui.presets.take() {
+            self.ui.eq_bands = picker.saved_gains;
+            self.ui.eq_on = picker.saved_on;
+            self.send_eq();
         }
     }
 
@@ -714,7 +804,11 @@ impl App {
     }
 
     pub fn dispatch(&mut self, action: Action) {
-        if self.ui.show_help && action != Action::Help && action != Action::Quit {
+        if self.ui.show_help
+            && action != Action::Help
+            && action != Action::Quit
+            && action != Action::EqPresets
+        {
             // Any other key closes the overlay, then is swallowed.
             self.ui.show_help = false;
             return;
@@ -767,6 +861,25 @@ impl App {
             EqReset => {
                 self.ui.eq_bands = [0; 11];
                 self.send_eq();
+            }
+            EqPresets => {
+                if self.ui.presets.is_some() {
+                    // `p` while open acts like Esc.
+                    self.cancel_presets();
+                } else {
+                    // Opening closes the help overlay first, saves the EQ
+                    // to restore on cancel, and lands on the preset that
+                    // matches the current curve (or Flat). The EQ itself
+                    // does not change until a preview or apply.
+                    self.ui.show_help = false;
+                    let picker = PresetPicker {
+                        cursor: crate::player::eq_presets::find_matching(&self.ui.eq_bands)
+                            .unwrap_or(0),
+                        saved_gains: self.ui.eq_bands,
+                        saved_on: self.ui.eq_on,
+                    };
+                    self.ui.presets = Some(picker);
+                }
             }
 
             // Playlist scope
@@ -1869,5 +1982,155 @@ mod tests {
         app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
         app.tick(Duration::from_millis(33));
         assert!(!path.exists(), "demo mode never writes the config");
+    }
+
+    // --- Plan 07: preset picker ---
+
+    /// Press a key by its default spec (e.g. `p`) through `handle_key`.
+    fn key(c: char) -> KeyEvent {
+        press(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn p_opens_the_picker_without_touching_the_eq() {
+        let (mut app, _dir) = test_app();
+        // A custom curve that matches no preset → cursor starts on Flat (0).
+        app.ui.eq_bands = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let saved = app.ui.eq_bands;
+        app.handle_key(key('p'));
+        let picker = app.ui.presets.expect("picker open");
+        assert_eq!(picker.cursor, 0, "no match → Flat");
+        assert_eq!(picker.saved_gains, saved);
+        assert!(picker.saved_on, "eq_on default is true");
+        assert_eq!(app.ui.eq_bands, saved, "opening does not change the EQ");
+
+        // A curve matching a preset starts the cursor on it.
+        app.handle_key(key('p')); // close (cancel)
+        assert!(app.ui.presets.is_none());
+        app.ui.eq_bands = crate::player::eq_presets::PRESETS[5].gains(); // Rock
+        app.handle_key(key('p'));
+        assert_eq!(app.ui.presets.unwrap().cursor, 5, "cursor on the match");
+        app.handle_key(key('p'));
+    }
+
+    #[test]
+    fn down_previews_the_preset_and_turns_the_eq_on() {
+        use crate::player::eq_presets::PRESETS;
+        let (mut app, _dir) = test_app();
+        app.ui.eq_on = false;
+        app.handle_key(key('p'));
+        let start = app.ui.presets.unwrap().cursor;
+        app.handle_key(press(KeyCode::Down));
+        let picker = app.ui.presets.expect("still open");
+        let expected = (start + 1).min(PRESETS.len() - 1);
+        assert_eq!(picker.cursor, expected, "cursor moved down");
+        assert_eq!(app.ui.eq_bands, PRESETS[expected].gains(), "previewed");
+        assert!(app.ui.eq_on, "previewing turns the EQ on");
+
+        // Up goes back and clamps at the top.
+        app.handle_key(press(KeyCode::Up));
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(app.ui.presets.unwrap().cursor, 0, "clamped at the top");
+        assert_eq!(app.ui.eq_bands, PRESETS[0].gains(), "Flat previewed");
+    }
+
+    #[test]
+    fn preset_jumps_and_page_keys() {
+        use crate::player::eq_presets::PRESETS;
+        let (mut app, _dir) = test_app();
+        app.handle_key(key('p'));
+        app.handle_key(press(KeyCode::End));
+        assert_eq!(app.ui.presets.unwrap().cursor, PRESETS.len() - 1);
+        app.handle_key(press(KeyCode::PageUp));
+        assert_eq!(
+            app.ui.presets.unwrap().cursor,
+            0,
+            "page up from the last row clamps at the top"
+        );
+        app.handle_key(press(KeyCode::Home));
+        app.handle_key(press(KeyCode::PageDown));
+        assert_eq!(app.ui.presets.unwrap().cursor, PRESETS.len() - 1);
+    }
+
+    #[test]
+    fn esc_restores_the_previous_bands_and_on_state() {
+        let (mut app, _dir) = test_app();
+        // Start with the EQ off and a custom curve: both must come back.
+        app.ui.eq_on = false;
+        app.ui.eq_bands = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2];
+        let saved_bands = app.ui.eq_bands;
+        app.handle_key(key('p'));
+        app.handle_key(press(KeyCode::Down)); // preview Full Bass
+        assert_ne!(app.ui.eq_bands, saved_bands, "preview changed the bands");
+        assert!(app.ui.eq_on);
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.ui.presets.is_none(), "Esc closes the picker");
+        assert_eq!(app.ui.eq_bands, saved_bands, "bands restored exactly");
+        assert!(!app.ui.eq_on, "the previous on/off state is restored too");
+    }
+
+    #[test]
+    fn enter_keeps_the_previewed_preset_and_notifies() {
+        use crate::player::eq_presets::PRESETS;
+        let (mut app, _dir) = test_app();
+        app.handle_key(key('p'));
+        app.handle_key(press(KeyCode::Down));
+        let previewed = PRESETS[app.ui.presets.unwrap().cursor].gains();
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.ui.presets.is_none(), "Enter closes the picker");
+        assert_eq!(app.ui.eq_bands, previewed, "the preview is kept");
+        let notice = app.ui.notice.expect("preset notice");
+        assert!(notice.starts_with("eq preset: "), "{notice}");
+        // The kept preset is a known one, by name.
+        assert!(
+            PRESETS
+                .iter()
+                .any(|p| notice == format!("eq preset: {}", p.name)),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn preset_picker_swallows_transport_keys_but_ctrl_c_still_quits() {
+        let (mut app, _dir) = test_app();
+        app.handle_key(key('p'));
+        let state = app.snapshot().state;
+        let volume = app.snapshot().volume;
+        let cursor = app.snapshot().current;
+        app.handle_key(press(KeyCode::Char(' '))); // play/pause
+        app.handle_key(press(KeyCode::Char('b'))); // next
+        app.handle_key(press(KeyCode::Char('+'))); // volume up
+        app.handle_key(press(KeyCode::Char('q'))); // quit
+        assert_eq!(app.snapshot().state, state, "space was swallowed");
+        assert_eq!(app.snapshot().volume, volume, "volume was swallowed");
+        assert_eq!(app.snapshot().current, cursor, "next was swallowed");
+        assert!(!app.should_quit, "`q` was swallowed");
+        assert!(app.ui.presets.is_some(), "still open");
+        // Ctrl+C still quits (unflushed config flushes in run(), not here).
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "Ctrl+C quits");
+    }
+
+    #[test]
+    fn p_while_open_cancels() {
+        let (mut app, _dir) = test_app();
+        app.ui.eq_on = false;
+        app.ui.eq_bands = [3; 11];
+        app.handle_key(key('p'));
+        app.handle_key(press(KeyCode::Down)); // preview
+        app.handle_key(key('p')); // cancel acts like Esc
+        assert!(app.ui.presets.is_none(), "p closes the picker");
+        assert_eq!(app.ui.eq_bands, [3; 11], "restored");
+        assert!(!app.ui.eq_on, "restored");
+    }
+
+    #[test]
+    fn opening_presets_closes_the_help_overlay_first() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::Help);
+        assert!(app.ui.show_help);
+        app.handle_key(key('p'));
+        assert!(!app.ui.show_help, "help closed by opening presets");
+        assert!(app.ui.presets.is_some(), "presets opened");
     }
 }

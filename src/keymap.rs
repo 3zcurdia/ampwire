@@ -212,6 +212,8 @@ fn defaults() -> Vec<(Scope, Key, Action)> {
         (Scope::Eq, "down", BandDown),
         (Scope::Eq, "o", EqToggle),
         (Scope::Eq, "0", EqReset),
+        // Presets open from anywhere (global), like the help overlay.
+        (Scope::Global, "p", EqPresets),
         // Playlist focus
         (Scope::Playlist, "up", CursorUp),
         (Scope::Playlist, "down", CursorDown),
@@ -705,6 +707,8 @@ mod tests {
             // EQ on/off and reset (plan 06) — eq scope only, no global clash
             (Scope::Eq, press(c('o')), Action::EqToggle),
             (Scope::Eq, press(c('0')), Action::EqReset),
+            // Preset picker (plan 07) — global, like the help overlay
+            (Scope::Global, press(c('p')), Action::EqPresets),
             // Playlist controls
             (Scope::Playlist, press(KeyCode::Enter), Action::Select),
             (Scope::Playlist, press(KeyCode::PageUp), Action::PageUp),

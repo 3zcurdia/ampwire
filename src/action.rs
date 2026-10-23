@@ -45,6 +45,8 @@ pub enum Action {
     EqToggle,
     /// `0`: reset preamp + bands to flat (plan 06).
     EqReset,
+    /// `p`: open/close the preset picker (plan 07).
+    EqPresets,
 
     // Playlist scope
     CursorUp,
@@ -104,6 +106,7 @@ impl Action {
             Action::BandDown => "band_down",
             Action::EqToggle => "eq_on",
             Action::EqReset => "eq_reset",
+            Action::EqPresets => "eq_presets",
             Action::CursorUp => "cursor_up",
             Action::CursorDown => "cursor_down",
             Action::Select => "select",
@@ -185,6 +188,7 @@ impl Action {
             Action::BandDown => "band gain -1 dB",
             Action::EqToggle => "equalizer on/off",
             Action::EqReset => "reset equalizer to flat",
+            Action::EqPresets => "equalizer presets",
             Action::CursorUp => "cursor up",
             Action::CursorDown => "cursor down",
             Action::Select => "play track under cursor",
@@ -237,6 +241,7 @@ impl Action {
             BandDown,
             EqToggle,
             EqReset,
+            EqPresets,
             CursorUp,
             CursorDown,
             Select,

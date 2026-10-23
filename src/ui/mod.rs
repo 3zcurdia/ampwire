@@ -1,6 +1,7 @@
 //! Render entry point: `render(frame, &App)` draws the full frame.
 
 pub mod chrome;
+pub mod eq_presets;
 pub mod equalizer;
 pub mod help;
 pub mod layout;
@@ -42,6 +43,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if app.ui.show_help {
         help::render(app, area, frame.buffer_mut());
+    }
+    // The preset picker draws on top of everything, including help.
+    if app.ui.presets.is_some() {
+        eq_presets::render(app, area, frame.buffer_mut());
     }
 }
 
