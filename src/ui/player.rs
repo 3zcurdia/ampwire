@@ -32,17 +32,6 @@ pub fn format_time(secs: u64) -> String {
     }
 }
 
-/// Format a sample rate in kHz, keeping the fraction only when there is one:
-/// 96000 → `96`, 44100 → `44.1`, 88200 → `88.2`.
-pub fn format_khz(rate: u32) -> String {
-    if rate.is_multiple_of(1000) {
-        format!("{}", rate / 1000)
-    } else {
-        let khz = format!("{:.1}", rate as f64 / 1000.0);
-        khz.trim_end_matches(".0").to_string()
-    }
-}
-
 /// Play-state glyph color: accent while playing, glow paused, muted stopped.
 fn state_color(state: PlayState, theme: &Theme) -> ratatui::style::Color {
     match state {
@@ -187,35 +176,49 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
 
     // --- Row 3: format line (hi-fi first) + shuf/rep flags.
     let fmt = &snapshot.format;
-    let mut fmt_parts = vec![fmt.codec.clone()];
-    match (fmt.bit_depth, fmt.sample_rate) {
-        (Some(depth), Some(rate)) => fmt_parts.push(format!("{depth}/{}", format_khz(rate))),
-        (Some(depth), None) => fmt_parts.push(format!("{depth}-bit")),
-        (None, Some(rate)) => fmt_parts.push(format!("{}kHz", format_khz(rate))),
-        (None, None) => {}
-    }
-    fmt_parts.push(fmt.channels.clone());
+    let mut fmt_parts = fmt.format_parts();
     if fmt.bit_perfect {
         fmt_parts.push("bit-perfect".into());
     }
     // Flags right-aligned with a 3-column margin. When tight, give up the
-    // margin, then the double spacing, then the flags; the format text wins.
+    // margin, then the double spacing — and a still-narrower line drops the
+    // format's trailing parts (channels first, then the rate; plan 05)
+    // before the flags themselves give way: the format text wins last.
+    // The `bit-perfect` marker is never dropped — it stays where it is.
     const FLAGS_WIDTH: usize = 9; // `shuf  rep`
     const FLAGS_MARGIN: usize = 3;
     const MIN_GAP: usize = 2;
     let width = format_area.width as usize;
-    let roomy = fmt_parts.join("  ");
-    let tight = fmt_parts.join(" ");
+    // Candidate part lists, widest first: everything, minus channels,
+    // minus channels and rate. The marker rides along at the end.
+    let format_part_count = fmt_parts.len() - usize::from(fmt.bit_perfect);
+    let mut candidates: Vec<Vec<String>> = vec![fmt_parts.clone()];
+    let droppable = usize::from(!fmt.channels.is_empty()) + usize::from(fmt.sample_rate.is_some());
+    for drop in 1..=droppable.min(format_part_count.saturating_sub(1)) {
+        let mut parts: Vec<String> = fmt_parts[..format_part_count - drop].to_vec();
+        parts.extend(fmt_parts[format_part_count..].iter().cloned());
+        candidates.push(parts);
+    }
     let fits = |text: &str, margin: usize| text.width() + MIN_GAP + FLAGS_WIDTH + margin <= width;
-    let (text, margin, show_flags) = if fits(&roomy, FLAGS_MARGIN) {
-        (roomy, FLAGS_MARGIN, true)
-    } else if fits(&roomy, 0) {
-        (roomy, 0, true)
-    } else if fits(&tight, 0) {
-        (tight, 0, true)
-    } else {
-        (roomy, 0, false)
-    };
+    let mut chosen: Option<(String, usize, bool)> = None;
+    for parts in &candidates {
+        let roomy = parts.join("  ");
+        let tight = parts.join(" ");
+        if fits(&roomy, FLAGS_MARGIN) {
+            chosen = Some((roomy, FLAGS_MARGIN, true));
+            break;
+        } else if fits(&roomy, 0) {
+            chosen = Some((roomy, 0, true));
+            break;
+        } else if fits(&tight, 0) {
+            chosen = Some((tight, 0, true));
+            break;
+        }
+    }
+    let (text, margin, show_flags) = chosen.unwrap_or_else(|| {
+        // Nothing fits with flags: the full format text still wins.
+        (fmt_parts.join("  "), 0, false)
+    });
     let filler = " ".repeat(width.saturating_sub(text.width() + FLAGS_WIDTH + margin));
     let mut spans: Vec<Span> = vec![Span::styled(
         text,
@@ -533,15 +536,6 @@ mod tests {
         assert_eq!(format_time(83), "1:23");
         assert_eq!(format_time(3600), "1:00:00");
         assert_eq!(format_time(0), "0:00");
-    }
-
-    #[test]
-    fn khz_keeps_fractions() {
-        assert_eq!(format_khz(44_100), "44.1");
-        assert_eq!(format_khz(88_200), "88.2");
-        assert_eq!(format_khz(48_000), "48");
-        assert_eq!(format_khz(96_000), "96");
-        assert_eq!(format_khz(352_800), "352.8");
     }
 
     /// The format line at a given panel width.

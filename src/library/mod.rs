@@ -37,6 +37,7 @@ pub fn read_track(path: &Path) -> Track {
     let mut artist = None;
     let mut title = None;
     let mut duration = None;
+    let mut bitrate_kbps = None;
 
     if let Ok(tagged) = lofty::read_from_path(path) {
         if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
@@ -47,6 +48,21 @@ pub fn read_track(path: &Path) -> Track {
         if !d.is_zero() {
             duration = Some(d);
         }
+        // Lossy line (plan 05): the tagged bitrate, else an estimate from
+        // file size and duration when both are known.
+        bitrate_kbps = tagged
+            .properties()
+            .audio_bitrate()
+            .filter(|b| *b > 0)
+            .or_else(|| {
+                let secs = duration?.as_secs_f64();
+                if secs <= 0.0 {
+                    return None;
+                }
+                let bytes = std::fs::metadata(path).ok()?.len() as f64;
+                let kbps = (bytes * 8.0 / secs / 1000.0).round() as u64;
+                u32::try_from(kbps).ok().filter(|b| *b > 0)
+            });
     }
 
     Track {
@@ -55,6 +71,7 @@ pub fn read_track(path: &Path) -> Track {
         artist,
         title,
         duration,
+        bitrate_kbps,
     }
 }
 

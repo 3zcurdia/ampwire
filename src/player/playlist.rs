@@ -156,6 +156,7 @@ mod tests {
             artist: Some(key.to_string()),
             title: Some(String::new()),
             duration: Some(Duration::from_secs(60)),
+            bitrate_kbps: None,
         }
     }
 

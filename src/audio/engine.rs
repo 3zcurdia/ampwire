@@ -20,6 +20,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use super::dsp::{Dsp, SharedParams};
 use super::{Decoder, StreamInfo};
 
 /// How often the engine thread wakes to feed the ring buffer / poll commands.
@@ -94,12 +95,14 @@ pub struct Engine {
 impl Engine {
     /// Spawn the engine thread. The device itself is opened lazily, on the
     /// first `Load` — spawning is safe on machines with no audio hardware.
-    pub fn spawn() -> Engine {
+    /// `params` are the shared volume/balance targets the callback reads
+    /// (plan 05); the engine never writes them.
+    pub fn spawn(params: Arc<SharedParams>) -> Engine {
         let (cmd_tx, cmd_rx) = channel();
         let (ev_tx, ev_rx) = channel();
         let join = std::thread::Builder::new()
             .name("ampwire-engine".into())
-            .spawn(move || run(cmd_rx, ev_tx))
+            .spawn(move || run(cmd_rx, ev_tx, params))
             .expect("spawn the audio engine thread");
         Engine {
             tx: cmd_tx,
@@ -184,7 +187,7 @@ impl Playing {
 }
 
 /// The engine thread loop: commands → feed the ring → sleep.
-fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>) {
+fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>, params: Arc<SharedParams>) {
     let mut state: Option<Playing> = None;
     // Pause flag shared with the callback. It deliberately lives *outside*
     // the per-track state and survives a `Load`, so a seek-while-paused
@@ -201,7 +204,7 @@ fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>) {
                     // Drop the old stream first: its ring buffer dies with it,
                     // so no stale audio survives into the next track.
                     state = None;
-                    match start_track(&path, start, &paused) {
+                    match start_track(&path, start, &paused, &params) {
                         Ok((playing, handle)) => {
                             let _ = ev_tx
                                 .send(EngineEvent::Started(playing.decoder.info().clone(), handle));
@@ -267,6 +270,7 @@ fn start_track(
     path: &Path,
     start: Duration,
     paused: &Arc<AtomicBool>,
+    params: &Arc<SharedParams>,
 ) -> Result<(Playing, PlaybackHandle), String> {
     let decoder = Decoder::open_at(path, start)?;
     let info = decoder.info().clone();
@@ -295,6 +299,9 @@ fn start_track(
     let callback_error = Arc::clone(&device_error);
     let callback_paused = Arc::clone(paused);
     let channels = info.channels as usize;
+    // The gain stage lives in the callback (one `Dsp` per stream); the UI
+    // changes targets through the shared `params`, never through commands.
+    let mut dsp = Dsp::new(Arc::clone(params), channels);
     let stream = device
         .build_output_stream(
             config,
@@ -306,6 +313,7 @@ fn start_track(
                     &callback_paused,
                     &callback_played,
                     channels,
+                    &mut dsp,
                 )
             },
             move |_err| callback_error.store(true, Ordering::Relaxed),
@@ -353,6 +361,9 @@ fn start_track(
 ///
 /// Counts the frames it *really* popped — padded silence is not counted, and
 /// pausing writes silence without popping, so the counter stops by itself.
+/// The mono spectrum tap is taken **before** the gain stage (plan 04's tap
+/// must stay pre-DSP), and [`Dsp::process`] then runs over exactly the
+/// popped frames — never over the padding silence.
 fn fill(
     data: &mut [f32],
     consumer: &mut Consumer<f32>,
@@ -360,6 +371,7 @@ fn fill(
     paused: &AtomicBool,
     played: &AtomicU64,
     channels: usize,
+    dsp: &mut Dsp,
 ) {
     if paused.load(Ordering::Relaxed) {
         data.fill(0.0);
@@ -389,6 +401,8 @@ fn fill(
         }
     }
     played.fetch_add(frames_popped, Ordering::Relaxed);
+    let filled = frames_popped as usize * channels;
+    dsp.process(&mut data[..filled]);
 }
 
 /// The one output config this track can play through unchanged: right channel
@@ -420,7 +434,7 @@ mod tests {
     #[test]
     fn dropping_the_engine_shuts_the_thread_down_promptly() {
         // No device is opened until a `Load`, so this is safe anywhere.
-        let engine = Engine::spawn();
+        let engine = Engine::spawn(Arc::new(SharedParams::new()));
         let started = std::time::Instant::now();
         drop(engine); // sends Shutdown and joins
         assert!(
@@ -447,7 +461,7 @@ mod tests {
 
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.wav");
-        let engine = Engine::spawn();
+        let engine = Engine::spawn(Arc::new(SharedParams::new()));
         engine.send(EngineCmd::Load {
             path: fixture,
             start: Duration::ZERO,
@@ -491,6 +505,11 @@ mod tests {
         (producer, consumer)
     }
 
+    /// A unity DSP (fresh params): the gain stage leaves samples alone.
+    fn unity_dsp(channels: usize) -> Dsp {
+        Dsp::new(Arc::new(SharedParams::new()), channels)
+    }
+
     #[test]
     fn fill_counts_only_real_frames_and_taps_mono() {
         let (producer, mut consumer) = stereo_ring(3);
@@ -498,6 +517,7 @@ mod tests {
         let paused = AtomicBool::new(false);
         let played = AtomicU64::new(0);
         let mut data = [9.9f32; 8]; // 4 stereo frames requested, only 3 available
+        let mut dsp = unity_dsp(2);
 
         fill(
             &mut data,
@@ -506,6 +526,7 @@ mod tests {
             &paused,
             &played,
             2,
+            &mut dsp,
         );
         // 3 frames popped, the 4th padded with silence and not counted.
         assert_eq!(played.load(Ordering::Relaxed), 3);
@@ -523,6 +544,7 @@ mod tests {
         let paused = AtomicBool::new(true);
         let played = AtomicU64::new(7); // already 7 frames in
         let mut data = [9.9f32; 8];
+        let mut dsp = unity_dsp(2);
 
         fill(
             &mut data,
@@ -531,12 +553,47 @@ mod tests {
             &paused,
             &played,
             2,
+            &mut dsp,
         );
         assert_eq!(data, [0.0; 8], "pause writes silence");
         assert_eq!(played.load(Ordering::Relaxed), 7, "no frames counted");
         assert!(tap_consumer.pop().is_err(), "nothing tapped while paused");
         // The ring is untouched: resuming picks up exactly where it left off.
         assert_eq!(consumer.slots(), 8);
+        drop(producer);
+    }
+
+    #[test]
+    fn fill_applies_the_gain_stage_to_popped_frames_only() {
+        // Halve the volume, then check that only the popped frames were
+        // attenuated (after settling) and the padded tail stays plain silence.
+        let (producer, mut consumer) = stereo_ring(2);
+        let (mut tap_producer, _tap_consumer) = RingBuffer::<f32>::new(8);
+        let paused = AtomicBool::new(false);
+        let played = AtomicU64::new(0);
+        let mut data = [1.0f32; 8]; // 4 stereo frames requested, 2 available
+        let params = Arc::new(SharedParams::new());
+        params.set(0.25, 1.0, 1.0); // volume 50 → gain 0.25
+        let mut dsp = Dsp::new(Arc::clone(&params), 2);
+
+        // Settle the smoothing first, then run the real callback once.
+        let mut scratch = [1.0f32; 2048];
+        for _ in 0..2000 {
+            dsp.process(&mut scratch);
+        }
+        fill(
+            &mut data,
+            &mut consumer,
+            &mut tap_producer,
+            &paused,
+            &played,
+            2,
+            &mut dsp,
+        );
+        assert_eq!(played.load(Ordering::Relaxed), 2);
+        // The ring carries (1.0, 0.0) frames: left becomes 0.25, right 0.0.
+        assert_eq!(&data[..4], &[0.25, 0.0, 0.25, 0.0], "popped: ×0.25");
+        assert_eq!(&data[4..], &[0.0; 4], "padding untouched by DSP");
         drop(producer);
     }
 }

@@ -13,12 +13,13 @@
 //! FFT ([`Analyzer`]) over a mono sample tap on this (UI) thread, with the
 //! mock's attack/release feel.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::audio::{
     Analyzer, AudioOut, BANDS, Engine, EngineCmd, EngineEvent, PlaybackHandle, SEEK_UNSUPPORTED,
-    StreamInfo,
+    SharedParams, StreamInfo, balance_to_gains, volume_to_gain,
 };
 
 use super::order::PlayOrder;
@@ -40,10 +41,13 @@ pub struct RealPlayer {
     state: PlayState,
     shuffle: bool,
     repeat: bool,
-    /// Stored only until plan 05 applies it to the samples.
+    /// Volume 0–=100 (default 100 = unity). Applied to the samples by the
+    /// callback's `Dsp` through the shared targets.
     volume: u8,
-    /// Stored only until plan 05 applies it to the samples.
+    /// Balance −100..=100 (default 0). Same path as `volume`.
     balance: i8,
+    /// Volume/balance targets shared with the audio callback (lock-free).
+    params: Arc<SharedParams>,
     /// From [`EngineEvent::Started`]; blank while stopped.
     format: FormatInfo,
     /// Live clock + sample tap from the engine; `None` while stopped.
@@ -74,21 +78,28 @@ pub struct RealPlayer {
 
 impl RealPlayer {
     /// The production player: an engine thread that owns the audio device.
+    /// The shared DSP targets are created here and cloned (`Arc`) into the
+    /// engine's callback — one instance, written by this thread, read by the
+    /// audio thread.
     pub fn new() -> Self {
-        Self::with_engine(Box::new(Engine::spawn()))
+        let params = Arc::new(SharedParams::new());
+        let engine = Box::new(Engine::spawn(Arc::clone(&params)));
+        Self::with_engine(engine, params)
     }
 
-    /// Same state machine over a different [`AudioOut`] (tests).
-    fn with_engine(engine: Box<dyn AudioOut>) -> Self {
+    /// Same state machine over a different [`AudioOut`] (tests). The tests
+    /// hold their own `Arc` clone of `params` to inspect what was written.
+    fn with_engine(engine: Box<dyn AudioOut>, params: Arc<SharedParams>) -> Self {
         Self {
             playlist: Playlist::new(),
             state: PlayState::Stopped,
             shuffle: false,
             repeat: false,
-            // Full volume: no DSP exists yet, so samples pass through
-            // untouched (plans-README rule 7). Plan 05 makes this live.
+            // Full volume, centered balance: unity targets, so the callback's
+            // DSP lets samples pass through untouched (plans-README rule 7).
             volume: 100,
             balance: 0,
+            params,
             format: FormatInfo::blank(),
             handle: None,
             pending_start: None,
@@ -105,6 +116,16 @@ impl RealPlayer {
     }
 
     pub fn snapshot(&self) -> PlayerSnapshot {
+        let format = if self.state == PlayState::Stopped {
+            FormatInfo::empty()
+        } else {
+            let mut format = self.format.clone();
+            // Bit-perfect marker (plan 05): only a lossless source with no
+            // DSP touching the samples. Plan 06 adds `&& !eq_active` (the
+            // shared params gain EQ fields).
+            format.bit_perfect = format.lossless && self.volume == 100 && self.balance == 0;
+            format
+        };
         PlayerSnapshot {
             state: self.state,
             current: self.playlist.current(),
@@ -114,11 +135,7 @@ impl RealPlayer {
             repeat: self.repeat,
             volume: self.volume,
             balance: self.balance,
-            format: if self.state == PlayState::Stopped {
-                FormatInfo::blank()
-            } else {
-                self.format.clone()
-            },
+            format,
             spectrum: self.spectrum.clone(),
             peaks: self.peaks.clone(),
         }
@@ -200,9 +217,27 @@ impl RealPlayer {
                 self.rebuild_order();
                 return;
             }
+            // Volume/balance work even with an empty playlist (they are
+            // applied at startup from the config, before any track loads).
+            PlayerCommand::SetVolume(v) => self.set_volume(v),
+            PlayerCommand::SetBalance(b) => self.set_balance(b),
             _ => {}
         }
         self.handle_transport(cmd);
+    }
+
+    /// Volume 0–=100 → the shared gain target (0 = silence, 100 = unity).
+    fn set_volume(&mut self, v: u8) {
+        self.volume = v.min(100);
+        let (left, right) = balance_to_gains(self.balance);
+        self.params.set(volume_to_gain(self.volume), left, right);
+    }
+
+    /// Balance −100..=100 → the shared per-channel targets.
+    fn set_balance(&mut self, b: i8) {
+        self.balance = b.clamp(-100, 100);
+        let (left, right) = balance_to_gains(self.balance);
+        self.params.set(volume_to_gain(self.volume), left, right);
     }
 
     /// Transport — everything that needs a non-empty playlist.
@@ -256,7 +291,6 @@ impl RealPlayer {
             }
             PlayerCommand::PlayTrack(_) => {}
             PlayerCommand::SeekBy(delta) => self.seek_by(delta),
-            PlayerCommand::SetVolume(v) => self.volume = v.min(100),
             PlayerCommand::ToggleShuffle => {
                 self.shuffle = !self.shuffle;
                 self.rebuild_order();
@@ -334,15 +368,27 @@ impl RealPlayer {
         }
         self.handle = Some(handle);
         self.pending_start = None; // the live clock takes over
+        // Codec / depth / rate / channels / lossless come from the decoder's
+        // StreamInfo; the bitrate (lossy only) from the scanned tag.
+        let bitrate_kbps = if info.lossless {
+            None
+        } else {
+            self.playlist
+                .current()
+                .and_then(|i| self.playlist.tracks().get(i))
+                .and_then(|t| t.bitrate_kbps)
+        };
         self.format = FormatInfo {
             codec: info.codec,
-            // Lossless source, no resampling (the device opens at the track's
-            // own rate), no DSP yet → the samples reach the device unchanged.
-            // plan 05: goes false once volume/balance/EQ act on them.
-            bit_perfect: info.lossless,
+            // The marker itself is computed in `snapshot()` from the live
+            // volume/balance (plan 05); the stored format only carries the
+            // source's losslessness.
+            bit_perfect: false,
             bit_depth: info.bit_depth,
             sample_rate: Some(info.sample_rate),
             channels: channels_label(info.channels),
+            bitrate_kbps,
+            lossless: info.lossless,
         };
     }
 
@@ -554,11 +600,12 @@ mod tests {
         }
     }
 
-    /// `(player, command log, event queue)`.
+    /// `(player, command log, event queue, shared DSP params)`.
     type Harness = (
         RealPlayer,
         Arc<Mutex<Vec<EngineCmd>>>,
         Arc<Mutex<Vec<EngineEvent>>>,
+        Arc<SharedParams>,
     );
 
     fn fake_player() -> Harness {
@@ -568,7 +615,13 @@ mod tests {
             cmds: Arc::clone(&cmds),
             events: Arc::clone(&events),
         };
-        (RealPlayer::with_engine(Box::new(engine)), cmds, events)
+        let params = Arc::new(SharedParams::new());
+        (
+            RealPlayer::with_engine(Box::new(engine), Arc::clone(&params)),
+            cmds,
+            events,
+            params,
+        )
     }
 
     fn tracks(n: usize) -> Vec<Track> {
@@ -579,6 +632,7 @@ mod tests {
                 artist: Some("A".into()),
                 title: Some(format!("Track {i}")),
                 duration: None,
+                bitrate_kbps: None,
             })
             .collect()
     }
@@ -608,10 +662,10 @@ mod tests {
 
     /// A 3-track list, no track playing yet (Add does not autoplay).
     fn three_tracks() -> Harness {
-        let (mut player, cmds, events) = fake_player();
+        let (mut player, cmds, events, params) = fake_player();
         player.handle(PlayerCommand::AddTracks(tracks(3)));
         assert!(loads_of(&cmds).is_empty(), "Add must not autoplay");
-        (player, cmds, events)
+        (player, cmds, events, params)
     }
 
     /// `duration: None` so `on_started` leaves the playlist alone; seek
@@ -646,7 +700,7 @@ mod tests {
 
     #[test]
     fn play_on_a_three_track_list_loads_track_zero() {
-        let (mut player, cmds, _events) = three_tracks();
+        let (mut player, cmds, _events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         assert_eq!(load_paths(&cmds), [PathBuf::from("/m/0.flac")]);
         assert_eq!(player.state, PlayState::Playing);
@@ -670,7 +724,7 @@ mod tests {
 
     #[test]
     fn finished_advances_to_the_next_track() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         queue(&events, EngineEvent::Finished);
         player.tick(Duration::ZERO);
@@ -685,7 +739,7 @@ mod tests {
 
     #[test]
     fn finished_on_the_last_track_stops_when_repeat_is_off() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::PlayTrack(2));
         queue(&events, EngineEvent::Finished);
         player.tick(Duration::ZERO);
@@ -703,7 +757,7 @@ mod tests {
 
     #[test]
     fn repeat_on_wraps_back_to_the_first_track() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::ToggleRepeat);
         player.handle(PlayerCommand::PlayTrack(2));
         queue(&events, EngineEvent::Finished);
@@ -715,7 +769,7 @@ mod tests {
 
     #[test]
     fn prev_past_three_seconds_restarts_the_track_otherwise_steps_back() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::PlayTrack(1));
         // 4 s into track 2 → Prev restarts it (same track, `start: 0`).
         queue(&events, fake_started_at(4 * 44_100));
@@ -739,7 +793,7 @@ mod tests {
 
     #[test]
     fn seek_forward_sends_a_load_with_the_new_offset() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         // 10 s into a 60 s track.
         queue(
@@ -771,7 +825,7 @@ mod tests {
 
     #[test]
     fn seeking_past_the_end_stops_one_second_short() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         queue(
             &events,
@@ -794,7 +848,7 @@ mod tests {
 
     #[test]
     fn seeking_while_paused_sends_pause_right_after_the_load() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         queue(&events, fake_started_at(2 * 44_100));
         player.tick(Duration::ZERO);
@@ -817,7 +871,7 @@ mod tests {
     fn a_second_seek_before_started_counts_from_the_new_offset() {
         // Two `→` presses land within one engine round-trip: the second
         // must build on the first's target, not on a zeroed clock.
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         queue(&events, fake_started_at(0));
         player.tick(Duration::ZERO);
@@ -833,14 +887,14 @@ mod tests {
 
     #[test]
     fn seek_is_ignored_while_stopped() {
-        let (mut player, cmds, _events) = three_tracks();
+        let (mut player, cmds, _events, ..) = three_tracks();
         player.handle(PlayerCommand::SeekBy(30));
         assert!(loads_of(&cmds).is_empty(), "nothing to seek when stopped");
     }
 
     #[test]
     fn an_unsupported_seek_restarts_the_track_with_a_notice() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         queue(&events, fake_started_at(10 * 44_100));
         player.tick(Duration::ZERO);
@@ -864,7 +918,7 @@ mod tests {
 
     #[test]
     fn error_notices_and_skips_to_the_next_track() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         queue(&events, EngineEvent::Error("cannot decode".into()));
         player.tick(Duration::ZERO);
@@ -880,7 +934,7 @@ mod tests {
 
     #[test]
     fn a_full_streak_of_errors_stops_with_no_playable_tracks() {
-        let (mut player, cmds, events) = three_tracks();
+        let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         for _ in 0..3 {
             queue(&events, EngineEvent::Error("bad file".into()));
@@ -894,7 +948,7 @@ mod tests {
 
     #[test]
     fn started_fills_the_format_line_and_blanks_it_on_stop() {
-        let (mut player, _cmds, events) = three_tracks();
+        let (mut player, _cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         assert_eq!(
             player.snapshot().format,
@@ -928,7 +982,7 @@ mod tests {
 
     #[test]
     fn the_clock_counts_frames_and_the_spectrum_has_32_bars() {
-        let (mut player, _cmds, events) = three_tracks();
+        let (mut player, _cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         // 2.5 s into the stream: 110 250 frames at 44.1 kHz.
         queue(&events, fake_started_at(110_250));
@@ -945,7 +999,7 @@ mod tests {
 
     #[test]
     fn position_is_clamped_to_the_known_track_duration() {
-        let (mut player, _cmds, events) = three_tracks();
+        let (mut player, _cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         queue(
             &events,
@@ -964,7 +1018,7 @@ mod tests {
 
     #[test]
     fn the_decoder_duration_overrides_a_missing_tag() {
-        let (mut player, _cmds, events) = three_tracks();
+        let (mut player, _cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         assert_eq!(player.playlist.tracks()[0].duration, None, "untagged");
         queue(
@@ -989,7 +1043,7 @@ mod tests {
 
     #[test]
     fn replace_autoplays_track_zero_and_empties_to_stopped() {
-        let (mut player, cmds, _events) = fake_player();
+        let (mut player, cmds, _events, _params) = fake_player();
         player.handle(PlayerCommand::ReplaceTracks(tracks(2)));
         assert_eq!(player.state, PlayState::Playing);
         assert_eq!(player.playlist.current(), Some(0));
@@ -1003,7 +1057,7 @@ mod tests {
 
     #[test]
     fn removing_the_current_track_stops_and_removing_another_does_not() {
-        let (mut player, cmds, _events) = three_tracks();
+        let (mut player, cmds, _events, ..) = three_tracks();
         player.handle(PlayerCommand::PlayTrack(1));
         let loads = load_paths(&cmds).len();
 
@@ -1020,7 +1074,7 @@ mod tests {
 
     #[test]
     fn clear_stops_and_keeps_playlist_commands_busy_on_an_empty_list() {
-        let (mut player, cmds, _events) = three_tracks();
+        let (mut player, cmds, _events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         player.handle(PlayerCommand::ClearPlaylist);
         assert_eq!(player.state, PlayState::Stopped);
@@ -1036,7 +1090,7 @@ mod tests {
 
     #[test]
     fn move_reorders_without_touching_playback() {
-        let (mut player, cmds, _events) = three_tracks();
+        let (mut player, cmds, _events, ..) = three_tracks();
         player.handle(PlayerCommand::PlayTrack(1));
         let loads = load_paths(&cmds);
         player.handle(PlayerCommand::MoveTrack { from: 1, up: true });
@@ -1050,7 +1104,7 @@ mod tests {
 
     #[test]
     fn volume_clamps_and_shuffle_repeat_toggle_with_notices() {
-        let (mut player, cmds, _events) = three_tracks();
+        let (mut player, cmds, _events, ..) = three_tracks();
         player.handle(PlayerCommand::SetVolume(200));
         assert_eq!(player.snapshot().volume, 100);
         player.handle(PlayerCommand::SetVolume(42));
@@ -1077,7 +1131,7 @@ mod tests {
 
     #[test]
     fn shuffled_next_covers_the_whole_playlist_before_repeating() {
-        let (mut player, _cmds, events) = fake_player();
+        let (mut player, _cmds, events, _params) = fake_player();
         player.handle(PlayerCommand::AddTracks(tracks(6)));
         player.handle(PlayerCommand::ToggleShuffle);
         player.handle(PlayerCommand::Play);
@@ -1131,7 +1185,7 @@ mod tests {
 
     #[test]
     fn paused_bars_decay_and_stopped_bars_zero() {
-        let (mut player, _cmds, events) = three_tracks();
+        let (mut player, _cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
         queue(&events, fake_started_at(0));
         player.tick(Duration::ZERO);

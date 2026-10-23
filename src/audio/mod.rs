@@ -18,11 +18,18 @@
 //! `AtomicU64` (the clock cannot drift, and pauses freeze it for free) and
 //! taps one mono sample per frame into a second small ring — the UI thread
 //! runs the FFT ([`analysis::Analyzer`]) on those, never on the audio thread.
+//!
+//! Plan 05 gain: the callback then applies volume and balance through a
+//! [`dsp::Dsp`] stage — the UI writes targets into a lock-free
+//! [`dsp::SharedParams`], the smoothing happens per frame, and at unity the
+//! samples pass through untouched (bit-perfect).
 
 pub mod analysis;
 pub mod decoder;
+pub mod dsp;
 pub mod engine;
 
 pub use analysis::{Analyzer, BANDS};
 pub use decoder::{Decoder, SEEK_UNSUPPORTED, StreamInfo};
+pub use dsp::{SharedParams, balance_to_gains, volume_to_gain};
 pub use engine::{AudioOut, Engine, EngineCmd, EngineEvent, PlaybackHandle};

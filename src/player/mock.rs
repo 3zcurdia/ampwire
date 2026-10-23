@@ -101,6 +101,7 @@ fn fake_tracks() -> Vec<Track> {
                 artist: Some(artist.into()),
                 title: Some(title.into()),
                 duration: Some(Duration::from_secs(secs)),
+                bitrate_kbps: None,
             }
         })
         .collect()
@@ -259,6 +260,9 @@ impl MockPlayer {
                 }
                 return;
             }
+            // Volume/balance are stored only — the mock has no samples.
+            PlayerCommand::SetVolume(v) => self.volume = v.min(100),
+            PlayerCommand::SetBalance(b) => self.balance = b.clamp(-100, 100),
             _ => {}
         }
         self.handle_transport(cmd);
@@ -326,7 +330,6 @@ impl MockPlayer {
                     self.position = Duration::from_secs(target);
                 }
             }
-            PlayerCommand::SetVolume(v) => self.volume = v.min(100),
             PlayerCommand::ToggleShuffle => self.shuffle = !self.shuffle,
             PlayerCommand::ToggleRepeat => self.repeat = !self.repeat,
             // Handled by `handle`.
