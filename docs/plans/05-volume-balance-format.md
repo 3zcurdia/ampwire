@@ -1,6 +1,9 @@
 # Plan 05 — Volume, balance and the format/bitrate line
 
-**Status:** ⬜ not started — safe to pick up (needs plan 03; 04 recommended).
+**Status:** ✅ done — 2026-10-23, 5c97b5c. 268 tests pass (2 `#[ignore]`d:
+a visual dump and the audio-device smoke test), goldens unchanged, the
+`--ignored` device test plays through the new DSP stage; deviations
+annotated at the end.
 
 Goal: the volume and balance controls change what you hear (and are
 remembered), and the player shows what is playing: `FLAC 24bit 96kHz stereo`
@@ -120,3 +123,60 @@ Volume and balance are audible and persisted, the format line matches the per-co
 - Default volume is 100 so a fresh install is bit-perfect.
 - Squared volume curve.
 - Balance only attenuates the opposite channel and only affects stereo.
+
+## Deviations (annotated at the end, per plans-README rule 11)
+
+Implemented in full; every step's tests pass. The following details differ
+from (or clarify) the plan text:
+
+1. **The smoothing snap threshold is 1e-4, not the planned 1e-5.** With a
+   `1.0` target, the f32 step `cur += (1 - cur) * 0.002` *stalls* at
+   |1 − cur| ≈ 1.5e-5: the increment drops below half an ULP and the
+   addition rounds to a no-op — just above the planned threshold, so the
+   snap (and with it the bit-perfect fast path, which needs an exact `1.0`)
+   would never fire. 1e-4 fires first; the jump is 0.01 % of full scale
+   (≈ −0.0009 dB). Documented in a comment on `SNAP` in `src/audio/dsp.rs`.
+2. **`describe()` renders the *golden* line format, not the plan's §3
+   example strings.** The plan asked for `FLAC 24bit 96kHz stereo`
+   (single-spaced, `24bit` + `96kHz` as separate parts), but also said the
+   goldens must not change and to fix `describe()` if it differs — and the
+   goldens pin `FLAC  24/96  stereo  bit-perfect` (double-spaced parts,
+   combined `depth/rate`). `describe()` follows the goldens:
+   lossless → `FLAC  24/96  stereo`, lossy → `MP3  320kbps  44.1kHz  stereo`,
+   with the same omit-when-unknown rules (omit `{depth}bit` → here the
+   combined `24/96` degrades to `96kHz` / `24-bit`; omit kbps; omit rate).
+3. **`bit_perfect = lossless && volume == 100 && balance == 0`**, not just
+   the volume/balance clause: the pre-existing rule "a lossy source is never
+   bit-perfect" had to survive (and its test), so the computed marker in
+   `RealPlayer::snapshot()` keeps the `lossless` gate. Plan 06's
+   `&& !eq_active` slots in there.
+4. **`SetVolume`/`SetBalance` are handled in `RealPlayer::handle` (and the
+   mock's), before the empty-playlist guard** — `handle_transport` early-
+   returns on an empty playlist, but the config restore at session start
+   (`App::new_session`) must land before any track is loaded.
+5. **`FormatInfo::format_parts()` was added next to `describe()`.** The UI's
+   width ladder (drop channels, then the rate) needs the parts, not one
+   joined string; `describe()` (the planned API) is what feeds the widest
+   candidate, and the UI appends the `bit-perfect` marker exactly where it
+   always was. `format_khz` moved from `src/ui/player.rs` to
+   `src/player/mod.rs` so the model can use it; the UI's copy is gone.
+6. **The balance command carries an `i8`, so it cannot hold ±200** — the
+   ±100 musical clamp happens in `App::dispatch` (i32 arithmetic) and again
+   in both players' setters. The clamp tests use ±127/±128 (the `i8`
+   extremes) instead of the plan's literal ±200.
+7. **`SharedParams::set(volume, left, right)` writes all three atomics in
+   one call** instead of only exposing the raw fields: the player always
+   updates volume and balance together, so a change to one can never leave
+   the other stale.
+8. **Extra tests beyond the plan's list**: an engine-level test that the DSP
+   runs over *popped frames only* (the padding silence is untouched),
+   a return-to-bit-perfect round trip, the library's size/duration bitrate
+   estimate on a tag-less WAV, and app-level proof that demo mode and a
+   read-only (unparseable) config never write audio changes.
+
+Manual checks from step 7 remain for a human with ears: volume keys
+audibly change level, `[` pans left, the levels come back after a restart,
+and the `bit-perfect` marker shows at 100 / 0. The automated `--ignored`
+device test (`real_engine_plays_a_fixture_end_to_end`) passes on this
+machine — the tone plays through the new DSP-wired callback — and the
+config round-trip + startup restore are unit-tested.
