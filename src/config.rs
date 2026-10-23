@@ -76,6 +76,9 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub audio: AudioConfig,
     pub eq: EqConfig,
+    /// `[jellyfin]` (plan 08): `None` when the section is absent, so `j`
+    /// can tell "not configured" from "configured".
+    pub jellyfin: Option<JellyfinConfig>,
     /// `[keys]` action → list of key specs.
     pub keys: HashMap<String, Vec<String>>,
 }
@@ -128,6 +131,120 @@ impl Default for EqConfig {
     }
 }
 
+/// How a Jellyfin track is fetched (plan 08). Unknown strings in the config
+/// downgrade to [`Cache`](JellyfinMode::Cache) with a notice (see the `From`
+/// conversion below), so a typo never fails the whole config parse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JellyfinMode {
+    /// Download to a temp dir, 3 remote tracks ahead/behind (the default).
+    #[default]
+    Cache,
+    /// Stream the original file over HTTP `Range` requests, store nothing.
+    Stream,
+    /// Stream, and bypass the EQ while a remote track plays.
+    StreamPure,
+}
+
+/// `[jellyfin]`: the server, the key, and how tracks are fetched.
+///
+/// Never written back — `Config::save` leaves the table untouched (the key
+/// lives only in the user's own file) — and never printed: the `Debug` impl
+/// below redacts `api_key`.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "JellyfinConfigRepr")]
+pub struct JellyfinConfig {
+    /// e.g. `http://192.168.1.10:8096`; trailing slash trimmed.
+    pub url: String,
+    /// API key from the Jellyfin dashboard. Header only, never a URL.
+    pub api_key: String,
+    /// Optional user name; the first user is used when omitted.
+    pub user: Option<String>,
+    pub mode: JellyfinMode,
+    /// `cache` mode only: how many *remote* tracks to prefetch ahead.
+    pub cache_ahead: usize,
+    pub cache_behind: usize,
+    /// Parent of `ampwire-jellyfin-<pid>`; the system temp dir by default.
+    pub cache_dir: Option<std::path::PathBuf>,
+    /// One-line notice when the file held an unrecognized `mode`.
+    #[serde(skip)]
+    pub notice: Option<String>,
+}
+
+impl JellyfinConfig {
+    /// A usable client needs at least a URL and a key.
+    pub fn is_complete(&self) -> bool {
+        !self.url.trim().is_empty() && !self.api_key.trim().is_empty()
+    }
+}
+
+impl std::fmt::Debug for JellyfinConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JellyfinConfig")
+            .field("url", &self.url)
+            .field("api_key", &"<redacted>")
+            .field("user", &self.user)
+            .field("mode", &self.mode)
+            .field("cache_ahead", &self.cache_ahead)
+            .field("cache_behind", &self.cache_behind)
+            .field("cache_dir", &self.cache_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the TOML holds: every field optional/defaulted, `mode` as a raw
+/// string so a typo can be reported instead of rejected (serde would abort
+/// the whole config on an unknown enum variant).
+#[derive(Deserialize)]
+#[serde(default)]
+struct JellyfinConfigRepr {
+    url: String,
+    api_key: String,
+    user: Option<String>,
+    mode: Option<String>,
+    cache_ahead: usize,
+    cache_behind: usize,
+    cache_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for JellyfinConfigRepr {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            api_key: String::new(),
+            user: None,
+            mode: None,
+            cache_ahead: 3,
+            cache_behind: 3,
+            cache_dir: None,
+        }
+    }
+}
+
+impl From<JellyfinConfigRepr> for JellyfinConfig {
+    fn from(repr: JellyfinConfigRepr) -> Self {
+        let (mode, notice) = match repr.mode.as_deref() {
+            None | Some("cache") => (JellyfinMode::Cache, None),
+            Some("stream") => (JellyfinMode::Stream, None),
+            Some("stream_pure") => (JellyfinMode::StreamPure, None),
+            Some(other) => (
+                JellyfinMode::Cache,
+                Some(format!("jellyfin: unknown mode \"{other}\", using cache")),
+            ),
+        };
+        Self {
+            url: repr.url.trim_end_matches('/').to_string(),
+            api_key: repr.api_key,
+            user: repr.user,
+            mode,
+            cache_ahead: repr.cache_ahead,
+            cache_behind: repr.cache_behind,
+            cache_dir: repr.cache_dir,
+            notice,
+        }
+    }
+}
+
 pub struct LoadedConfig {
     pub config: Config,
     /// One-line notice for the playlist bottom border, if anything went wrong.
@@ -168,11 +285,19 @@ impl Config {
                 read_only: true,
             },
             Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(config) => LoadedConfig {
-                    config: sanitize(config),
-                    notice: None,
-                    read_only: false,
-                },
+                Ok(config) => {
+                    // A bad `[jellyfin] mode` is downgraded to `cache` with a
+                    // one-line notice; everything else still loads.
+                    let notice = config
+                        .jellyfin
+                        .as_ref()
+                        .and_then(|jf| jf.notice.clone());
+                    LoadedConfig {
+                        config: sanitize(config),
+                        notice,
+                        read_only: false,
+                    }
+                }
                 Err(err) => LoadedConfig {
                     config: Config::default(),
                     notice: Some(format!("config invalid — not saving ({err})")),
@@ -329,6 +454,11 @@ fn sanitize(mut config: Config) -> Config {
     config.eq.preamp = config.eq.preamp.clamp(-12, 12);
     for band in &mut config.eq.bands {
         *band = (*band).clamp(-12, 12);
+    }
+    // Jellyfin cache window: the plan's 0–10 range (defaults 3/3).
+    if let Some(jf) = config.jellyfin.as_mut() {
+        jf.cache_ahead = jf.cache_ahead.min(10);
+        jf.cache_behind = jf.cache_behind.min(10);
     }
     config
 }
@@ -571,5 +701,124 @@ mod tests {
         assert_eq!(config.eq.preamp, 12);
         assert_eq!(config.eq.bands[0], 12);
         assert_eq!(config.eq.bands[1], -12);
+    }
+
+    // --- `[jellyfin]` (plan 08, step 7) ---
+
+    const JF_TOML: &str = "\
+# my server
+[jellyfin]
+url = \"http://jellyfin.lan:8096/\" # trailing slash
+api_key = \"0123456789abcdef\"
+user = \"luis\"
+mode = \"stream\"
+cache_ahead = 5
+cache_behind = 2
+";
+
+    #[test]
+    fn jellyfin_section_parses_and_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, JF_TOML).unwrap();
+        let loaded = Config::load_from(&path);
+        assert!(loaded.notice.is_none(), "{:?}", loaded.notice);
+        let jf = loaded.config.jellyfin.expect("[jellyfin] parsed");
+        assert_eq!(jf.url, "http://jellyfin.lan:8096", "slash trimmed");
+        assert_eq!(jf.api_key, "0123456789abcdef");
+        assert_eq!(jf.user.as_deref(), Some("luis"));
+        assert_eq!(jf.mode, JellyfinMode::Stream);
+        assert_eq!(jf.cache_ahead, 5);
+        assert_eq!(jf.cache_behind, 2);
+        assert!(jf.is_complete());
+    }
+
+    #[test]
+    fn missing_jellyfin_section_is_none_and_defaults_are_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[theme]\npreset = \"amber\"\n").unwrap();
+        assert!(Config::load_from(&path).config.jellyfin.is_none());
+
+        // A section without `mode` (or the other optional keys) is cache mode.
+        fs::write(
+            &path,
+            "[jellyfin]\nurl = \"http://x:8096\"\napi_key = \"k\"\n",
+        )
+        .unwrap();
+        let jf = Config::load_from(&path).config.jellyfin.expect("parsed");
+        assert_eq!(jf.mode, JellyfinMode::Cache);
+        assert_eq!((jf.cache_ahead, jf.cache_behind), (3, 3), "plan defaults");
+        assert_eq!(jf.user, None);
+    }
+
+    #[test]
+    fn unknown_mode_falls_back_to_cache_with_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[jellyfin]\nurl = \"http://x:8096\"\napi_key = \"k\"\nmode = \"turbo\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        // The rest of the config survives; only the mode is downgraded.
+        assert!(!loaded.read_only, "a bad mode must not kill the config");
+        let jf = loaded.config.jellyfin.expect("still parsed");
+        assert_eq!(jf.mode, JellyfinMode::Cache);
+        let notice = loaded.notice.expect("mode notice");
+        assert_eq!(notice, "jellyfin: unknown mode \"turbo\", using cache");
+    }
+
+    #[test]
+    fn save_leaves_the_jellyfin_table_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, JF_TOML).unwrap();
+
+        let mut config = Config::load_from(&path).config;
+        config.layout.columns = 1;
+        config.audio.volume = 70;
+        config.save(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[jellyfin]"), "{text}");
+        assert!(text.contains("api_key = \"0123456789abcdef\""), "{text}");
+        assert!(text.contains("# trailing slash"), "{text}");
+        assert!(text.contains("columns = 1"), "{text}");
+        // …and it reloads to the same thing (the key round-trips).
+        let reloaded = Config::load_from(&path).config;
+        assert_eq!(reloaded.jellyfin, config.jellyfin);
+    }
+
+    #[test]
+    fn jellyfin_debug_redacts_the_api_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, JF_TOML).unwrap();
+        let config = Config::load_from(&path).config;
+        let printed = format!("{config:?}");
+        assert!(
+            !printed.contains("0123456789abcdef"),
+            "the key must never appear in a Debug print: {printed}"
+        );
+        assert!(printed.contains("<redacted>"), "{printed}");
+        // The same holds for the section on its own.
+        let jf = config.jellyfin.expect("parsed");
+        assert!(!format!("{jf:?}").contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn out_of_range_cache_windows_are_clamped_to_ten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[jellyfin]\nurl = \"http://x:8096\"\napi_key = \"k\"\ncache_ahead = 99\ncache_behind = 50\n",
+        )
+        .unwrap();
+        let jf = Config::load_from(&path).config.jellyfin.expect("parsed");
+        assert_eq!(jf.cache_ahead, 10);
+        assert_eq!(jf.cache_behind, 10);
     }
 }
