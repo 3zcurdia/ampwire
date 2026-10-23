@@ -8,6 +8,7 @@ mod action;
 mod app;
 mod audio;
 mod config;
+mod jellyfin;
 mod keymap;
 mod library;
 mod player;
