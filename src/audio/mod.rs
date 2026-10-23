@@ -28,6 +28,7 @@ pub mod analysis;
 pub mod decoder;
 pub mod dsp;
 pub mod engine;
+pub mod eq;
 
 pub use analysis::{Analyzer, BANDS};
 pub use decoder::{Decoder, SEEK_UNSUPPORTED, StreamInfo};

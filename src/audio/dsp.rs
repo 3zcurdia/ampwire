@@ -1,14 +1,21 @@
-//! Volume + balance DSP (plan 05): targets shared across threads, smoothing
-//! in the callback.
+//! Volume + balance DSP (plan 05) plus the 10-band equalizer stage (plan
+//! 06): targets shared across threads, smoothing in the callback.
 //!
-//! The UI thread writes the target gains into [`SharedParams`] (three lock-free
+//! The UI thread writes the target gains into [`SharedParams`] (lock-free
 //! atomics); a [`Dsp`] owned by the cpal callback steps its *smoothed* gains
-//! toward them once per frame and multiplies. When every target — and every
-//! smoothed gain — is exactly `1.0`, `process` returns without touching a
-//! single sample (plans-README rule 7: bit-perfect stays bit-perfect).
+//! toward them once per frame and multiplies, and picks up EQ changes through
+//! a version counter. When every gain target — and every smoothed gain — is
+//! exactly `1.0`, the gain stage returns without touching a single sample,
+//! and a flat or off EQ bypasses the EQ stage the same way (plans-README
+//! rule 7: bit-perfect stays bit-perfect).
+//!
+//! Chain order in the callback (plan 06): decode → [`Dsp::process_eq`] →
+//! spectrum tap → [`Dsp::process_gain`] → device.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+
+use super::eq::Equalizer;
 
 /// Smoothing factor per frame: `cur += (target - cur) * SMOOTHING`. Small
 /// enough to be click-free, large enough to settle in ~100 ms.
@@ -35,11 +42,18 @@ pub struct SharedParams {
     /// gains, so it fixes the stereo image and the balance direction even
     /// at unity — it reorders samples, it never changes their values.
     pub swap_channels: AtomicBool,
-    // plan 06 adds the EQ fields
+    /// EQ on/off (plan 06). Flat gains bypass regardless.
+    pub eq_enabled: AtomicBool,
+    /// Preamp + 10 bands in whole dB (`[i8; 11]` widened to `AtomicI32`).
+    pub eq_gains: [AtomicI32; 11],
+    /// Writer bumps this **after** writing gains/enabled; the callback
+    /// recomputes its coefficients when it sees a value it hasn't applied.
+    pub eq_version: AtomicU32,
 }
 
 impl SharedParams {
-    /// Unity by default: a fresh session is bit-perfect until told otherwise.
+    /// Unity by default: a fresh session is bit-perfect until told otherwise
+    /// (the EQ starts flat, and `Dsp` treats version 0 as already applied).
     pub fn new() -> Self {
         let unity = 1.0f32.to_bits();
         Self {
@@ -47,6 +61,9 @@ impl SharedParams {
             balance_left: AtomicU32::new(unity),
             balance_right: AtomicU32::new(unity),
             swap_channels: AtomicBool::new(false),
+            eq_enabled: AtomicBool::new(true),
+            eq_gains: std::array::from_fn(|_| AtomicI32::new(0)),
+            eq_version: AtomicU32::new(0),
         }
     }
 
@@ -62,9 +79,20 @@ impl SharedParams {
             .store(balance_right.to_bits(), Ordering::Relaxed);
     }
 
-    /// Turn the L/R swap on or off (read once per `Dsp::process` call).
+    /// Turn the L/R swap on or off (read once per `Dsp::process_gain` call).
     pub fn set_swap_channels(&self, swap: bool) {
         self.swap_channels.store(swap, Ordering::Relaxed);
+    }
+
+    /// Write the EQ state (UI thread): gains, then enabled, then bump the
+    /// version with `Release` so the callback's `Acquire` load sees all of
+    /// it. `gains[0]` is the preamp, `gains[1..=10]` the bands, in dB.
+    pub fn set_eq(&self, enabled: bool, gains: [i8; 11]) {
+        for (slot, &gain) in self.eq_gains.iter().zip(gains.iter()) {
+            slot.store(i32::from(gain), Ordering::Relaxed);
+        }
+        self.eq_enabled.store(enabled, Ordering::Relaxed);
+        self.eq_version.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -83,16 +111,49 @@ pub struct Dsp {
     cur_vol: f32,
     cur_l: f32,
     cur_r: f32,
+    /// The EQ stage (plan 06): preamp + 10 biquads per channel.
+    eq: Equalizer,
+    /// Whether the EQ currently shapes audio: enabled *and* not flat.
+    eq_on: bool,
+    /// Last [`SharedParams::eq_version`] applied to `eq`.
+    seen_version: u32,
 }
 
 impl Dsp {
-    pub fn new(params: Arc<SharedParams>, channels: usize) -> Self {
+    pub fn new(params: Arc<SharedParams>, sample_rate: u32, channels: usize) -> Self {
         Self {
             params,
             channels,
             cur_vol: 1.0,
             cur_l: 1.0,
             cur_r: 1.0,
+            eq: Equalizer::new(sample_rate, channels),
+            eq_on: false,
+            seen_version: 0,
+        }
+    }
+
+    /// Apply the equalizer to `samples` (interleaved, `channels` wide).
+    ///
+    /// Notices a bumped [`SharedParams::eq_version`] first (reads the gains,
+    /// recomputes the coefficients — nothing allocated), then bypasses
+    /// immediately when the EQ is off or flat: a flat or disabled EQ leaves
+    /// the buffer **bit-identical**. Runs **before** the spectrum tap, so
+    /// the bars show what is actually heard.
+    pub fn process_eq(&mut self, samples: &mut [f32]) {
+        let version = self.params.eq_version.load(Ordering::Acquire);
+        if version != self.seen_version {
+            let mut gains = [0i8; 11];
+            for (slot, gain) in self.params.eq_gains.iter().zip(&mut gains) {
+                *gain = slot.load(Ordering::Relaxed).clamp(-12, 12) as i8;
+            }
+            let enabled = self.params.eq_enabled.load(Ordering::Relaxed);
+            self.eq.set_gains(gains);
+            self.eq_on = enabled && gains.iter().any(|g| *g != 0);
+            self.seen_version = version;
+        }
+        if self.eq_on {
+            self.eq.process(samples);
         }
     }
 
@@ -106,7 +167,7 @@ impl Dsp {
     ///
     /// Call this **after** the spectrum tap and only over the frames that
     /// were really popped — never over the callback's padding silence.
-    pub fn process(&mut self, samples: &mut [f32]) {
+    pub fn process_gain(&mut self, samples: &mut [f32]) {
         let target_vol = f32::from_bits(self.params.volume_gain.load(Ordering::Relaxed));
         let target_l = f32::from_bits(self.params.balance_left.load(Ordering::Relaxed));
         let target_r = f32::from_bits(self.params.balance_right.load(Ordering::Relaxed));
@@ -184,13 +245,14 @@ mod tests {
 
     fn dsp(channels: usize) -> (Dsp, Arc<SharedParams>) {
         let params = Arc::new(SharedParams::new());
-        (Dsp::new(Arc::clone(&params), channels), params)
+        (Dsp::new(Arc::clone(&params), 44_100, channels), params)
     }
 
-    /// Run `process` over `buffer` in callback-sized chunks, `frames` times.
+    /// Run one callback pass (EQ, then gain) over `buffer`, `frames` times.
     fn run(dsp: &mut Dsp, buffer: &mut [f32], frames: usize) {
         for _ in 0..frames {
-            dsp.process(buffer);
+            dsp.process_eq(buffer);
+            dsp.process_gain(buffer);
         }
     }
 
@@ -251,7 +313,7 @@ mod tests {
         let mut max = f32::NEG_INFINITY;
         for _ in 0..2000 {
             buffer.fill(1.0); // fresh input: read the gain off, not a product
-            dsp.process(&mut buffer);
+            dsp.process_gain(&mut buffer);
             for frame in buffer.as_chunks::<2>().0 {
                 min = min.min(frame[0]);
                 max = max.max(frame[0]);
@@ -273,7 +335,7 @@ mod tests {
         let mut buffer = vec![0.75f32; 512];
         for _ in 0..4000 {
             buffer.fill(0.75);
-            dsp.process(&mut buffer);
+            dsp.process_gain(&mut buffer);
         }
         for frame in buffer.as_chunks::<2>().0 {
             assert_eq!(frame[0], 0.0, "left fully attenuated");
@@ -288,7 +350,7 @@ mod tests {
         let mut buffer = vec![0.5f32; 64];
         for _ in 0..100 {
             buffer.fill(0.5);
-            dsp.process(&mut buffer);
+            dsp.process_gain(&mut buffer);
         }
         assert!(
             buffer.iter().all(|s| *s == 0.5),
@@ -305,13 +367,13 @@ mod tests {
         let mut buffer = vec![0.42f32; 256];
         for _ in 0..5000 {
             buffer.fill(0.42);
-            dsp.process(&mut buffer);
+            dsp.process_gain(&mut buffer);
         }
         assert!((buffer[0] - 0.42).abs() > 1e-6, "was attenuated");
         params.set(1.0, 1.0, 1.0);
         for _ in 0..5000 {
             buffer.fill(0.42);
-            dsp.process(&mut buffer);
+            dsp.process_gain(&mut buffer);
         }
         assert_eq!(buffer[0], 0.42, "unity again: samples untouched");
     }
@@ -334,7 +396,7 @@ mod tests {
         let mut buffer = vec![0.25, -0.75, 0.5, 1.0];
         // One pass = one callback: each pair is swapped exactly once (in a
         // real session the samples then move on and never come back).
-        dsp.process(&mut buffer);
+        dsp.process_gain(&mut buffer);
         assert_eq!(
             buffer,
             vec![-0.75, 0.25, 1.0, 0.5],
@@ -342,7 +404,7 @@ mod tests {
         );
         // Turning it back off restores the untouched fast path.
         params.set_swap_channels(false);
-        dsp.process(&mut buffer);
+        dsp.process_gain(&mut buffer);
         assert_eq!(buffer, vec![-0.75, 0.25, 1.0, 0.5], "swap off: alone");
     }
 
@@ -359,11 +421,11 @@ mod tests {
         let mut scratch = vec![0.0f32; 2048];
         for _ in 0..4000 {
             scratch.fill(0.0);
-            dsp.process(&mut scratch); // settle the smoothing (swap still off)
+            dsp.process_gain(&mut scratch); // settle the smoothing (swap still off)
         }
         params.set_swap_channels(true);
         let mut buffer = vec![1.0, 0.5, 1.0, 0.5];
-        dsp.process(&mut buffer); // the one pass that carries the samples
+        dsp.process_gain(&mut buffer); // the one pass that carries the samples
         assert_eq!(
             buffer,
             vec![0.0, 1.0, 0.0, 1.0],
@@ -383,5 +445,74 @@ mod tests {
                 "{channels}ch: no reordering without a stereo pair"
             );
         }
+    }
+
+    // --- EQ stage (plan 06, step 2 + 6) ---
+
+    #[test]
+    fn a_flat_enabled_eq_leaves_the_buffer_bit_identical() {
+        let (mut dsp, params) = dsp(2);
+        params.set_eq(true, [0; 11]); // enabled, all gains 0
+        let buffer: Vec<f32> = (0..1024)
+            .map(|i| (i as f32 * 0.013 - 1.0).sin() * 0.9)
+            .collect();
+        let mut processed = buffer.clone();
+        dsp.process_eq(&mut processed);
+        assert_eq!(processed, buffer, "flat EQ must not touch a sample");
+    }
+
+    #[test]
+    fn a_disabled_eq_with_non_zero_gains_is_also_bit_identical() {
+        let (mut dsp, params) = dsp(2);
+        params.set_eq(false, [6, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let buffer: Vec<f32> = (0..1024)
+            .map(|i| (i as f32 * 0.013 - 1.0).sin() * 0.5)
+            .collect();
+        let mut processed = buffer.clone();
+        dsp.process_eq(&mut processed);
+        assert_eq!(processed, buffer, "EQ off: samples untouched");
+    }
+
+    #[test]
+    fn a_version_bump_turns_the_eq_on_and_off_live() {
+        // Mono, so the 1 kHz sine is also a 1 kHz per-channel signal.
+        let (mut dsp, params) = dsp(1);
+        let sine: Vec<f32> = (0..8192)
+            .map(|i| (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 44_100.0).sin() as f32 * 0.2)
+            .collect();
+
+        // Boost the 1 kHz band: the callback notices on the next pass.
+        params.set_eq(true, [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0]);
+        let mut boosted = sine.clone();
+        dsp.process_eq(&mut boosted);
+        let peak = boosted.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (peak - 0.2 * 3.98).abs() < 0.2 * 3.98 * 0.15,
+            "×3.98 at 1 kHz, got peak {peak}"
+        );
+
+        // Back to flat: the very next pass is bit-identical again.
+        params.set_eq(true, [0; 11]);
+        let mut flat = sine.clone();
+        dsp.process_eq(&mut flat);
+        assert_eq!(flat, sine, "flat again after the bump");
+    }
+
+    #[test]
+    fn an_active_eq_is_independent_of_the_gain_stage() {
+        // EQ runs even at unity volume, and the gain stage runs even with a
+        // flat EQ — each with its own bypass.
+        let (mut dsp, params) = dsp(2);
+        params.set_eq(true, [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // preamp +3
+        let mut buffer = vec![0.25f32; 256];
+        dsp.process_eq(&mut buffer);
+        assert!(
+            (buffer[0] - 0.25f32 * 10f32.powf(3.0 / 20.0)).abs() < 1e-3,
+            "preamp applied at unity volume"
+        );
+        // …and the gain stage untouched it (unity targets → early return).
+        let eqd = buffer.clone();
+        dsp.process_gain(&mut buffer);
+        assert_eq!(buffer, eqd, "unity gain stage bypasses");
     }
 }

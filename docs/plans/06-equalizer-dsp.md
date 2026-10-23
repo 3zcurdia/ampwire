@@ -1,6 +1,6 @@
 # Plan 06 — Real 10-band equalizer
 
-**Status:** ⬜ not started — safe to pick up (needs plan 05 done).
+**Status:** 🟨 in progress — luis, since 2026-10-23.
 
 Goal: the EQ panel sliders (preamp + 10 bands) actually shape the sound. The
 `on` toggle works, settings persist, and when the EQ is off or flat the audio

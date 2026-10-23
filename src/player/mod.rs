@@ -228,6 +228,13 @@ pub enum PlayerCommand {
     /// Route L/R to the opposite ears (`[audio] swap_channels`) — for
     /// headsets/DACs with reversed channel wiring.
     SetSwapChannels(bool),
+    /// The equalizer (plan 06): on/off + preamp + 10 band gains in whole dB
+    /// (`gains[0]` = preamp). This payload is why `PlayerCommand` lost
+    /// `Copy` back in plan 02.
+    SetEq {
+        enabled: bool,
+        gains: [i8; 11],
+    },
     ToggleShuffle,
     ToggleRepeat,
     /// Append, sorted among themselves.

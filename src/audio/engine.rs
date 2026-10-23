@@ -306,9 +306,9 @@ fn start_track(
     let callback_error = Arc::clone(&device_error);
     let callback_paused = Arc::clone(paused);
     let channels = info.channels as usize;
-    // The gain stage lives in the callback (one `Dsp` per stream); the UI
+    // The DSP stages live in the callback (one `Dsp` per stream); the UI
     // changes targets through the shared `params`, never through commands.
-    let mut dsp = Dsp::new(Arc::clone(params), channels);
+    let mut dsp = Dsp::new(Arc::clone(params), info.sample_rate, channels);
     let stream = device
         .build_output_stream(
             config,
@@ -368,9 +368,9 @@ fn start_track(
 ///
 /// Counts the frames it *really* popped — padded silence is not counted, and
 /// pausing writes silence without popping, so the counter stops by itself.
-/// The mono spectrum tap is taken **before** the gain stage (plan 04's tap
-/// must stay pre-DSP), and [`Dsp::process`] then runs over exactly the
-/// popped frames — never over the padding silence.
+/// Chain order (plan 06): pop → [`Dsp::process_eq`] → the mono spectrum tap
+/// → [`Dsp::process_gain`] — all three over exactly the popped frames, never
+/// over the callback's padding silence.
 fn fill(
     data: &mut [f32],
     consumer: &mut Consumer<f32>,
@@ -387,13 +387,11 @@ fn fill(
     let channels = channels.max(1);
     let mut frames_popped: u64 = 0;
     for frame in data.chunks_mut(channels) {
-        let mut sum = 0.0;
         let mut popped = 0;
         for sample in frame.iter_mut() {
             match consumer.pop() {
                 Ok(value) => {
                     *sample = value;
-                    sum += value;
                     popped += 1;
                 }
                 // Ring drained: pad with silence, count nothing.
@@ -402,14 +400,22 @@ fn fill(
         }
         if popped == channels {
             frames_popped += 1;
-            // Mono tap for the spectrum: (L + R) / 2 (or the single channel).
-            // A full ring drops the sample — the callback never blocks.
-            let _ = tap.push(sum / channels as f32);
         }
     }
-    played.fetch_add(frames_popped, Ordering::Relaxed);
     let filled = frames_popped as usize * channels;
-    dsp.process(&mut data[..filled]);
+    // 1. EQ first: everything downstream (tap, gains, device) hears the
+    //    shaped signal.
+    dsp.process_eq(&mut data[..filled]);
+    // 2. Mono spectrum tap: (L + R) / 2 (or the single channel), after the
+    //    EQ so the bars show what is really heard. A full ring drops the
+    //    sample — the callback never blocks.
+    for frame in data[..filled].chunks(channels) {
+        let sum: f32 = frame.iter().sum();
+        let _ = tap.push(sum / channels as f32);
+    }
+    // 3. Gain stage last, over exactly the popped frames.
+    played.fetch_add(frames_popped, Ordering::Relaxed);
+    dsp.process_gain(&mut data[..filled]);
 }
 
 /// The one output config this track can play through unchanged: right channel
@@ -515,9 +521,9 @@ mod tests {
         (producer, consumer)
     }
 
-    /// A unity DSP (fresh params): the gain stage leaves samples alone.
+    /// A unity DSP (fresh params): both stages leave samples alone.
     fn unity_dsp(channels: usize) -> Dsp {
-        Dsp::new(Arc::new(SharedParams::new()), channels)
+        Dsp::new(Arc::new(SharedParams::new()), 44_100, channels)
     }
 
     #[test]
@@ -584,12 +590,12 @@ mod tests {
         let mut data = [1.0f32; 8]; // 4 stereo frames requested, 2 available
         let params = Arc::new(SharedParams::new());
         params.set(0.25, 1.0, 1.0); // volume 50 → gain 0.25
-        let mut dsp = Dsp::new(Arc::clone(&params), 2);
+        let mut dsp = Dsp::new(Arc::clone(&params), 44_100, 2);
 
         // Settle the smoothing first, then run the real callback once.
         let mut scratch = [1.0f32; 2048];
         for _ in 0..2000 {
-            dsp.process(&mut scratch);
+            dsp.process_gain(&mut scratch);
         }
         fill(
             &mut data,
@@ -604,6 +610,41 @@ mod tests {
         // The ring carries (1.0, 0.0) frames: left becomes 0.25, right 0.0.
         assert_eq!(&data[..4], &[0.25, 0.0, 0.25, 0.0], "popped: ×0.25");
         assert_eq!(&data[4..], &[0.0; 4], "padding untouched by DSP");
+        drop(producer);
+    }
+
+    #[test]
+    fn fill_taps_the_signal_after_the_eq_stage() {
+        // Chain order (plan 06): EQ → tap → gains. A −6 dB preamp (×≈0.5)
+        // means the tap sees the *shaped* mono sum, not the raw one.
+        let (producer, mut consumer) = stereo_ring(4);
+        let (mut tap_producer, mut tap_consumer) = RingBuffer::<f32>::new(8);
+        let paused = AtomicBool::new(false);
+        let played = AtomicU64::new(0);
+        let mut data = [9.9f32; 8];
+        let params = Arc::new(SharedParams::new());
+        params.set_eq(true, [-6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut dsp = Dsp::new(Arc::clone(&params), 44_100, 2);
+
+        fill(
+            &mut data,
+            &mut consumer,
+            &mut tap_producer,
+            &paused,
+            &played,
+            2,
+            &mut dsp,
+        );
+        // Frames are (1.0, 0.0): post-EQ left is ≈0.499, so the mono tap is
+        // half of that — ≈0.249, not the pre-EQ 0.5.
+        let tapped: Vec<f32> = std::iter::from_fn(|| tap_consumer.pop().ok()).collect();
+        assert_eq!(tapped.len(), 4);
+        for sample in tapped {
+            assert!(
+                (sample - 10f32.powf(-6.0 / 20.0) / 2.0).abs() < 1e-3,
+                "tap must carry the EQ-shaped signal: {sample}"
+            );
+        }
         drop(producer);
     }
 }

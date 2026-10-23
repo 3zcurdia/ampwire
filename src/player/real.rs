@@ -48,7 +48,10 @@ pub struct RealPlayer {
     balance: i8,
     /// L/R swap for reversed-wiring devices (`[audio] swap_channels`).
     swap_channels: bool,
-    /// Volume/balance targets shared with the audio callback (lock-free).
+    /// EQ on *and* not flat (plan 06): any non-zero preamp/band shapes the
+    /// samples, so the bit-perfect marker must go.
+    eq_active: bool,
+    /// Volume/balance/EQ targets shared with the audio callback (lock-free).
     params: Arc<SharedParams>,
     /// From [`EngineEvent::Started`]; blank while stopped.
     format: FormatInfo,
@@ -103,6 +106,7 @@ impl RealPlayer {
             volume: 100,
             balance: 0,
             swap_channels: false,
+            eq_active: false,
             params,
             format: FormatInfo::blank(),
             handle: None,
@@ -124,13 +128,17 @@ impl RealPlayer {
             FormatInfo::empty()
         } else {
             let mut format = self.format.clone();
-            // Bit-perfect marker (plan 05): only a lossless source with no
-            // DSP touching the samples. A channel swap reorders the stream —
-            // sample *values* survive, but the device no longer receives the
-            // decoded layout — so it counts as processing too. Plan 06 adds
-            // `&& !eq_active`.
-            format.bit_perfect =
-                format.lossless && self.volume == 100 && self.balance == 0 && !self.swap_channels;
+            // Bit-perfect marker (plan 05/06): only a lossless source with
+            // no DSP touching the samples — full volume, centered balance,
+            // no channel swap, and an EQ that is off or flat. A swap
+            // reorders the stream — sample *values* survive, but the device
+            // no longer receives the decoded layout — so it counts as
+            // processing too.
+            format.bit_perfect = format.lossless
+                && self.volume == 100
+                && self.balance == 0
+                && !self.swap_channels
+                && !self.eq_active;
             format
         };
         PlayerSnapshot {
@@ -224,11 +232,13 @@ impl RealPlayer {
                 self.rebuild_order();
                 return;
             }
-            // Volume/balance/swap work even with an empty playlist (they are
-            // applied at startup from the config, before any track loads).
+            // Volume/balance/swap/EQ work even with an empty playlist (they
+            // are applied at startup from the config, before any track
+            // loads).
             PlayerCommand::SetVolume(v) => self.set_volume(v),
             PlayerCommand::SetBalance(b) => self.set_balance(b),
             PlayerCommand::SetSwapChannels(swap) => self.set_swap_channels(swap),
+            PlayerCommand::SetEq { enabled, gains } => self.set_eq(enabled, gains),
             _ => {}
         }
         self.handle_transport(cmd);
@@ -253,6 +263,15 @@ impl RealPlayer {
     fn set_swap_channels(&mut self, swap: bool) {
         self.swap_channels = swap;
         self.params.set_swap_channels(swap);
+    }
+
+    /// EQ on/off + gains → the shared targets (plan 06). The callback picks
+    /// them up through the version bump; `eq_active` mirrors what actually
+    /// shapes the sound (enabled *and* not flat) for the bit-perfect marker.
+    fn set_eq(&mut self, enabled: bool, gains: [i8; 11]) {
+        let gains = gains.map(|g| g.clamp(-12, 12));
+        self.eq_active = enabled && gains.iter().any(|g| *g != 0);
+        self.params.set_eq(enabled, gains);
     }
 
     /// Transport — everything that needs a non-empty playlist.
@@ -1277,6 +1296,81 @@ mod tests {
         assert!(
             player.snapshot().format.bit_perfect,
             "swap off: marker back"
+        );
+    }
+
+    // --- EQ → shared DSP targets (plan 06) ---
+
+    #[test]
+    fn set_eq_writes_the_shared_targets_and_bumps_the_version() {
+        let (mut player, _cmds, _events, params) = three_tracks();
+        let before = params.eq_version.load(Ordering::Relaxed);
+        player.handle(PlayerCommand::SetEq {
+            enabled: true,
+            gains: [3, 6, 0, 0, 0, 0, 0, 0, 0, 0, -6],
+        });
+        let gains: Vec<i8> = params
+            .eq_gains
+            .iter()
+            .map(|g| g.load(Ordering::Relaxed) as i8)
+            .collect();
+        assert_eq!(gains, vec![3, 6, 0, 0, 0, 0, 0, 0, 0, 0, -6]);
+        assert!(params.eq_enabled.load(Ordering::Relaxed), "flag set");
+        assert!(
+            params.eq_version.load(Ordering::Relaxed) > before,
+            "version bumped after the writes"
+        );
+    }
+
+    #[test]
+    fn set_eq_works_with_an_empty_playlist_and_clamps_out_of_range() {
+        // The session restores `[eq]` at startup, before any track loads.
+        let (mut player, _cmds, _events, params) = fake_player();
+        player.handle(PlayerCommand::SetEq {
+            enabled: true,
+            gains: [20, -30, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        });
+        let gains: Vec<i8> = params
+            .eq_gains
+            .iter()
+            .map(|g| g.load(Ordering::Relaxed) as i8)
+            .collect();
+        assert_eq!(gains, vec![12, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0], "clamped");
+    }
+
+    #[test]
+    fn an_active_eq_clears_the_bit_perfect_marker() {
+        let (mut player, _cmds, events, _params) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert!(player.snapshot().format.bit_perfect, "default: flat EQ");
+
+        player.handle(PlayerCommand::SetEq {
+            enabled: true,
+            gains: [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        });
+        assert!(
+            !player.snapshot().format.bit_perfect,
+            "EQ on and not flat: processing"
+        );
+        // On but flat: passes through untouched, marker back.
+        player.handle(PlayerCommand::SetEq {
+            enabled: true,
+            gains: [0; 11],
+        });
+        assert!(
+            player.snapshot().format.bit_perfect,
+            "flat EQ passes through"
+        );
+        // Off with non-zero gains: also bypassed.
+        player.handle(PlayerCommand::SetEq {
+            enabled: false,
+            gains: [12; 11],
+        });
+        assert!(
+            player.snapshot().format.bit_perfect,
+            "EQ off passes through"
         );
     }
 

@@ -191,7 +191,7 @@ pub struct App {
     /// True when the on-disk config failed to load: never write back.
     read_only: bool,
     /// When the config last changed in a way worth persisting (volume,
-    /// balance; plan 06 adds the EQ). `tick` saves once it has aged
+    /// balance, EQ). `tick` saves once it has aged
     /// [`CONFIG_SAVE_DEBOUNCE`], and quitting flushes it immediately.
     config_dirty_since: Option<Instant>,
     /// Terminal area of the frame about to be drawn; `None` until the first
@@ -318,6 +318,12 @@ impl App {
         app.player.handle(PlayerCommand::SetBalance(audio.balance));
         app.player
             .handle(PlayerCommand::SetSwapChannels(audio.swap_channels));
+        // …and the remembered EQ (`[eq]`): a flat/off config keeps the
+        // fresh session bit-perfect.
+        app.ui.eq_on = app.config.eq.on;
+        app.ui.eq_bands[0] = app.config.eq.preamp;
+        app.ui.eq_bands[1..].copy_from_slice(&app.config.eq.bands);
+        app.apply_eq();
         app.snapshot = app.player.snapshot();
         app.ui.playlist_cursor = 0;
         app
@@ -601,7 +607,7 @@ impl App {
                 self.check_omarchy();
             }
         }
-        // Debounced config save (volume/balance; plan 06 reuses it for EQ).
+        // Debounced config save (volume/balance/EQ).
         if self
             .config_dirty_since
             .is_some_and(|since| since.elapsed() >= CONFIG_SAVE_DEBOUNCE)
@@ -754,6 +760,14 @@ impl App {
             BandRight => self.ui.eq_focus = (self.ui.eq_focus + 1).min(10),
             BandUp => self.change_band(1),
             BandDown => self.change_band(-1),
+            EqToggle => {
+                self.ui.eq_on = !self.ui.eq_on;
+                self.send_eq();
+            }
+            EqReset => {
+                self.ui.eq_bands = [0; 11];
+                self.send_eq();
+            }
 
             // Playlist scope
             CursorUp => {
@@ -886,6 +900,26 @@ impl App {
     fn change_band(&mut self, delta: i8) {
         let band = &mut self.ui.eq_bands[self.ui.eq_focus];
         *band = (*band + delta).clamp(-12, 12);
+        self.send_eq();
+    }
+
+    /// Push the live EQ state (on/off + preamp + 10 gains) to the player
+    /// and into the config, arming the debounced save (plan 06).
+    fn send_eq(&mut self) {
+        self.apply_eq();
+        self.config.eq.on = self.ui.eq_on;
+        self.config.eq.preamp = self.ui.eq_bands[0];
+        self.config.eq.bands.copy_from_slice(&self.ui.eq_bands[1..]);
+        self.config_dirty_since = Some(Instant::now());
+    }
+
+    /// Send the EQ command only — used at session start, where the config
+    /// state is being *restored*, not changed (nothing to save yet).
+    fn apply_eq(&mut self) {
+        self.player.handle(PlayerCommand::SetEq {
+            enabled: self.ui.eq_on,
+            gains: self.ui.eq_bands,
+        });
     }
 
     fn toggle_panel(&mut self, panel: Panel) {
@@ -1727,5 +1761,113 @@ mod tests {
             "this is not toml [",
             "the broken file is untouched"
         );
+    }
+
+    // --- Plan 06: EQ actions → SetEq → config ---
+
+    #[test]
+    fn band_up_reaches_the_player_as_a_set_eq() {
+        let (mut app, _dir) = test_app();
+        app.ui.focus = Scope::Eq;
+        app.ui.eq_focus = 3;
+        app.dispatch(Action::BandUp);
+        assert_eq!(app.ui.eq_bands[3], 1);
+        assert_eq!(
+            app.mock_mut().last_eq(),
+            Some((true, [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0])),
+            "BandUp must ship the new gains as SetEq"
+        );
+        // The change also landed in the config and armed the debounce.
+        assert_eq!(app.config.eq.bands[2], 1, "band 3 of the config is index 2");
+        assert!(app.config_dirty_since.is_some(), "debounce flag set");
+    }
+
+    #[test]
+    fn eq_reset_zeroes_everything_and_sends_flat() {
+        let (mut app, _dir) = test_app();
+        app.ui.focus = Scope::Eq;
+        app.ui.eq_focus = 0;
+        app.dispatch(Action::BandUp); // preamp +1
+        app.ui.eq_focus = 7;
+        app.dispatch(Action::BandDown); // a band −1
+        app.dispatch(Action::EqReset);
+        assert_eq!(app.ui.eq_bands, [0; 11], "all 11 values zeroed");
+        assert_eq!(app.mock_mut().last_eq(), Some((true, [0; 11])));
+        assert_eq!(app.config.eq.preamp, 0);
+        assert_eq!(app.config.eq.bands, [0; 10]);
+        assert!(app.config_dirty_since.is_some());
+    }
+
+    #[test]
+    fn o_toggles_the_eq_from_eq_focus_only() {
+        let (mut app, _dir) = test_app();
+        app.ui.focus = Scope::Eq;
+        assert!(app.ui.eq_on);
+        app.handle_key(press(KeyCode::Char('o')));
+        assert!(!app.ui.eq_on, "`o` toggles the EQ in eq focus");
+        assert_eq!(app.mock_mut().last_eq(), Some((false, [0; 11])));
+        app.handle_key(press(KeyCode::Char('o')));
+        assert!(app.ui.eq_on, "toggled back on");
+        assert!(app.config_dirty_since.is_some());
+
+        // From another panel `o` does nothing (eq scope only, no global
+        // binding — the keymap conflict test pins that).
+        app.ui.focus = Scope::Player;
+        app.handle_key(press(KeyCode::Char('o')));
+        assert!(app.ui.eq_on, "`o` is eq-scope only");
+    }
+
+    #[test]
+    fn eq_changes_survive_a_restart_through_the_config() {
+        let (mut app, dir) = test_app();
+        app.ui.focus = Scope::Eq;
+        app.ui.eq_focus = 0;
+        for _ in 0..3 {
+            app.dispatch(Action::BandUp); // preamp +3
+        }
+        app.dispatch(Action::EqToggle); // and off
+        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.tick(Duration::from_millis(33));
+
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(text.contains("[eq]"), "{text}");
+        let loaded = Config::load_from(&dir.path().join("config.toml")).config;
+        assert!(!loaded.eq.on);
+        assert_eq!(loaded.eq.preamp, 3);
+        assert_eq!(loaded.eq.bands, [0; 10], "only the preamp moved");
+    }
+
+    #[test]
+    fn a_real_session_restores_the_eq_from_the_config() {
+        let mut config = Config::default();
+        config.eq.on = false;
+        config.eq.preamp = -4;
+        config.eq.bands = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let app = App::new_session(config, Keymap::defaults(), crate::ui::theme::neon());
+        assert!(!app.ui.eq_on, "`[eq] on = false` restored");
+        assert_eq!(
+            app.ui.eq_bands,
+            [-4, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "`[eq]` preamp + bands restored into the sliders"
+        );
+    }
+
+    #[test]
+    fn demo_mode_never_saves_eq_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut app = App::with_config_path(
+            Config::default(),
+            Keymap::defaults(),
+            crate::ui::theme::neon(),
+            true, // demo
+            Some(path.clone()),
+        );
+        app.ui.focus = Scope::Eq;
+        app.dispatch(Action::BandUp);
+        app.dispatch(Action::EqToggle);
+        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.tick(Duration::from_millis(33));
+        assert!(!path.exists(), "demo mode never writes the config");
     }
 }

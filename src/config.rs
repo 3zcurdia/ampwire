@@ -75,6 +75,7 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub theme: ThemeConfig,
     pub audio: AudioConfig,
+    pub eq: EqConfig,
     /// `[keys]` action → list of key specs.
     pub keys: HashMap<String, Vec<String>>,
 }
@@ -100,6 +101,29 @@ impl Default for AudioConfig {
             volume: 100,
             balance: 0,
             swap_channels: false,
+        }
+    }
+}
+
+/// Equalizer (plan 06), saved with the same debounce as `[audio]`:
+/// on/off + preamp + 10 bands in whole dB (−12..=12). Defaults keep a fresh
+/// install flat (and therefore bit-perfect).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct EqConfig {
+    pub on: bool,
+    /// −12..=12.
+    pub preamp: i8,
+    /// 10 band gains in dB, low to high (same order as `BAND_HZ`).
+    pub bands: [i8; 10],
+}
+
+impl Default for EqConfig {
+    fn default() -> Self {
+        Self {
+            on: true,
+            preamp: 0,
+            bands: [0; 10],
         }
     }
 }
@@ -208,6 +232,15 @@ impl Config {
                 toml_edit::value(self.audio.swap_channels),
             );
         });
+        set_table(&mut doc, "eq", |t| {
+            set_preserving_decor(t, "on", toml_edit::value(self.eq.on));
+            set_preserving_decor(t, "preamp", toml_edit::value(i64::from(self.eq.preamp)));
+            set_preserving_decor(
+                t,
+                "bands",
+                int_array(self.eq.bands.iter().map(|&b| i64::from(b))),
+            );
+        });
 
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -254,6 +287,15 @@ fn string_array<'a>(items: impl IntoIterator<Item = &'a str>) -> toml_edit::Item
     toml_edit::Item::Value(toml_edit::Value::Array(arr))
 }
 
+/// Build a TOML array of integers (the EQ's `bands`, plan 06).
+fn int_array(items: impl IntoIterator<Item = i64>) -> toml_edit::Item {
+    let mut arr = toml_edit::Array::new();
+    for item in items {
+        arr.push(item);
+    }
+    toml_edit::Item::Value(toml_edit::Value::Array(arr))
+}
+
 /// Drop obviously wrong values serde can't catch (empty orders, bad columns).
 ///
 /// `stack` must be a permutation of player + eq and `single_order` of all
@@ -283,6 +325,11 @@ fn sanitize(mut config: Config) -> Config {
     // out-of-range values (e.g. volume = 250) are clamped here.
     config.audio.volume = config.audio.volume.min(100);
     config.audio.balance = config.audio.balance.clamp(-100, 100);
+    // EQ gains: clamp to the slider span (−12..=12), preamp + bands.
+    config.eq.preamp = config.eq.preamp.clamp(-12, 12);
+    for band in &mut config.eq.bands {
+        *band = (*band).clamp(-12, 12);
+    }
     config
 }
 
@@ -476,5 +523,53 @@ mod tests {
         assert!(text.contains("# not too loud"), "{text}");
         assert!(text.contains("volume = 40"), "{text}");
         assert_eq!(Config::load_from(&path).config.audio, config.audio);
+    }
+
+    // --- `[eq]` (plan 06, step 5) ---
+
+    #[test]
+    fn eq_defaults_are_flat_and_on() {
+        let eq = EqConfig::default();
+        assert!(eq.on, "fresh install: EQ enabled but flat");
+        assert_eq!(eq.preamp, 0, "fresh install: unity preamp");
+        assert_eq!(eq.bands, [0; 10], "fresh install: flat = bit-perfect");
+    }
+
+    #[test]
+    fn eq_round_trips_through_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.eq.on = false;
+        config.eq.preamp = -3;
+        config.eq.bands = [6, 0, 0, 0, -4, 0, 0, 12, 0, 0];
+        config.save(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[eq]"), "{text}");
+        assert!(text.contains("on = false"), "{text}");
+        assert!(text.contains("preamp = -3"), "{text}");
+        assert!(
+            text.contains("bands = [6, 0, 0, 0, -4, 0, 0, 12, 0, 0]"),
+            "{text}"
+        );
+
+        let reloaded = Config::load_from(&path).config;
+        assert_eq!(reloaded.eq, config.eq);
+    }
+
+    #[test]
+    fn out_of_range_eq_gains_are_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[eq]\npreamp = 20\nbands = [30, -40, 0, 0, 0, 0, 0, 0, 0, 0]\n",
+        )
+        .unwrap();
+        let config = Config::load_from(&path).config;
+        assert_eq!(config.eq.preamp, 12);
+        assert_eq!(config.eq.bands[0], 12);
+        assert_eq!(config.eq.bands[1], -12);
     }
 }

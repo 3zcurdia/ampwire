@@ -31,6 +31,9 @@ pub struct MockPlayer {
     repeat: bool,
     volume: u8,
     balance: i8,
+    /// Last `SetEq` the mock received (plan 06): it has no audio to shape,
+    /// but the app tests read it back as a recorder.
+    last_eq: Option<(bool, [i8; 11])>,
     format: FormatInfo,
     spectrum: Vec<f32>,
     /// Peaks slowly fall back toward the bar height, btop-style.
@@ -125,6 +128,7 @@ impl MockPlayer {
             repeat: false,
             volume: 68,
             balance: 0,
+            last_eq: None,
             format: FormatInfo::default(),
             spectrum,
             peaks,
@@ -147,6 +151,7 @@ impl MockPlayer {
             repeat: false,
             volume: 68,
             balance: 0,
+            last_eq: None,
             format: FormatInfo::default(),
             spectrum,
             peaks,
@@ -168,6 +173,7 @@ impl MockPlayer {
             repeat: false,
             volume: 68,
             balance: 0,
+            last_eq: None,
             format: FormatInfo::default(),
             spectrum,
             peaks,
@@ -190,6 +196,7 @@ impl MockPlayer {
             repeat: false,
             volume: 68,
             balance: 0,
+            last_eq: None,
             format: FormatInfo::default(),
             spectrum,
             peaks,
@@ -201,6 +208,13 @@ impl MockPlayer {
     fn with_current(mut self, current: usize) -> Self {
         self.playlist.set_current(Some(current));
         self
+    }
+
+    /// The last `SetEq` received — a recorder for the app tests (plan 06).
+    /// The mock has no audio to shape, so the command is otherwise ignored.
+    #[cfg(test)]
+    pub fn last_eq(&self) -> Option<(bool, [i8; 11])> {
+        self.last_eq
     }
 
     pub fn snapshot(&self) -> PlayerSnapshot {
@@ -262,10 +276,12 @@ impl MockPlayer {
             }
             // Volume/balance are stored (the sliders read them back); the
             // swap has no representation in the mock — no samples to reorder
-            // and no widget shows it.
+            // and no widget shows it. The EQ is recorded only so app tests
+            // can read back what the UI sent.
             PlayerCommand::SetVolume(v) => self.volume = v.min(100),
             PlayerCommand::SetBalance(b) => self.balance = b.clamp(-100, 100),
             PlayerCommand::SetSwapChannels(_) => {}
+            PlayerCommand::SetEq { enabled, gains } => self.last_eq = Some((enabled, gains)),
             _ => {}
         }
         self.handle_transport(cmd);
@@ -560,5 +576,18 @@ mod tests {
         p.position = Duration::from_secs(180);
         p.tick(Duration::from_secs(1));
         assert_eq!(p.playlist.current(), Some(1));
+    }
+
+    #[test]
+    fn set_eq_is_recorded_but_changes_nothing_else() {
+        let mut p = MockPlayer::new(1);
+        p.handle(PlayerCommand::SetEq {
+            enabled: true,
+            gains: [3; 11],
+        });
+        assert_eq!(p.last_eq(), Some((true, [3; 11])));
+        // The mock has no audio to shape: playback state is untouched.
+        assert_eq!(p.snapshot().volume, 68);
+        assert_eq!(p.playlist.current(), Some(2));
     }
 }

@@ -41,6 +41,10 @@ pub enum Action {
     BandRight,
     BandUp,
     BandDown,
+    /// `o`: equalizer on/off (plan 06).
+    EqToggle,
+    /// `0`: reset preamp + bands to flat (plan 06).
+    EqReset,
 
     // Playlist scope
     CursorUp,
@@ -98,6 +102,8 @@ impl Action {
             Action::BandRight => "band_right",
             Action::BandUp => "band_up",
             Action::BandDown => "band_down",
+            Action::EqToggle => "eq_on",
+            Action::EqReset => "eq_reset",
             Action::CursorUp => "cursor_up",
             Action::CursorDown => "cursor_down",
             Action::Select => "select",
@@ -131,7 +137,12 @@ impl Action {
             Action::SeekBack | Action::SeekFwd | Action::VolumeUp | Action::VolumeDown => {
                 Scope::Player
             }
-            Action::BandLeft | Action::BandRight | Action::BandUp | Action::BandDown => Scope::Eq,
+            Action::BandLeft
+            | Action::BandRight
+            | Action::BandUp
+            | Action::BandDown
+            | Action::EqToggle
+            | Action::EqReset => Scope::Eq,
             Action::CursorUp
             | Action::CursorDown
             | Action::Select
@@ -172,6 +183,8 @@ impl Action {
             Action::BandRight => "next EQ band",
             Action::BandUp => "band gain +1 dB",
             Action::BandDown => "band gain -1 dB",
+            Action::EqToggle => "equalizer on/off",
+            Action::EqReset => "reset equalizer to flat",
             Action::CursorUp => "cursor up",
             Action::CursorDown => "cursor down",
             Action::Select => "play track under cursor",
@@ -222,6 +235,8 @@ impl Action {
             BandRight,
             BandUp,
             BandDown,
+            EqToggle,
+            EqReset,
             CursorUp,
             CursorDown,
             Select,

@@ -210,6 +210,8 @@ fn defaults() -> Vec<(Scope, Key, Action)> {
         (Scope::Eq, "right", BandRight),
         (Scope::Eq, "up", BandUp),
         (Scope::Eq, "down", BandDown),
+        (Scope::Eq, "o", EqToggle),
+        (Scope::Eq, "0", EqReset),
         // Playlist focus
         (Scope::Playlist, "up", CursorUp),
         (Scope::Playlist, "down", CursorDown),
@@ -700,6 +702,9 @@ mod tests {
             // EQ band gain in eq focus
             (Scope::Eq, press(KeyCode::Up), Action::BandUp),
             (Scope::Eq, press(KeyCode::Down), Action::BandDown),
+            // EQ on/off and reset (plan 06) — eq scope only, no global clash
+            (Scope::Eq, press(c('o')), Action::EqToggle),
+            (Scope::Eq, press(c('0')), Action::EqReset),
             // Playlist controls
             (Scope::Playlist, press(KeyCode::Enter), Action::Select),
             (Scope::Playlist, press(KeyCode::PageUp), Action::PageUp),
@@ -740,6 +745,36 @@ mod tests {
                 action
             );
         }
+    }
+
+    /// Plan 06: `o` / `0` live in the EQ scope only — no global fallback,
+    /// no clash with `shift+o` (cycle_order) or `1`/`2`/`3`.
+    #[test]
+    fn eq_toggle_and_reset_are_eq_scope_only() {
+        let map = Keymap::defaults();
+        assert_eq!(
+            map.resolve(Scope::Eq, press(KeyCode::Char('o'))),
+            Some(Action::EqToggle)
+        );
+        assert_eq!(
+            map.resolve(Scope::Eq, press(KeyCode::Char('0'))),
+            Some(Action::EqReset)
+        );
+        assert_eq!(
+            map.resolve(Scope::Player, press(KeyCode::Char('o'))),
+            None,
+            "no global fallback from player focus"
+        );
+        assert_eq!(
+            map.resolve(Scope::Playlist, press(KeyCode::Char('0'))),
+            None,
+            "no global fallback from playlist focus"
+        );
+        // `shift+o` keeps cycling the panel order from anywhere.
+        assert_eq!(
+            map.resolve(Scope::Global, shift(KeyCode::Char('o'))),
+            Some(Action::CycleOrder)
+        );
     }
 
     #[test]

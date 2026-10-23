@@ -144,7 +144,9 @@ mod tests {
     #[test]
     fn help_overlay_renders() {
         let app = App::new(Config::default(), Keymap::defaults(), theme::neon(), false);
-        let area = Rect::new(0, 0, 80, 46);
+        // Tall enough for every entry (two EQ actions arrived in plan 06) so
+        // nothing scrolls out of the first page.
+        let area = Rect::new(0, 0, 80, 54);
         let mut buf = Buffer::empty(area);
         render(&app, area, &mut buf);
         let text: String = buf
