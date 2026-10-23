@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::keymap::Keymap;
 use crate::library::ScanMsg;
 use crate::player::mock::MockPlayer;
+use crate::player::real::RealPlayer;
 use crate::player::{PlayerCommand, PlayerSnapshot, Track};
 use crate::ui;
 use crate::ui::layout::{LayoutPrefs, Panel, PlaylistSide, Visibility, compute_layout};
@@ -122,6 +123,46 @@ pub enum ScanMode {
     Append,
 }
 
+/// The player driving the UI: the mock (demo, `--dump`, every test) or the
+/// real engine (a real, non-demo session). Both speak the same
+/// [`PlayerCommand`] / [`PlayerSnapshot`] contract, so `ui` never notices.
+pub enum Backend {
+    Mock(MockPlayer),
+    Real(RealPlayer),
+}
+
+impl Backend {
+    fn handle(&mut self, cmd: PlayerCommand) {
+        match self {
+            Backend::Mock(player) => player.handle(cmd),
+            Backend::Real(player) => player.handle(cmd),
+        }
+    }
+
+    fn tick(&mut self, dt: Duration) {
+        match self {
+            Backend::Mock(player) => player.tick(dt),
+            Backend::Real(player) => player.tick(dt),
+        }
+    }
+
+    fn snapshot(&self) -> PlayerSnapshot {
+        match self {
+            Backend::Mock(player) => player.snapshot(),
+            Backend::Real(player) => player.snapshot(),
+        }
+    }
+
+    /// A queued one-line notice (`skipped …`, `shuffle on`, …). The mock has
+    /// none; the real player surfaces engine errors and toggle feedback.
+    fn take_notice(&mut self) -> Option<String> {
+        match self {
+            Backend::Mock(_) => None,
+            Backend::Real(player) => player.take_notice(),
+        }
+    }
+}
+
 pub struct App {
     pub ui: UiState,
     pub theme: Theme,
@@ -129,7 +170,7 @@ pub struct App {
     pub config: Config,
     pub should_quit: bool,
     snapshot: PlayerSnapshot,
-    player: MockPlayer,
+    player: Backend,
     omarchy: OmarchyWatch,
     /// Frame deadline: when we next redraw (independent of the 30 fps tick).
     next_frame: Instant,
@@ -174,7 +215,7 @@ impl App {
             eq_bands: DETERMINISTIC_EQ_BANDS,
             ..UiState::default()
         };
-        let player = MockPlayer::deterministic();
+        let player = Backend::Mock(MockPlayer::deterministic());
         let snapshot = player.snapshot();
         let now = Instant::now();
         Self {
@@ -220,7 +261,11 @@ impl App {
             // A pleasing demo state: cursor on the playing track.
             ui.playlist_cursor = 2;
         }
-        let player = MockPlayer::animated();
+        // The low-level constructor always builds the mock: `--demo`, every
+        // test and the golden frames depend on the 24-track fake playlist.
+        // Real sessions come from `new_session` below (plan 02's precedent,
+        // re-confirmed for plan 03).
+        let player = Backend::Mock(MockPlayer::animated());
         let snapshot = player.snapshot();
         ui.playlist_cursor = ui
             .playlist_cursor
@@ -255,7 +300,9 @@ impl App {
     pub fn new_session(config: Config, keymap: Keymap, theme: Theme) -> Self {
         let mut app =
             Self::with_config_path(config, keymap, theme, false, crate::config::config_path());
-        app.player = MockPlayer::empty();
+        // The real session starts empty and plays for real: this backend owns
+        // the engine thread (dropped → Shutdown + join, so `q` exits fast).
+        app.player = Backend::Real(RealPlayer::new());
         app.snapshot = app.player.snapshot();
         app.ui.playlist_cursor = 0;
         app
@@ -274,10 +321,14 @@ impl App {
         &self.snapshot
     }
 
-    /// Mutable access to the mock (tests).
+    /// Mutable access to the mock (tests). Panics on the real backend — the
+    /// production session is the only one that uses it, and no test does.
     #[cfg(test)]
     pub fn mock_mut(&mut self) -> &mut MockPlayer {
-        &mut self.player
+        match &mut self.player {
+            Backend::Mock(player) => player,
+            Backend::Real(_) => panic!("mock_mut() on the real backend"),
+        }
     }
 
     /// Re-snapshot after mutating the mock in tests.
@@ -507,6 +558,11 @@ impl App {
     pub fn tick(&mut self, dt: Duration) {
         self.player.tick(dt);
         self.snapshot = self.player.snapshot();
+        // Surface whatever the real player queued this tick (engine errors,
+        // shuffle/repeat feedback) in the playlist's notice slot.
+        if let Some(notice) = self.player.take_notice() {
+            self.ui.notice = Some(notice);
+        }
         self.poll_scan();
 
         // Marquee: one step every 200 ms.

@@ -1,6 +1,8 @@
 //! Mock player: fake playlist, ticking clock, animated spectrum.
 //!
-//! Stands in for the real audio thread until it exists. The RNG is seeded so
+//! Stands in for [`RealPlayer`](super::real::RealPlayer) in `--demo`,
+//! `--dump` and the tests — it owns the clock and spectrum the real player
+//! only gets in plan 04. The RNG is seeded so
 //! a given seed always yields the same spectrum; [`MockPlayer::deterministic`]
 //! freezes that seed's spectrum so `--dump` and the golden tests reproduce
 //! exactly.
@@ -9,19 +11,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::playlist::Playlist;
+use super::rng::Rng;
 use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, Track, TrackSource};
-
-/// Tiny xorshift PRNG — enough for spectrum wobble, no dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next_f32(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 40) as f32 / (1u64 << 24) as f32
-    }
-}
 
 const SPECTRUM_BINS: usize = 24;
 
@@ -54,7 +45,7 @@ pub struct MockPlayer {
 /// spans the full 0–1 range (so bars can drop to zero), low bins louder than
 /// high, with per-bin jitter. Same seed → same shape.
 fn seeded_spectrum(seed: u64) -> (Vec<f32>, Vec<f32>, Rng) {
-    let mut rng = Rng(seed | 1);
+    let mut rng = Rng::new(seed);
     let mut spectrum = vec![0.0f32; SPECTRUM_BINS];
     for (i, bin) in spectrum.iter_mut().enumerate() {
         let t = i as f32 / (SPECTRUM_BINS - 1) as f32;
@@ -186,6 +177,8 @@ impl MockPlayer {
     }
 
     /// A stopped, empty-player mock: no tracks, nothing current (plan 02).
+    /// Test-only since plan 03: real sessions use `RealPlayer::new()`.
+    #[cfg(test)]
     pub fn empty() -> Self {
         let (spectrum, peaks, rng) = seeded_spectrum(ANIMATED_SEED);
         Self {

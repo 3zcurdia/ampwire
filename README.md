@@ -4,11 +4,11 @@ Terminal Winamp 2.0 replica with modern hi-fi playback.
 
 Retro Winamp anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look.
 
-> Status: Phase 2 — real playlists from disk. Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags; playlist edit (add/delete/clear/reorder/filter) works. Playback is still the mock player (fake clock over the real list) — no audio yet, no Jellyfin. The UI renders from a `PlayerSnapshot`, so the real player/audio backend can replace the mock later without touching render code.
+> Status: Phase 3 — **real audio playback.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track, ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The timer/seek/spectrum still read `0:00` and zeros (plan 04), volume/balance are stored but not yet applied (plan 05), no Jellyfin yet. `--demo` / `--dump` keep the mock player.
 
 ## Quickstart
 
-Requirements: Rust (managed via `mise`, see `mise.toml`), a real TTY.
+Requirements: Rust (managed via `mise`, see `mise.toml`), a real TTY, and — for audio output on Linux — the ALSA development headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch). macOS plays through CoreAudio with no extra setup.
 
 ```sh
 cargo run -- ~/Music   # load a real playlist (files or folders) and start playing
@@ -19,6 +19,13 @@ cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 ```
 
 `--dump` never enters raw mode or the alternate screen. Useful sizes used in tests: `40x3`, `52x12`, `80x24`, `104x18`, `160x45` (see `tests/golden/`).
+
+## Playback
+
+- Formats: WAV/PCM, FLAC, MP3, M4A (AAC or ALAC) — decoded with Symphonia and played through cpal **at the track's own sample rate and channel count** (no resampling; lossless sources show `bit-perfect`).
+- Play order: ordered (default) or full-permutation shuffle (`s` — every track plays once per round), repeat (`r`). Tracks auto-advance; the last track stops, or wraps to track 1 with repeat on. `z`/`b` follow the same rule at the end of the playlist.
+- Failures never stop the run: a bad file shows `skipped <name>: <reason>` and playback moves on; if every track fails → `no playable tracks`.
+- Not yet: the timer/seek/spectrum (plan 04), volume/balance (plan 05), gapless playback, and resampling for device-unsupported rates (such a track is skipped with `device cannot play 48000 Hz 8ch`).
 
 ## Layout
 
@@ -40,7 +47,7 @@ Automatic fallbacks (never overwrite your saved preference):
 
 ## Keys
 
-Winamp-style defaults, Space for play/pause. Every action is remappable.
+Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real.
 
 | Key | Action | Scope |
 |---|---|---|
@@ -127,22 +134,29 @@ Notes:
 - Run the TUI only in a real TTY; output under pipes/CI is garbage.
 - `crossterm` is imported as `ratatui::crossterm` — no direct dependency.
 - `Cargo.lock` is committed (binary crate).
-- Linux targets will need ALSA dev packages once real audio lands.
+- Audio on Linux builds against ALSA (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS needs nothing. `cargo test` never opens a sound card — the end-to-end device test is `#[ignore]`d: `cargo test -- --ignored` (it plays an audible tone).
 
 ## Project structure
 
 ```text
 src/
   main.rs            --demo / --dump / CLI load paths, theme resolution, ratatui::run
-  app.rs             App: UiState + snapshot, event loop (~30fps), tick, dispatch, prompts, scans
+  app.rs             App: UiState + snapshot, event loop (~30fps), tick, dispatch, prompts, scans, Backend{Mock,Real}
   action.rs          Action enum (every remappable command)
   keymap.rs          defaults, spec parsing, (scope, key) → Action
   config.rs          load/save config.toml, XDG paths
+  audio/
+    mod.rs           3-thread overview: UI thread · engine thread · cpal callback
+    decoder.rs       symphonia → interleaved f32 (unit-tested on tests/fixtures/)
+    engine.rs        engine thread: owns the cpal Stream + decoder, feeds the rtrb ring
   library/
     mod.rs           audio-file scan (walkdir) + tag reading (lofty) on a thread
   player/
-    mod.rs           PlayerSnapshot view model + PlayerCommand + Track
-    playlist.rs       Playlist: append_sorted, remove, reorder, current bookkeeping
+    mod.rs           PlayerSnapshot view model + PlayerCommand + Track + FormatInfo
+    playlist.rs      Playlist: append_sorted, remove, reorder, current bookkeeping
+    order.rs         PlayOrder: ordered/shuffle permutation (next, prev, jump, look-ahead)
+    real.rs          RealPlayer: playlist + play order + AudioOut engine seam
+    rng.rs           xorshift RNG shared by the mock's wobble and shuffle
     mock.rs          MockPlayer: fake playlist, ticking clock, spectrum bins
   ui/
     mod.rs           render(frame, &App)
@@ -154,12 +168,13 @@ src/
     playlist.rs      playing/cursor styles, scroll, scrollbar, totals, filter/prompt
     help.rs          ? overlay
     widgets/         lcd_digits, marquee, spectrum, slider, eq_curve
+tests/fixtures/      0.5 s 44.1 kHz stereo tones (wav/flac/mp3/aac/alac) for decoder tests
 tests/golden/        --dump snapshots at 5 sizes
 docs/plans/          design plans (01-winamp-layout.md, 02-playlist-loading.md, …)
 ```
 
-Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → PlayerCommand → MockPlayer`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`. `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
+Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; engine events come back over a channel polled from `App::tick` (notices land in the playlist border). `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
 
 ## Roadmap
 
-Done: playlist loading + editing (plan 02). Next: real audio (Symphonia + cpal/rodio) with gapless/bit-perfect output (plan 03). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.
+Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03). Next: real timer, seeking and an FFT spectrum synced to the audio (plan 04). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.

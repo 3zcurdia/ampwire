@@ -1,12 +1,15 @@
 //! Player view model and commands.
 //!
 //! `ui` only ever reads a [`PlayerSnapshot`]. Changes go the other way, as a
-//! [`PlayerCommand`]. This phase feeds commands to [`mock::MockPlayer`];
-//! later a channel to the audio thread replaces it without touching render
-//! code.
+//! [`PlayerCommand`]. Two backends implement that contract: [`mock::MockPlayer`]
+//! (demo / `--dump` / tests) and [`real::RealPlayer`] (a real session, whose
+//! audio thread is [`crate::audio::Engine`]) — the UI cannot tell them apart.
 
 pub mod mock;
+pub mod order;
 pub mod playlist;
+pub mod real;
+pub mod rng;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +32,20 @@ pub struct FormatInfo {
     pub sample_rate: Option<u32>,
     pub channels: String,
     pub bit_perfect: bool,
+}
+
+impl FormatInfo {
+    /// Nothing known yet: shown when stopped, or between `Load` and the
+    /// engine's `Started` event.
+    pub fn blank() -> Self {
+        Self {
+            codec: String::new(),
+            bit_depth: None,
+            sample_rate: None,
+            channels: String::new(),
+            bit_perfect: false,
+        }
+    }
 }
 
 impl Default for FormatInfo {
