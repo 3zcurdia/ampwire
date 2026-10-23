@@ -1,6 +1,7 @@
 # Plan 08 — Jellyfin: load the whole server library and play it
 
-**Status:** ⬜ not started — safe to pick up (needs plans 03, 04, 05, 06 done).
+**Status:** 🟨 in progress — since 2026-10-23 (plans 03–07 all done; Step 0
+spike passed, all three modes ship).
 
 Goal: with a `[jellyfin]` section in `config.toml`, pressing `j` fetches every
 audio track on the server into the playlist (appended to whatever is there).
@@ -192,4 +193,33 @@ README: `[jellyfin]` block, `j` key, the three modes (with the "EQ works while s
 - Remote items keep the server's `Artist, SortName` order.
 
 ## Spike result
-_(fill in at Step 0: status line, `Content-Range`, `Accept-Ranges`, server version)_
+
+**PASSED — 2026-10-23, against `http://hyperion.local:8096` (Jellyfin Server
+12.2.0, Kestrel), auth header `Authorization: MediaBrowser Token="<key>"`.**
+
+- `GET /System/Info/Public` → `200` without auth (connectivity check).
+- `GET /Users` → `200`, users parsed (`Id` + `Name`).
+- Library page (`/Items?…IncludeItemTypes=Audio…`) → `200`,
+  `TotalRecordCount: 2523`, items carry `Id`, `Name`, `Artists[]`,
+  `AlbumArtist`, `RunTimeTicks`, `Container`, `MediaSources[0].{Bitrate,
+  Container}` as documented.
+- **`GET /Audio/<id>/stream?static=true` with `Range: bytes=0-1`:**
+  ```
+  HTTP/1.1 206 Partial Content
+  Content-Length: 2
+  Content-Type: audio/mp4
+  Accept-Ranges: bytes
+  Content-Range: bytes 0-1/8223082
+  ```
+- **`Range: bytes=-65536` (tail, the M4A end-seek):**
+  ```
+  HTTP/1.1 206 Partial Content
+  Content-Length: 65536
+  Accept-Ranges: bytes
+  Content-Range: bytes 8157546-8223081/8223082
+  ```
+
+Verdict: the server answers `206` + `Content-Range` + `Accept-Ranges: bytes`
+for both head and tail ranges → seekable streaming is possible, so **all three
+modes (`cache`, `stream`, `stream_pure`) are implemented** (no
+"streaming not verified" fallback needed).

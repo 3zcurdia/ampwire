@@ -15,6 +15,8 @@ toml = "0.8"
 toml_edit = "0.22"
 unicode-width = "0.2"
 walkdir = "2.5.0"
+ureq = "3.5.0"
+serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3"

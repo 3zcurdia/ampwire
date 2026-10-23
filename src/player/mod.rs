@@ -133,7 +133,14 @@ pub type TrackId = u64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackSource {
     Local(PathBuf),
-    // plan 08 adds `Remote { .. }`
+    /// A Jellyfin item (plan 08): the server's `Id`, plus the container used
+    /// as the file-extension hint (decoder probe / cache file name). The
+    /// credentials never live here — the [`Client`][crate::jellyfin::Client]
+    /// holds them.
+    Remote {
+        item_id: String,
+        container: Option<String>,
+    },
 }
 
 /// One playlist entry.
@@ -157,7 +164,8 @@ impl Track {
     }
 
     /// Row text: `artist - title` when both tags exist, otherwise the file
-    /// name without extension (`?` when even that is missing).
+    /// name without extension (`?` when even that is missing). A remote row
+    /// never shows a path: it falls back to the server's `Name`.
     pub fn display_name(&self) -> String {
         match (&self.artist, &self.title) {
             (Some(artist), Some(title)) => format!("{artist} - {title}"),
@@ -167,18 +175,35 @@ impl Track {
                     .and_then(|stem| stem.to_str())
                     .unwrap_or("?")
                     .to_string(),
+                TrackSource::Remote { .. } => self.title.clone().unwrap_or_else(|| "?".into()),
             },
         }
     }
 
     /// Sort order: `artist - title` (lowercased) when both tags exist,
-    /// otherwise the full path as a lowercased string.
+    /// otherwise the full path as a lowercased string. A remote row has no
+    /// path, so it sorts on the title (the server's `Name`).
     pub fn sort_key(&self) -> String {
         match (&self.artist, &self.title) {
             (Some(artist), Some(title)) => format!("{artist} - {title}").to_lowercase(),
             _ => match &self.source {
                 TrackSource::Local(path) => path.to_string_lossy().to_lowercase(),
+                TrackSource::Remote { .. } => self.title.clone().unwrap_or_default().to_lowercase(),
             },
+        }
+    }
+
+    /// A Jellyfin server item (vs. a local file). Drives the cache window,
+    /// the `RemoveRemote` reload rule and the `stream_pure` EQ bypass.
+    pub fn is_remote(&self) -> bool {
+        matches!(self.source, TrackSource::Remote { .. })
+    }
+
+    /// The Jellyfin item id behind a remote track, if it is one.
+    pub fn remote_id(&self) -> Option<&str> {
+        match &self.source {
+            TrackSource::Remote { item_id, .. } => Some(item_id),
+            TrackSource::Local(_) => None,
         }
     }
 }
