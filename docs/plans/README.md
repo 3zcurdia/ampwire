@@ -8,7 +8,7 @@ the earlier ones are merged.
 |---|---|---|---|
 | [01](01-winamp-layout.md) | ✅ done | UI shell (mock player, no audio) | — |
 | [02](02-playlist-loading.md) | ✅ done | Load files/dirs into the playlist + playlist controls | 01 |
-| [03](03-audio-playback.md) | ⬜ not started | Play wav/mp3/m4a/flac: play, pause, stop, next, prev, **ordered/shuffle play order** (no timer, no spectrum) | 02 |
+| [03](03-audio-playback.md) | ✅ done | Play wav/mp3/m4a/flac: play, pause, stop, next, prev, **ordered/shuffle play order** (no timer, no spectrum) | 02 |
 | [04](04-live-sync.md) | ⬜ not started | Real timer, seeking, FFT spectrum synced to the audio | 03 |
 | [05](05-volume-balance-format.md) | ⬜ not started | Volume + balance that work, format/bitrate line | 03 (04 recommended) |
 | [06](06-equalizer-dsp.md) | ⬜ not started | Real 10-band equalizer + preamp | 05 |

@@ -1,6 +1,10 @@
 # Plan 03 — Real audio playback (wav, mp3, m4a, flac)
 
-**Status:** ⬜ not started — safe to pick up (needs plan 02 done).
+**Status:** ✅ done — 2026-10-22, 0fcd518. 216 tests pass (2 `#[ignore]`d:
+a visual dump and the audio-device smoke test), goldens unchanged; the real
+device path was exercised with `cargo test -- --ignored` and a scripted TUI
+session (scan → play → auto-advance across all five fixtures → quit, exit 0).
+See **Deviations** at the end.
 
 Goal: tracks in the playlist actually play through the speakers, with
 **play, pause, stop, next, prev** working. Tracks auto-advance; bad files are
@@ -233,3 +237,49 @@ and the three cargo checks pass. `--demo` and the golden tests still use the moc
 - A small gap between tracks (no gapless yet).
 - Ordered play is the default; shuffle is the `s` toggle (no separate "order" UI beyond the existing shuffle indicator and notice).
 - Prev ignores the "restart if > 3 s" rule until the clock exists (plan 04).
+
+## Deviations (implemented 2026-10-22)
+
+Annotated here as plan 02 did (two items were confirmed with the user first):
+
+1. **symphonia resolved to 0.6.1, not the 0.5 API the recipe assumed.**
+   Adapted: `Probe::probe()` (was `.format()`), `next_packet() -> Option<Packet>`
+   (EOF is `None`), `GenericAudioBufferRef::copy_to_vec_interleaved::<f32>`
+   (replaces `SampleBuffer`), `make_audio_decoder` + `AudioDecoderOptions`,
+   the `CodecParameters`/`CodecId` enum wrappers, duration from
+   `Track::num_frames` (timebase fallback). Codec name comes from the
+   registered decoder's `short_name`, upper-cased (`flac` → `FLAC`), with the
+   linear-PCM id range (0x100–0x123) shown as `PCM`; `lossless` = FLAC | ALAC
+   | that same range, so A-law/µ-law/ADPCM stay lossy.
+2. **`App::new(…, demo)` keeps the mock for *both* values** (confirmed).
+   ~20 UI tests call `App::new(…, false)` and depend on the 24-track animated
+   mock, exactly the conflict plan 02 documented. Only the real entrypoint,
+   `App::new_session`, builds `Real(RealPlayer)`; `--demo`/`--dump`/tests are
+   untouched.
+3. **`tone.wav` is 88 KB** (confirmed): 0.5 s × 44.1 kHz × stereo × 16-bit
+   PCM cannot fit the "< 30 KB" fixture guideline; keeping the spec matters
+   more because 0.5 s is what holds lossy priming inside tolerance. The other
+   four fixtures are 9–15 KB.
+4. **`bit_perfect` is set from `lossless`.** `FormatInfo` has no `lossless`
+   field, so the plan's "fill format (codec, lossless, …)" maps onto the one
+   flag the format line renders. Plan 05 re-evaluates it against
+   volume/balance/EQ. The real player stores `volume` as 100 by default
+   (the mock keeps its cosmetic 68).
+5. **rtrb 0.4 has no push that can silently drop samples**, so the engine
+   feeds with `push_partial_slice` and carries a pending remainder between
+   iterations instead of the plan's `slots >= scratch.len()` refill sketch —
+   same semantics (never lose a sample, never spin).
+6. **AAC sample tolerance widened to ±8 %** (the plan's ±5 % stands for MP3,
+   exact for lossless). Symphonia's isomp4 reader does no gapless trimming
+   ("Gapless: No"), so encoder priming and whole 1024-sample frames survive:
+   47 104 vs 44 100 samples (+6.8 %) on the committed 0.5 s fixture —
+   negligible on real tracks.
+7. **Small engine/API details the plan left open**: `Load` clears the pause
+   flag (Next while paused starts playing, matching `start_track` setting
+   `state = Playing`); the engine loop sleeps 5 ms every iteration rather
+   than only when idle; ALAC publishes no `bits_per_sample` (its format line
+   reads `44.1kHz stereo` until plan 05); `MockPlayer::empty()` became
+   `#[cfg(test)]` (its only caller moved to `RealPlayer`); `PlayOrder` uses
+   `usize::MAX` for "nothing current", `prev()` with nothing current returns
+   the first track, and `upcoming`/`previous` are `#[allow(dead_code)]` until
+   plan 08 consumes them (they are unit-tested now).
