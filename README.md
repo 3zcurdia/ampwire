@@ -4,7 +4,7 @@ Terminal Winamp 2.0 replica with modern hi-fi playback.
 
 Retro Winamp anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look.
 
-> Status: Phase 4 — **live sync.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track, ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume/balance are stored but not yet applied (plan 05), no Jellyfin yet. `--demo` / `--dump` keep the mock player.
+> Status: Phase 5 — **volume & balance.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track, ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume (`+`/`-`/`↑↓`) and balance (`[`/`]`) shape what you hear and are remembered across restarts; at 100 % / centered the samples stay bit-perfect. The format line reads `FLAC 24/96 stereo` / `MP3 320kbps 44.1kHz stereo`. No Jellyfin yet. `--demo` / `--dump` keep the mock player.
 
 ## Quickstart
 
@@ -26,7 +26,9 @@ cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 - Play order: ordered (default) or full-permutation shuffle (`s` — every track plays once per round), repeat (`r`). Tracks auto-advance; the last track stops, or wraps to track 1 with repeat on. `z`/`b` follow the same rule at the end of the playlist.
 - Live sync: the LCD clock, seek bar and spectrum follow what is actually being heard. The clock counts frames the audio callback delivered (no drift, freezes on pause), `←`/`→` seek ±5 s by reloading the stream at that offset (a brief glitch; unsupported files restart with `seek not supported for this file`), and the bars are a 2048-point Hann FFT over the played samples in 32 log-spaced bands (40 Hz → 16 kHz).
 - Failures never stop the run: a bad file shows `skipped <name>: <reason>` and playback moves on; if every track fails → `no playable tracks`.
-- Not yet: volume/balance (plan 05), gapless playback, and resampling for device-unsupported rates (such a track is skipped with `device cannot play 48000 Hz 8ch`).
+- Volume & balance are real (plan 05): software gain in the audio callback with click-free smoothing, volume 0–100 (squared law, default 100 = unity), balance −100…+100 (attenuates only the opposite channel, stereo only). Both live in `config.toml` `[audio]` and are restored on startup. At volume 100 / balance 0 the DSP is skipped entirely — lossless stays bit-perfect, as the format line's `bit-perfect` marker shows.
+- The format line is per-codec: `FLAC 24/96 stereo` (lossless: depth + rate) vs `MP3 320kbps 44.1kHz stereo` (lossy: bitrate + rate, bitrate from tags). Codec/depth/rate/channels come from the decoder, never the tags.
+- Not yet: gapless playback, and resampling for device-unsupported rates (such a track is skipped with `device cannot play 48000 Hz 8ch`).
 
 ## Layout
 
@@ -48,7 +50,7 @@ Automatic fallbacks (never overwrite your saved preference):
 
 ## Keys
 
-Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Since plan 04 so are `←` / `→` (seek ±5 s) — the clock and bars follow the audio.
+Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Plan 04 made `←` / `→` (seek ±5 s) live — the clock and bars follow the audio; plan 05 made volume (`+` `-`) and balance (`[` `]`) shape the actual samples.
 
 | Key | Action | Scope |
 |---|---|---|
@@ -62,6 +64,7 @@ Winamp-style defaults, Space for play/pause. Every action is remappable. Since p
 | `↑` / `↓` | cursor | playlist |
 | `↑` / `↓` | band gain ±1 dB | eq |
 | `+` `=` / `-` | volume | global |
+| `[` / `]` | balance left / right | global |
 | `Enter`, `PgUp`/`PgDn`, `Home`/`End` | play under cursor, page, jump | playlist |
 | `a` / `d` / `D` | add path / delete track / clear playlist | playlist |
 | `/` | find (live filter; `Esc` clears) | playlist |
@@ -101,12 +104,17 @@ transparent = true   # false → paint panel background
 [theme.colors]       # optional per-role overrides
 accent = "#00E5FF"
 
+[audio]
+volume = 100         # 0–100, default 100 = unity (bit-perfect)
+balance = 0          # −100 (full left) … +100 (full right)
+
 [keys]
 next = ["n"]
 ```
 
 - Load never crashes: missing/invalid config falls back to defaults with a one-line notice in the playlist border.
 - Saves use `toml_edit` (comments and formatting survive), written atomically via temp-file + rename.
+- Volume/balance changes are saved 500 ms after the last keypress (and on quit); layout hotkeys save immediately.
 - If the on-disk config failed to parse, the session is read-only: layout hotkeys still work in memory but nothing is written back (`config invalid — not saving`).
 
 ## Theming
@@ -150,6 +158,7 @@ src/
     mod.rs           3-thread overview: UI thread · engine thread · cpal callback
     decoder.rs       symphonia → interleaved f32 (unit-tested on tests/fixtures/)
     engine.rs        engine thread: owns the cpal Stream + decoder, feeds the rtrb ring
+    dsp.rs           SharedParams (lock-free targets) + Dsp: smoothed volume/balance in the callback
   library/
     mod.rs           audio-file scan (walkdir) + tag reading (lofty) on a thread
   player/
@@ -178,4 +187,4 @@ Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Ba
 
 ## Roadmap
 
-Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04). Next: volume, balance and EQ applied to the samples (plan 05). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.
+Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05). Next: the 10-band equalizer (plan 06). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.
