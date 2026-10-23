@@ -215,6 +215,13 @@ pub struct App {
     scan_rx: Option<std::sync::mpsc::Receiver<ScanMsg>>,
     /// What to do with the tracks when the running scan finishes.
     scan_mode: ScanMode,
+    /// A background Jellyfin library load is in flight (plan 08, step 4).
+    jf_rx: Option<std::sync::mpsc::Receiver<crate::jellyfin::JfMsg>>,
+    /// The next `Page` is the first of this load → send `RemoveRemote` once
+    /// (pressing `j` again drops the old remote batch before appending).
+    jf_first_page: bool,
+    /// Tracks actually appended by the running load (for the `Done` notice).
+    jf_loaded: usize,
 }
 
 /// Fixed EQ state for `--dump` and the golden tests (plan §2.3 shape).
@@ -258,6 +265,9 @@ impl App {
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
+            jf_rx: None,
+            jf_first_page: false,
+            jf_loaded: 0,
         }
     }
 
@@ -313,6 +323,9 @@ impl App {
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
+            jf_rx: None,
+            jf_first_page: false,
+            jf_loaded: 0,
         }
     }
 
@@ -676,6 +689,7 @@ impl App {
             self.ui.notice = Some(notice);
         }
         self.poll_scan();
+        self.poll_jellyfin();
 
         // Marquee: one step every 200 ms.
         self.marquee_acc += dt;
@@ -764,6 +778,92 @@ impl App {
             self.ui.notice = Some(format!("loaded {loaded} tracks ({skipped} skipped)"));
         }
         self.snapshot = self.player.snapshot();
+    }
+
+    /// Kick off a background Jellyfin library load (plan 08, step 4): the
+    /// worker thread pages the whole server and reports through
+    /// [`App::poll_jellyfin`]; nothing here blocks. Refuses (with a notice)
+    /// when there is no `[jellyfin]` section or one is already running.
+    fn start_jellyfin_load(&mut self) {
+        let configured = self
+            .config
+            .jellyfin
+            .as_ref()
+            .is_some_and(|jf| jf.is_complete());
+        if !configured {
+            self.ui.notice = Some("jellyfin: add [jellyfin] url and api_key to config.toml".into());
+            return;
+        }
+        if self.jf_rx.is_some() {
+            self.ui.notice = Some("jellyfin: already loading".into());
+            return;
+        }
+        let config = self.config.jellyfin.clone().expect("checked above");
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::jellyfin::spawn_library_load(
+            crate::jellyfin::Client::new(&config),
+            config.user.clone(),
+            tx,
+        );
+        self.jf_rx = Some(rx);
+        self.jf_first_page = true;
+        self.jf_loaded = 0;
+    }
+
+    /// Drain pending Jellyfin messages. The first `Page` drops the previous
+    /// remote batch (`RemoveRemote`, once per load), then each page appends
+    /// progressively — the playlist stays fully usable while loading, so
+    /// this never touches the cursor or scrolls the view. An `Error` keeps
+    /// everything already appended (plan §4).
+    fn poll_jellyfin(&mut self) {
+        let Some(rx) = self.jf_rx.take() else {
+            return;
+        };
+        let mut changed = false;
+        // `Done`/`Error`/disconnect end the load: the receiver is dropped
+        // (not restored), but a partially-filled playlist still re-snapshots.
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(crate::jellyfin::JfMsg::Page {
+                    tracks,
+                    loaded,
+                    total,
+                }) => {
+                    if self.jf_first_page {
+                        self.player.handle(PlayerCommand::RemoveRemote);
+                        self.jf_first_page = false;
+                    }
+                    self.jf_loaded += tracks.len();
+                    self.player.handle(PlayerCommand::AppendInOrder(tracks));
+                    self.ui.notice = Some(format!("jellyfin: loading {loaded}/{total}"));
+                    changed = true;
+                }
+                Ok(crate::jellyfin::JfMsg::Done) => {
+                    let n = self.jf_loaded;
+                    self.ui.notice = Some(format!("jellyfin: loaded {n} tracks"));
+                    finished = true;
+                    break;
+                }
+                Ok(crate::jellyfin::JfMsg::Error(reason)) => {
+                    self.ui.notice = Some(reason);
+                    finished = true; // keep whatever was appended
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if !finished {
+            self.jf_rx = Some(rx);
+        }
+        if changed {
+            self.snapshot = self.player.snapshot();
+            self.clamp_cursor();
+        }
     }
 
     /// Poll the Omarchy theme once and adopt it if it changed. If Omarchy is
@@ -908,6 +1008,7 @@ impl App {
                 self.ui.playlist_cursor = self.visible_indices().len().saturating_sub(1);
             }
             Open => self.ui.prompt = Some(Prompt::new(PromptKind::Open)),
+            LoadJellyfin => self.start_jellyfin_load(),
             Add => self.ui.prompt = Some(Prompt::new(PromptKind::Add)),
             Find => {
                 // Reopen with the active filter pre-filled.
@@ -2132,5 +2233,161 @@ mod tests {
         app.handle_key(key('p'));
         assert!(!app.ui.show_help, "help closed by opening presets");
         assert!(app.ui.presets.is_some(), "presets opened");
+    }
+
+    // --- Jellyfin load (plan 08, step 4 + 7) ---
+
+    /// A config with a complete `[jellyfin]` section pointing at a closed
+    /// port: a real `j` spawns a worker that fails instantly and harmlessly
+    /// (nothing listens on 127.0.0.1:9).
+    fn jf_config() -> Config {
+        let mut config = Config::default();
+        config.jellyfin = Some(crate::config::JellyfinConfig {
+            url: "http://127.0.0.1:9".into(),
+            api_key: "test-key".into(),
+            user: None,
+            mode: crate::config::JellyfinMode::Cache,
+            cache_ahead: 3,
+            cache_behind: 3,
+            cache_dir: None,
+            notice: None,
+        });
+        config
+    }
+
+    /// A remote (Jellyfin) track, for playlist assertions.
+    fn remote_track(id: &str) -> Track {
+        Track {
+            id: Track::next_id(),
+            source: crate::player::TrackSource::Remote {
+                item_id: id.to_string(),
+                container: None,
+            },
+            artist: None,
+            title: Some(format!("t-{id}")),
+            duration: None,
+            bitrate_kbps: None,
+        }
+    }
+
+    #[test]
+    fn j_without_a_jellyfin_section_notices_and_loads_nothing() {
+        let (mut app, _dir) = test_app(); // default config: no [jellyfin]
+        app.dispatch(Action::LoadJellyfin);
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("jellyfin: add [jellyfin] url and api_key to config.toml")
+        );
+        assert!(app.jf_rx.is_none(), "no worker without config");
+    }
+
+    #[test]
+    fn j_twice_refuses_the_second_press_while_still_loading() {
+        let (mut app, _dir) = test_app();
+        app.config = jf_config();
+        app.dispatch(Action::LoadJellyfin);
+        assert!(app.jf_rx.is_some(), "first j starts the worker");
+        assert_eq!(app.ui.notice, None, "no complaint on the first press");
+        app.dispatch(Action::LoadJellyfin);
+        assert_eq!(app.ui.notice.as_deref(), Some("jellyfin: already loading"));
+    }
+
+    #[test]
+    fn the_first_jellyfin_page_removes_old_remote_tracks_exactly_once() {
+        let (mut app, _dir) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.jf_rx = Some(rx);
+        app.jf_first_page = true;
+
+        // Two pages arrive in one tick: progressive append, one removal.
+        tx.send(crate::jellyfin::JfMsg::Page {
+            tracks: vec![remote_track("a"), remote_track("b")],
+            loaded: 2,
+            total: 4,
+        })
+        .unwrap();
+        tx.send(crate::jellyfin::JfMsg::Page {
+            tracks: vec![remote_track("c")],
+            loaded: 3,
+            total: 4,
+        })
+        .unwrap();
+        app.tick(Duration::ZERO);
+
+        let commands = &app.mock_mut().commands;
+        let removals = commands
+            .iter()
+            .filter(|c| matches!(c, PlayerCommand::RemoveRemote))
+            .count();
+        assert_eq!(removals, 1, "RemoveRemote once per load: {commands:?}");
+        let appended: usize = commands
+            .iter()
+            .filter_map(|c| match c {
+                PlayerCommand::AppendInOrder(tracks) => Some(tracks.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(appended, 3, "both pages appended in server order");
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("jellyfin: loading 3/4"),
+            "progress notice"
+        );
+
+        // Done: summary notice, receiver released.
+        tx.send(crate::jellyfin::JfMsg::Done).unwrap();
+        app.tick(Duration::ZERO);
+        assert_eq!(app.ui.notice.as_deref(), Some("jellyfin: loaded 3 tracks"));
+        assert!(app.jf_rx.is_none(), "a finished load releases the slot");
+
+        // The next load arms `RemoveRemote` again (first page of load #2).
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        app.jf_rx = Some(rx2);
+        app.jf_first_page = true;
+        tx2.send(crate::jellyfin::JfMsg::Page {
+            tracks: vec![remote_track("d")],
+            loaded: 1,
+            total: 1,
+        })
+        .unwrap();
+        app.tick(Duration::ZERO);
+        let removals = app
+            .mock_mut()
+            .commands
+            .iter()
+            .filter(|c| matches!(c, PlayerCommand::RemoveRemote))
+            .count();
+        assert_eq!(removals, 2, "one removal per reload");
+    }
+
+    #[test]
+    fn a_jellyfin_error_keeps_what_was_appended() {
+        let (mut app, _dir) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.jf_rx = Some(rx);
+        app.jf_first_page = true;
+        let before = app.snapshot.tracks.len(); // the mock's 24 fake rows
+        tx.send(crate::jellyfin::JfMsg::Page {
+            tracks: vec![remote_track("a")],
+            loaded: 1,
+            total: 10,
+        })
+        .unwrap();
+        tx.send(crate::jellyfin::JfMsg::Error(
+            "jellyfin: invalid API key".into(),
+        ))
+        .unwrap();
+        app.tick(Duration::ZERO);
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("jellyfin: invalid API key"),
+            "the worker's reason reaches the notice"
+        );
+        assert_eq!(
+            app.snapshot.tracks.len(),
+            before + 1,
+            "page 1 stays in the list"
+        );
+        assert!(app.jf_rx.is_none(), "the failed load is over");
     }
 }

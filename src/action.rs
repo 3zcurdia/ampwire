@@ -25,6 +25,8 @@ pub enum Action {
     Stop,
     Next,
     Open, // prompt for a path; replaces the playlist (plan 02)
+    /// `j`: load the whole Jellyfin library into the playlist (plan 08).
+    LoadJellyfin,
     ToggleShuffle,
     ToggleRepeat,
 
@@ -92,6 +94,7 @@ impl Action {
             Action::Stop => "stop",
             Action::Next => "next",
             Action::Open => "open",
+            Action::LoadJellyfin => "jellyfin",
             Action::ToggleShuffle => "shuffle",
             Action::ToggleRepeat => "repeat",
             Action::SeekBack => "seek_back",
@@ -174,6 +177,7 @@ impl Action {
             Action::Stop => "stop",
             Action::Next => "next track",
             Action::Open => "open / eject",
+            Action::LoadJellyfin => "load jellyfin library",
             Action::ToggleShuffle => "shuffle",
             Action::ToggleRepeat => "repeat",
             Action::SeekBack => "seek back 5s",
@@ -227,6 +231,7 @@ impl Action {
             Stop,
             Next,
             Open,
+            LoadJellyfin,
             ToggleShuffle,
             ToggleRepeat,
             SeekBack,

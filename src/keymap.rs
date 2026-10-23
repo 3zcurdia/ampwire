@@ -189,6 +189,7 @@ fn defaults() -> Vec<(Scope, Key, Action)> {
         (Scope::Global, "v", Stop),
         (Scope::Global, "b", Next),
         (Scope::Global, "l", Open),
+        (Scope::Global, "j", LoadJellyfin),
         (Scope::Global, "s", ToggleShuffle),
         (Scope::Global, "r", ToggleRepeat),
         // Volume: arrows while the player is focused, +/- anywhere
@@ -679,6 +680,8 @@ mod tests {
             (Scope::Global, press(c('v')), Action::Stop),
             (Scope::Global, press(c('b')), Action::Next),
             (Scope::Global, press(c('l')), Action::Open),
+            // Jellyfin library load (plan 08) — global, next to Open.
+            (Scope::Global, press(c('j')), Action::LoadJellyfin),
             (Scope::Global, press(c('s')), Action::ToggleShuffle),
             (Scope::Global, press(c('r')), Action::ToggleRepeat),
             // Volume: +/- anywhere
