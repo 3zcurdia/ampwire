@@ -1,6 +1,8 @@
 # Plan 06 — Real 10-band equalizer
 
-**Status:** 🟨 in progress — luis, since 2026-10-23.
+**Status:** ✅ done — 2026-10-23, f85bce3. 300 tests pass (2 `#[ignore]`d: a
+visual dump and the audio-device smoke test, which plays through the new EQ
+stage), goldens unchanged, deviations annotated at the end.
 
 Goal: the EQ panel sliders (preamp + 10 bands) actually shape the sound. The
 `on` toggle works, settings persist, and when the EQ is off or flat the audio
@@ -114,3 +116,41 @@ Moving a slider changes the sound within a frame or two, `o` toggles it, a flat/
 ## Assumptions I made (tell me to change)
 - Whole-dB steps only; Q = 1.41 on all bands; ±1.0 hard clip as the only protection.
 - `auto` (per-track EQ) is not implemented.
+
+## Deviations (annotated at the end, per plans-README rule 11)
+
+Implemented in full; every step's tests pass. The following details differ
+from (or clarify) the plan text:
+
+1. **The three stages are `Dsp::process_eq` / the tap / `Dsp::process_gain`,
+   but `process_eq` also owns the version-check + `set_gains` recompute.** The
+   plan (step 2) put the `eq_version` bump check "at the top of `process`";
+   since plan 04's tap splits the callback into two `Dsp` calls, that check
+   lives at the top of `process_eq` (the earlier of the two) so the tap and
+   the gain stage both see a consistent, already-updated EQ. `Equalizer` is
+   rebuilt only on a version bump, so the common path allocates nothing.
+2. **`equalizer.rs` already rendered the on/off state, so it was left alone**
+   (step 4's "check … if it already renders the on/off state, leave it"):
+   `on`/`auto` were painted accent-when-on / muted-when-off, and the sliders
+   were not additionally dimmed. The `o` toggle is visible via that `on`
+   label plus the config's `bit-perfect` marker clearing in the player.
+3. **`EqReset` clears all 11 values (preamp included) and does *not* turn
+   the EQ back on.** The plan said "sets all 11 values to 0" and "both call
+   `send_eq()`"; a flat-but-off EQ stays off until `o` re-enables it, which
+   is the honest reading of the two independent controls. Reset still marks
+   the config dirty, so a flat result persists.
+4. **`--demo` keeps its own `eq_on` but never ships it anywhere.** The mock
+   backend records the last `SetEq` (test-only) and ignores it otherwise, so
+   `--demo`/`--dump` behavior — including the golden frames driven by
+   `DETERMINISTIC_EQ_BANDS` — is byte-for-byte unchanged.
+5. **Manual A/B listening (step 6's last bullet) was approximated by the
+   numeric response tests, not a human.** `cargo test -- --ignored` plays a
+   fixture through the real device (proving the EQ stage doesn't break
+   playback); the +12 dB @ 1 kHz ≈ ×3.98 and 100 Hz ≈ ×1.0 assertions pin
+   the shape of the curve that "obvious bass" / "A/B change" describe. A
+   human ear-check remains worthwhile before calling the *feel* right.
+6. **Two more tests were touched beyond the plan's list:** `help_overlay_renders`
+   (its fixed 80×46 terminal no longer fits every entry now that `EqToggle`
+   and `EqReset` are in the help overlay — area raised to 80×54, no golden
+   change) and the keymap `every_plan_default_resolves` table (the two new
+   EQ keys added per rule 8).

@@ -50,7 +50,7 @@ Automatic fallbacks (never overwrite your saved preference):
 
 ## Keys
 
-Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Plan 04 made `←` / `→` (seek ±5 s) live — the clock and bars follow the audio; plan 05 made volume (`+` `-`) and balance (`[` `]`) shape the actual samples.
+Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Plan 04 made `←` / `→` (seek ±5 s) live — the clock and bars follow the audio; plan 05 made volume (`+` `-`) and balance (`[` `]`) shape the actual samples; plan 06 made the EQ real — `↑` / `↓` in the EQ panel actually reshapes the sound.
 
 | Key | Action | Scope |
 |---|---|---|
@@ -63,6 +63,8 @@ Winamp-style defaults, Space for play/pause. Every action is remappable. Since p
 | `↑` / `↓` | volume | player |
 | `↑` / `↓` | cursor | playlist |
 | `↑` / `↓` | band gain ±1 dB | eq |
+| `o` | equalizer on / off | eq |
+| `0` | reset equalizer to flat | eq |
 | `+` `=` / `-` | volume | global |
 | `[` / `]` | balance left / right | global |
 | `Enter`, `PgUp`/`PgDn`, `Home`/`End` | play under cursor, page, jump | playlist |
@@ -109,13 +111,18 @@ volume = 100               # 0–100, default 100 = unity (bit-perfect)
 balance = 0                # −100 (full left) … +100 (full right)
 swap_channels = false      # true → L/R to opposite ears (reversed-wiring headsets/DACs)
 
+[eq]                       # 10-band equalizer + preamp (dB, −12…+12); flat + on = bit-perfect
+on = true
+preamp = 0
+bands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # 60, 170, 310, 600, 1k, 3k, 6k, 12k, 14k, 16k Hz
+
 [keys]
 next = ["n"]
 ```
 
 - Load never crashes: missing/invalid config falls back to defaults with a one-line notice in the playlist border.
 - Saves use `toml_edit` (comments and formatting survive), written atomically via temp-file + rename.
-- Volume/balance changes are saved 500 ms after the last keypress (and on quit); layout hotkeys save immediately.
+- Volume/balance/EQ changes are saved 500 ms after the last keypress (and on quit); layout hotkeys save immediately.
 - If the on-disk config failed to parse, the session is read-only: layout hotkeys still work in memory but nothing is written back (`config invalid — not saving`).
 
 ## Theming
@@ -160,7 +167,8 @@ src/
     mod.rs           3-thread overview: UI thread · engine thread · cpal callback
     decoder.rs       symphonia → interleaved f32 (unit-tested on tests/fixtures/)
     engine.rs        engine thread: owns the cpal Stream + decoder, feeds the rtrb ring
-    dsp.rs           SharedParams (lock-free targets) + Dsp: smoothed volume/balance in the callback
+    dsp.rs           SharedParams (lock-free targets) + Dsp: smoothed volume/balance + the EQ stage
+    eq.rs            10-band peaking EQ (RBJ cookbook biquads + preamp), f64 state, interleaved f32
   library/
     mod.rs           audio-file scan (walkdir) + tag reading (lofty) on a thread
   player/
@@ -189,4 +197,4 @@ Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Ba
 
 ## Roadmap
 
-Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05). Next: the 10-band equalizer (plan 06). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.
+Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05), 10-band equalizer + preamp that really shapes the sound (plan 06). Next: EQ presets screen (plan 07). Still out of scope: Jellyfin client, mouse, media keys / MPRIS / Now Playing.

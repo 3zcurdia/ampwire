@@ -11,7 +11,7 @@ the earlier ones are merged.
 | [03](03-audio-playback.md) | ✅ done | Play wav/mp3/m4a/flac: play, pause, stop, next, prev, **ordered/shuffle play order** (no timer, no spectrum) | 02 |
 | [04](04-live-sync.md) | ✅ done | Real timer, seeking, FFT spectrum synced to the audio | 03 |
 | [05](05-volume-balance-format.md) | ✅ done | Volume + balance that work, format/bitrate line | 03 (04 recommended) |
-| [06](06-equalizer-dsp.md) | ⬜ not started | Real 10-band equalizer + preamp | 05 |
+| [06](06-equalizer-dsp.md) | ✅ done | Real 10-band equalizer + preamp | 05 |
 | [07](07-eq-presets.md) | ⬜ not started | Presets screen (full bass/treble, jazz, rock, …) | 06 |
 | [08](08-jellyfin.md) | ⬜ not started | Jellyfin server → playlist; temp-dir cache (3 ahead/3 behind) or HTTP streaming, optional EQ bypass | 03, 04, 05, 06 |
 
