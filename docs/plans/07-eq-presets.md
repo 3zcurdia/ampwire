@@ -1,6 +1,8 @@
 # Plan 07 — Equalizer presets screen
 
-**Status:** ⬜ not started — safe to pick up (needs plan 06 done).
+**Status:** ✅ done — 2026-10-23, bb120e1. 317 tests pass (2 `#[ignore]`d: a
+visual dump and the audio-device smoke test), goldens unchanged, deviations
+annotated at the end.
 
 Goal: press `p` to open a centered list of presets. Moving the cursor
 **previews** the preset live (the EQ sliders and the sound change), `Enter`
@@ -114,3 +116,35 @@ The behavior in the Decisions table works end to end and the three cargo checks 
 - Preset numbers are tasteful defaults, not a copy of Winamp's.
 - Applying a preset also switches the EQ on.
 - The picker does not remember the last-used preset's *name* (only the bands persist).
+
+## Deviations (annotated at the end, per plans-README rule 11)
+
+Implemented in full; every step's tests pass (317 total, goldens unchanged).
+The following details differ from (or clarify) the plan text:
+
+1. **`EqPresets` joined `Help`/`Quit` in `dispatch`'s help-overlay exception
+   list** (step 4: "opening presets closes the help overlay first"). With
+   the "any other key closes help" rule applied literally, `p` while help
+   was open would close help *and be swallowed*, needing a second press.
+   Treating `EqPresets` like `Help` lets one press close help and open the
+   picker; the rule itself is untouched for every other action.
+2. **The overlay's scroll offset is derived, not stored** (step 5: "scroll
+   like the help overlay"). The help overlay keeps `help_scroll` in
+   `UiState` because its key handler mutates it; `render` only reads
+   `&App`, so the preset picker computes `cursor - rows + 1` at draw time.
+   Same visible behavior (cursor always on screen), no extra state to keep
+   in sync.
+3. **The "key bound to `EqPresets` cancels" check resolves through the live
+   keymap** (step 4) instead of hardcoding `Char('p')`, so a `[keys]`
+   remap of `eq_presets` gets the same cancel behavior for free.
+4. **The full footer (`↑↓ preview · enter apply · esc cancel`) is currently
+   unreachable**: `WIDTH` is 30, and the plan says to shorten below 34 —
+   so the `≥ 34` branch only matters if `WIDTH` grows (or the terminal
+   clamps it wider later). The conditional was kept exactly as specified.
+5. **Method naming**: the plan's `preview()` is `preview_preset()` (and the
+   cancel path `cancel_presets()`) to match `handle_preset_key`/
+   `PresetPicker`; pure naming, no behavior change.
+6. **`●` origin marker fades with the overlay width**: the marker is
+   skipped when the inner width leaves no room for it (very narrow
+   terminals) so it can never overwrite a preset name. At the shipped
+   width it always renders.
