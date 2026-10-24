@@ -198,14 +198,6 @@ impl Track {
     pub fn is_remote(&self) -> bool {
         matches!(self.source, TrackSource::Remote { .. })
     }
-
-    /// The Jellyfin item id behind a remote track, if it is one.
-    pub fn remote_id(&self) -> Option<&str> {
-        match &self.source {
-            TrackSource::Remote { item_id, .. } => Some(item_id),
-            TrackSource::Local(_) => None,
-        }
-    }
 }
 
 /// Everything the UI needs to render the player, in one immutable snapshot.

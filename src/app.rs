@@ -336,7 +336,9 @@ impl App {
             Self::with_config_path(config, keymap, theme, false, crate::config::config_path());
         // The real session starts empty and plays for real: this backend owns
         // the engine thread (dropped → Shutdown + join, so `q` exits fast).
-        app.player = Backend::Real(RealPlayer::new());
+        // `[jellyfin]` decides whether a rolling cache directory exists.
+        let jellyfin = app.config.jellyfin.clone();
+        app.player = Backend::Real(RealPlayer::new(jellyfin.as_ref()));
         // Restore the remembered audio settings before anything plays.
         let audio = app.config.audio;
         app.player.handle(PlayerCommand::SetVolume(audio.volume));

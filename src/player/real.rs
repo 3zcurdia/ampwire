@@ -21,6 +21,9 @@ use crate::audio::{
     Analyzer, AudioOut, BANDS, Engine, EngineCmd, EngineEvent, PlaybackHandle, SEEK_UNSUPPORTED,
     SharedParams, StreamInfo, balance_to_gains, volume_to_gain,
 };
+use crate::config::{JellyfinConfig, JellyfinMode};
+use crate::jellyfin::Client;
+use crate::jellyfin::cache::{Cache, CacheEvent, compute_window};
 
 use super::order::PlayOrder;
 use super::playlist::Playlist;
@@ -79,6 +82,18 @@ pub struct RealPlayer {
     notice: Option<String>,
     /// The shuffle source (xorshift, seeded from the wall clock).
     rng: Rng,
+    /// How remote tracks are fetched (plan 08); `None` when `[jellyfin]`
+    /// is absent — no remote track can then ever reach this player.
+    jf_mode: Option<JellyfinMode>,
+    /// Rolling-window size in remote tracks (`[jellyfin] cache_ahead/behind`).
+    jf_ahead: usize,
+    jf_behind: usize,
+    /// The rolling temp-dir cache (`mode = "cache"`); `None` in the stream
+    /// modes (and in tests).
+    cache: Option<Cache>,
+    /// A remote track is waiting for its file to finish downloading (cache
+    /// mode). Cleared as soon as the download resolves or the user moves on.
+    pending_remote: Option<String>,
 }
 
 impl RealPlayer {
@@ -86,10 +101,28 @@ impl RealPlayer {
     /// The shared DSP targets are created here and cloned (`Arc`) into the
     /// engine's callback — one instance, written by this thread, read by the
     /// audio thread.
-    pub fn new() -> Self {
+    ///
+    /// `jellyfin` is the session's `[jellyfin]` config: in `cache` mode it
+    /// also creates the temp-dir window (which sweeps crash leftovers at
+    /// startup); the stream modes create no directory at all.
+    pub fn new(jellyfin: Option<&JellyfinConfig>) -> Self {
         let params = Arc::new(SharedParams::new());
         let engine = Box::new(Engine::spawn(Arc::clone(&params)));
-        Self::with_engine(engine, params)
+        let mut player = Self::with_engine(engine, params);
+        if let Some(config) = jellyfin.filter(|config| config.is_complete()) {
+            player.jf_mode = Some(config.mode);
+            player.jf_ahead = config.cache_ahead;
+            player.jf_behind = config.cache_behind;
+            if config.mode == JellyfinMode::Cache {
+                match Cache::new(Client::new(config), config.cache_dir.clone()) {
+                    Ok(cache) => player.cache = Some(cache),
+                    Err(reason) => {
+                        player.notice = Some(format!("jellyfin: cache unavailable ({reason})"))
+                    }
+                }
+            }
+        }
+        player
     }
 
     /// Same state machine over a different [`AudioOut`] (tests). The tests
@@ -120,6 +153,11 @@ impl RealPlayer {
             fail_streak: 0,
             notice: None,
             rng: Rng::new(wall_clock_seed()),
+            jf_mode: None,
+            jf_ahead: 3,
+            jf_behind: 3,
+            cache: None,
+            pending_remote: None,
         }
     }
 
@@ -354,6 +392,10 @@ impl RealPlayer {
             }
             PlayerCommand::ToggleRepeat => {
                 self.repeat = !self.repeat;
+                // The plan lists repeat toggles among the window refresh
+                // triggers; the wanted set cannot change, but recomputing
+                // it is one cheap vector.
+                self.update_cache_window();
                 self.notice = Some(
                     if self.repeat {
                         "repeat on"
@@ -395,6 +437,7 @@ impl RealPlayer {
                 EngineEvent::Error(reason) => self.on_error(reason),
             }
         }
+        self.poll_cache();
         self.update_spectrum();
     }
 
@@ -495,8 +538,12 @@ impl RealPlayer {
     /// survives a `Load` (that is what makes a paused seek race-free), so
     /// every load re-asserts the state it wants: `Pause` to stay paused,
     /// `Resume` to make sure a stale pause never mutes a fresh track.
+    ///
+    /// Remote tracks go through [`RealPlayer::start_remote`] instead: the
+    /// cache plays a local file (ready) or buffers (not ready yet), and the
+    /// stream modes ask the engine for an HTTP `Range` source.
     fn load_track(&mut self, i: usize, start: Duration, keep_paused: bool) {
-        let Some(TrackSource::Local(path)) = self
+        let Some(source) = self
             .playlist
             .tracks()
             .get(i)
@@ -511,14 +558,139 @@ impl RealPlayer {
             PlayState::Playing
         };
         // The old handle's clock dies with the old stream; the pending
-        // offset stands in until the engine reports `Started`.
+        // offset stands in until the engine reports `Started` (or, while a
+        // remote file buffers, until the cache reports `Ready`).
         self.handle = None;
         self.pending_start = Some(start);
-        self.engine.send(EngineCmd::Load { path, start });
-        if keep_paused {
-            self.engine.send(EngineCmd::Pause);
-        } else {
-            self.engine.send(EngineCmd::Resume);
+        self.pending_remote = None;
+        let engine_load = match source {
+            TrackSource::Local(path) => {
+                self.engine.send(EngineCmd::Load { path, start });
+                true
+            }
+            TrackSource::Remote { item_id, container } => {
+                self.start_remote(&item_id, container.as_deref(), start, keep_paused)
+            }
+        };
+        if engine_load {
+            if keep_paused {
+                self.engine.send(EngineCmd::Pause);
+            } else {
+                self.engine.send(EngineCmd::Resume);
+            }
+        }
+        // Every track change reshuffles the rolling window around the new
+        // current track (plan §5).
+        self.update_cache_window();
+    }
+
+    /// Start a remote (Jellyfin) track (plan 08, step 5). Cache mode: play
+    /// the local file when it is ready; otherwise show `buffering…`, keep
+    /// `state = Playing` and remember the item until its `CacheEvent`
+    /// arrives. Returns true when a `Load` went to the engine, so the
+    /// caller still re-asserts the pause state around it.
+    fn start_remote(
+        &mut self,
+        item_id: &str,
+        _container: Option<&str>,
+        start: Duration,
+        keep_paused: bool,
+    ) -> bool {
+        match self.jf_mode.unwrap_or(JellyfinMode::Cache) {
+            JellyfinMode::Cache => {
+                let Some(cache) = &self.cache else {
+                    // No window to download into (the cache dir could not be
+                    // created): stop with the reason instead of skipping
+                    // through every remote track in the list.
+                    self.stop_playback();
+                    self.notice = Some("jellyfin: cache unavailable".into());
+                    return false;
+                };
+                if let Some(path) = cache.path_if_ready(item_id) {
+                    // A local file under our own name: seek, EQ and the
+                    // spectrum tap all work unchanged.
+                    self.engine.send(EngineCmd::Load { path, start });
+                    return true;
+                }
+                self.notice = Some("buffering…".into());
+                self.pending_remote = Some(item_id.to_string());
+                let _ = keep_paused; // the state was already set by load_track
+                false
+            }
+            // Plan 08, step 6 wires the HTTP `Range` source into the engine
+            // for these two modes; until then a remote track in stream mode
+            // stops with a reason rather than pretending to play.
+            JellyfinMode::Stream | JellyfinMode::StreamPure => {
+                self.stop_playback();
+                self.notice = Some("jellyfin: streaming not available yet".into());
+                false
+            }
+        }
+    }
+
+    /// Push the current rolling window to the cache downloader: the current
+    /// remote track → the next `jf_ahead` → the previous `jf_behind`, in
+    /// *play* order (so shuffle is respected). Called after every track
+    /// change, playlist mutation and order/repeat toggle — which is also
+    /// what "a library page batch finished" becomes, since each page lands
+    /// as an `AppendInOrder` mutation.
+    fn update_cache_window(&self) {
+        if self.cache.is_none() {
+            return;
+        }
+        let wanted = compute_window(
+            &self.order,
+            self.playlist.tracks(),
+            self.playlist.current(),
+            self.jf_ahead,
+            self.jf_behind,
+        );
+        if let Some(cache) = &self.cache {
+            cache.set_window(wanted);
+        }
+    }
+
+    /// Drain downloader events (plan §5): the `Ready` of the track we are
+    /// waiting on becomes the engine `Load`, a `Failed` takes the plan-03
+    /// error/skip path, and anything else is a prefetch result the cache
+    /// already recorded — ignored here.
+    fn poll_cache(&mut self) {
+        let events = match self.cache.as_mut() {
+            Some(cache) => cache.poll(),
+            None => return,
+        };
+        for event in events {
+            self.handle_cache_event(event);
+        }
+    }
+
+    /// Apply one downloader event (split out of [`RealPlayer::poll_cache`]
+    /// so the state machine is testable without a server).
+    fn handle_cache_event(&mut self, event: CacheEvent) {
+        match event {
+            CacheEvent::Ready { item_id, path } => {
+                if self.pending_remote.as_deref() != Some(item_id.as_str()) {
+                    return; // stale: the user already moved on
+                }
+                let start = self.pending_start.unwrap_or(Duration::ZERO);
+                let keep_paused = self.state == PlayState::Paused;
+                self.pending_remote = None;
+                self.engine.send(EngineCmd::Load { path, start });
+                if keep_paused {
+                    self.engine.send(EngineCmd::Pause);
+                } else {
+                    self.engine.send(EngineCmd::Resume);
+                }
+            }
+            CacheEvent::Failed { item_id, error } => {
+                if self.pending_remote.as_deref() != Some(item_id.as_str()) {
+                    return;
+                }
+                self.pending_remote = None;
+                // Plan-03 path: "skipped …: reason", or give up when the
+                // failures span the playlist.
+                self.on_error(error);
+            }
         }
     }
 
@@ -529,6 +701,9 @@ impl RealPlayer {
         self.format = FormatInfo::blank();
         self.handle = None;
         self.pending_start = None;
+        // Nothing is playing, so nothing waits for a download either: a
+        // late `Ready` for it must be ignored, not loaded.
+        self.pending_remote = None;
     }
 
     /// Smooth the analyzer's band levels into the bars (plan §step 6):
@@ -582,17 +757,19 @@ impl RealPlayer {
     }
 
     /// Keep the play order in step with the playlist (and the shuffle flag)
-    /// after any edit or shuffle toggle.
+    /// after any edit or shuffle toggle — and the cache window in step with
+    /// both (it follows *play* order, plan 08).
     fn rebuild_order(&mut self) {
         let current = self.playlist.current();
         self.order
             .rebuild(self.playlist.len(), current, self.shuffle, &mut self.rng);
+        self.update_cache_window();
     }
 }
 
 impl Default for RealPlayer {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -1491,5 +1668,198 @@ mod tests {
             "stopped zeroes"
         );
         assert!(snapshot.peaks.iter().all(|v| *v == 0.0));
+    }
+
+    // --- cache mode: buffering, ready and failure (plan 08, step 5) ---
+
+    /// A remote (Jellyfin) track for the mixed-list tests.
+    fn remote_track(id: &str) -> Track {
+        Track {
+            id: Track::next_id(),
+            source: TrackSource::Remote {
+                item_id: id.to_string(),
+                container: Some("flac".into()),
+            },
+            artist: Some("A".into()),
+            title: Some(format!("R {id}")),
+            duration: None,
+            bitrate_kbps: None,
+        }
+    }
+
+    /// A client for a server that answers nothing (no window is ever
+    /// *really* downloaded in these state-machine tests — events are
+    /// injected through `handle_cache_event`).
+    fn idle_client() -> Client {
+        Client::new(&JellyfinConfig {
+            url: "http://127.0.0.1:9".into(),
+            api_key: "k".into(),
+            user: None,
+            mode: JellyfinMode::Cache,
+            cache_ahead: 3,
+            cache_behind: 3,
+            cache_dir: None,
+            notice: None,
+        })
+    }
+
+    /// `(player, …)` with a real (idle) cache directory under `dir`.
+    fn cached_player(dir: &tempfile::TempDir) -> Harness {
+        let (mut player, cmds, events, params) = fake_player();
+        player.cache =
+            Some(Cache::new(idle_client(), Some(dir.path().to_path_buf())).expect("cache dir"));
+        player.jf_mode = Some(JellyfinMode::Cache);
+        (player, cmds, events, params)
+    }
+
+    #[test]
+    fn a_ready_cache_file_plays_and_seeks_like_a_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = cached_player(&dir);
+        let path = dir.path().join("abc.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player
+            .cache
+            .as_mut()
+            .unwrap()
+            .insert_ready("abc", path.clone());
+
+        player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
+        player.handle(PlayerCommand::Play);
+        assert_eq!(
+            load_paths(&cmds),
+            [path.clone()],
+            "a cache hit is a plain local Load"
+        );
+        assert_eq!(player.state, PlayState::Playing);
+        assert_eq!(
+            player.take_notice(),
+            None,
+            "ready at once: no buffering notice"
+        );
+
+        // Seeking is a normal local-file seek from here on.
+        player.handle(PlayerCommand::SeekBy(5));
+        assert_eq!(
+            loads_of(&cmds).last(),
+            Some(&(path, Duration::from_secs(5)))
+        );
+    }
+
+    #[test]
+    fn a_remote_track_buffers_until_the_cache_reports_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = cached_player(&dir);
+        player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
+        player.handle(PlayerCommand::AddTracks(tracks(1)));
+
+        player.handle(PlayerCommand::PlayTrack(0));
+        assert_eq!(player.state, PlayState::Playing, "playing while buffering");
+        assert_eq!(
+            player.take_notice().as_deref(),
+            Some("buffering…"),
+            "the user sees why there is no sound yet"
+        );
+        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+        assert!(load_paths(&cmds).is_empty(), "nothing sent to the engine");
+
+        // Paused while buffering: the Ready load re-asserts the pause.
+        player.handle(PlayerCommand::Pause);
+        assert_eq!(player.state, PlayState::Paused);
+
+        // The downloader finishes the file.
+        let path = dir.path().join("abc.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player.handle_cache_event(CacheEvent::Ready {
+            item_id: "abc".into(),
+            path: path.clone(),
+        });
+        assert_eq!(load_paths(&cmds), [path], "Load once the file exists");
+        assert!(
+            matches!(log_of(&cmds).last(), Some(EngineCmd::Pause)),
+            "the pause survives the deferred load: {cmds:?}",
+            cmds = log_of(&cmds)
+        );
+        assert_eq!(player.pending_remote, None, "no longer waiting");
+        assert_eq!(player.state, PlayState::Paused);
+    }
+
+    #[test]
+    fn a_ready_for_another_item_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = cached_player(&dir);
+        player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
+        player.handle(PlayerCommand::Play);
+        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+
+        let other = dir.path().join("zzz.flac");
+        std::fs::write(&other, b"pretend flac").unwrap();
+        player.handle_cache_event(CacheEvent::Ready {
+            item_id: "zzz".into(),
+            path: other,
+        });
+        assert!(
+            load_paths(&cmds).is_empty(),
+            "a prefetch finishing must not interrupt the buffering track"
+        );
+        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_failed_download_takes_the_skip_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = cached_player(&dir);
+        player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
+        player.handle(PlayerCommand::AddTracks(tracks(2)));
+        player.handle(PlayerCommand::Play);
+        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+
+        player.handle_cache_event(CacheEvent::Failed {
+            item_id: "abc".into(),
+            error: "jellyfin: cannot reach server".into(),
+        });
+        assert_eq!(
+            player.take_notice().as_deref(),
+            Some("skipped A - R abc: jellyfin: cannot reach server"),
+            "plan-03 error path with the reason kept"
+        );
+        assert_eq!(load_paths(&cmds).last(), Some(&PathBuf::from("/m/0.flac")));
+        assert_eq!(player.state, PlayState::Playing, "moved on to the next");
+        assert_eq!(player.pending_remote, None);
+
+        // A late `Ready` for the abandoned item changes nothing.
+        player.handle_cache_event(CacheEvent::Ready {
+            item_id: "abc".into(),
+            path: dir.path().join("abc.flac"),
+        });
+        assert_eq!(
+            load_paths(&cmds).len(),
+            1,
+            "only the skip's load: the stale Ready adds nothing"
+        );
+    }
+
+    #[test]
+    fn stop_while_buffering_makes_a_late_ready_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = cached_player(&dir);
+        player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
+        player.handle(PlayerCommand::Play);
+        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+
+        player.handle(PlayerCommand::Stop);
+        assert_eq!(player.state, PlayState::Stopped);
+        assert_eq!(player.pending_remote, None, "nothing waits after Stop");
+
+        let path = dir.path().join("abc.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player.handle_cache_event(CacheEvent::Ready {
+            item_id: "abc".into(),
+            path,
+        });
+        assert!(
+            load_paths(&cmds).is_empty(),
+            "a stale Ready must never start playback"
+        );
     }
 }
