@@ -1,6 +1,8 @@
 # Plan 09 — Gapless playback (keep the stream open across tracks)
 
-**Status:** ⬜ not started
+**Status:** ✅ done — 2026-10-23, 5c633f2. 392 tests pass (4 `#[ignore]`d: a
+visual dump, the two audio-device smokes — both run manually here and green —
+and the real-server Jellyfin smoke).
 
 Goal: when one track ends and the next one has the **same sample rate and
 channel count**, the next track's first sample follows the previous track's
@@ -85,3 +87,97 @@ reopen gap), and the three cargo checks pass.
 - `stream*` modes get the same treatment (the next `HttpRangeSource` is
   probed ahead, which also hides its round trip).
 - Encoder delay/padding is left to symphonia's defaults in this plan.
+
+## Deviations (annotated during implementation, 2026-10-23)
+
+All eight steps shipped as written; these are the places where the code
+diverges from — or extends — the literal text above.
+
+1. **`Queue`'s payload** — the plan specifies `Queue { source, start: ZERO }`;
+   the built-in command is `Queue { source, start, eq_bypass }`. `start` is
+   there (and honoured by the pre-open) but always `Duration::ZERO` today; the
+   `eq_bypass: bool` is step 6's "the bypass flag moves into the queued item"
+   made explicit on the wire.
+2. **`QueueSource`, not `TrackSource`** — `source` is a new engine-owned enum
+   (`Local(PathBuf)` / `Remote { item_id, container }`) instead of the player's
+   `TrackSource`, so `audio` never depends on `player` and carries no playlist
+   state.
+3. **The compatibility check runs at `Queue` time, not at EOF** (step 3 puts it
+   on the decoder's `Ok(false)`). `Feeder::queue` compares the next track's
+   rate/channels against the current decoder's — the current format cannot
+   change mid-stream, so the information is identical, and an incompatible
+   track is dropped from the queue up front (its decoder is probed, then
+   released). `switch_next` then swaps whatever is queued unconditionally.
+   Observable behaviour matches the plan: incompatible → today's EOF → drain →
+   `Finished` → the UI's normal reopen.
+4. **A no-`Range` server queues nothing instead of erroring** (plan silent).
+   If `HttpRangeSource::open` returns `NoRanges` for the *queued* track, the
+   queue is silently dropped, so after the drain the normal `LoadRemote` →
+   `Buffering` → whole-file download path plays it exactly as before. Holding
+   it as a boundary `Error` would have *skipped* the track — a regression
+   against plan 08.
+5. **Repeat wraps stay non-gapless.** The plan lists "repeat-one-track and
+   end-of-order (no repeat)" as queue-nothing; in this codebase repeat is a
+   bool and `PlayOrder::upcoming` never wraps, so a repeat *wrap* (the cursor
+   at the end with repeat on) also queues nothing and reopens the device. In
+   shuffle + repeat at the end, `order.next` reshuffles anyway, so the next
+   track is genuinely unknowable — queueing it would guess.
+6. **`stream_pure` keeps two flip sites, only one moved.** Step 6 says "move
+   `set_eq_bypass` to the boundary" — done for the gapless path (the engine
+   flips the shared flag when it swaps decoders, carrying the queued track's
+   flag). The `Load` path still sets it in `load_track`: format changes, seeks
+   and non-remote transitions have no boundary, and there the UI's `Load` *is*
+   the track change. Both write the same atomic; they can never disagree
+   because a `Load` drops the queue that would have used the other one.
+7. **`start_offset = 0` after the crossing lives in the UI** (step 4's wording
+   implies a handle mutation, but `PlaybackHandle` is shared and immutable
+   once sent). `RealPlayer` gained `track_base` (frames) and
+   `track_start_offset`: `position = track_start_offset + (played −
+   track_base) / rate`, both reset at the crossing — so the new track's clock
+   is exactly frame-relative to the boundary, while the engine's handle keeps
+   counting the whole stream.
+8. **Cache-mode queue needs the file ready.** The plan says the engine opens
+   the "cache path" on `Queue`; if the next remote track is still downloading,
+   the UI queues nothing (`upcoming(1)` resolves through
+   `Cache::path_if_ready`) and the normal buffering path takes over at the
+   boundary. A downloaded file queues as a plain local path.
+9. **Step 1's test uses a generic cache, not a device seam.** cpal offers no
+   seam to fake `supported_output_configs()`, so the cache is `Cached<T>` with
+   a `queries` counter: the pure test proves "two starts query once,
+   invalidate re-queries" without hardware; the device itself is only touched
+   by the `#[ignore]`d tests.
+10. **The device test asserts the boundary, not raw frames.** The plan's "no
+    zero frames between them" is proven sample-*exactly* by
+    `feed_switches_decoders_without_a_gap` (the ring output is compared
+    byte-for-byte against standalone decodes of A and B — A's last sample
+    directly followed by B's first). The `#[ignore]`d
+    `two_tones_play_back_to_back_through_one_stream` proves the same wiring on
+    real hardware (Started → Advanced → Finished on one stream, boundary
+    recorded) — the sample tap can't be used for that check because it drops
+    samples when nothing drains it. **Both ignored device tests were run
+    manually during this implementation and pass.**
+11. **A `Queue` arriving after the current decoder already hit EOF** (an order
+    change in the final milliseconds) cannot switch: the read that set EOF has
+    already run. The drain takes the normal `Finished` path — correct, just
+    not gapless for that one race.
+12. **Symphonia gapless verification** (the Files section's ask): symphonia
+    0.6.1's `AudioDecoderOptions::default()` sets `gapless: true`, and the MP3
+    decoder trims LAME delay/padding per packet (`buf.trim(trim_start,
+    trim_end)`) — MP3 is gapless to the encoder's own trimming. AAC-in-MP4
+    does **no** gapless trimming (the isomp4 reader keeps the encoder priming;
+    +6.8 % on the 0.5 s AAC fixture, pinned by an existing `decoder.rs` test) —
+    noted here per the plan's "note it if MP3/AAC gaps remain audible", left
+    to symphonia as assumed.
+13. **`src/audio/decoder.rs` needed no changes**, as the plan expected; the
+    new decode-side state moved into `audio::engine::Feeder` instead (the
+    plan's `Playing::feed` is now `Feeder::feed`, split out so the switch is
+    unit-testable without a cpal `Stream`, which is `!Send` and needs real
+    hardware).
+
+**Done-when check:** two consecutive same-format local tracks play with no
+silent frames between them (sample-exact unit test + the on-hardware two-tone
+test); cache-mode remote tracks queue as soon as their file is ready
+(`path_if_ready` → `QueueSource::Local`); format changes still play through
+the old reopen path (incompatible-queue test + the existing `pick_config`
+behaviour, now served from the device cache); `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings` and `cargo test` all pass.
