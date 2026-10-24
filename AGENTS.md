@@ -1,7 +1,8 @@
-# Ampwire — terminal Winamp 2.0 replica with modern hi-fi playback
+# Ampwire — terminal player inspired by Winamp 2, with modern hi-fi playback
 
-Goal: retro Winamp 2.x UI/feel in the terminal (Ratatui), but with real modern
-playback: local lossless files + Jellyfin server streaming.
+Goal: a UI/feel **inspired by Winamp 2**, implemented from scratch for the
+terminal (Ratatui) — not a port, clone or replica of Winamp — but with real
+modern playback: local lossless files + Jellyfin server streaming.
 
 ## Toolchain
 
@@ -30,6 +31,7 @@ playback: local lossless files + Jellyfin server streaming.
 
 - Ratatui 0.30 requires explicit `Terminal::draw` + crossterm event polling; there is no framework auto-refresh.
 - `cpal` is wired up: Linux builds need the ALSA dev headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS CoreAudio needs no extra setup. The cpal `Stream` is `!Send` on macOS — keep it on the engine thread (`src/audio/engine.rs`).
+- Platforms: **Linux and macOS are supported and tested; Windows is untested** (never built, never run — no CI, no WASAPI verification). Treat Windows as unsupported: the device + `supported_output_configs()` cache, the exact-rate-only playback rule (Windows shared-mode devices usually expose only 44.1/48 kHz) and the device names in error notices were written for ALSA/CoreAudio. The POSIX permission bits (`0600` config, `0700` Jellyfin cache dir) are `cfg(unix)`-guarded, so they compile elsewhere but do nothing.
 - Sync (plan 04): the clock is **frames played**, not wall time — the audio callback counts what it really pops (whole frames only, one `read_chunk` per callback: a half frame left by the producer waits in the ring, so an underrun can never rotate the channels) into an `AtomicU64` (pausing/buffering freezes it for free), and taps one mono sample per frame into a second small `rtrb` ring. The FFT (`src/audio/analysis.rs`) runs on the UI thread inside `RealPlayer::tick` over that tap — never on the audio thread, which stays atomics-and-ring-buffers only. Seeking reloads the stream at an offset (`Decoder::open_at`); the engine's pause flag survives a `Load`, so every load re-asserts Pause/Resume right after it.
 - Gapless (plan 09): `RealPlayer` sends `EngineCmd::Queue { source, start: 0, eq_bypass }` for `order.upcoming(1)` right after every `Started` and every boundary crossing, and re-sends (or `Unqueue`s) on every order change — end of order, a repeat *wrap* and a stopped player queue nothing. The engine pre-opens that decoder on the engine thread (local file, cache path or `HttpRangeSource` — a no-`Range` server queues nothing and keeps the download path), and at the current decoder's EOF swaps it into the **same** stream/ring/DSP when its rate and channels match (incompatible → not queued → today's `Finished` → UI reopen). The switch records `PlaybackHandle::boundary` (frames pushed) *before* `EngineEvent::Advanced(StreamInfo)`; `RealPlayer::check_boundary` moves `current`/clock base/format only when `played >= boundary` — never when the event arrives (it can precede the audio by the ring's length) — then re-queues the following track. A queued track that fails to open is **held** and sent as `Error` at the drain (the skip path stays unchanged). Every `Load`/`LoadRemote`/`Stop` drops the queue with its stream. The cpal device + `supported_output_configs()` are cached on the engine thread (`Cached<DeviceData>`), invalidated on a device error or a config miss (one re-query retry).
 - DSP chain order (plan 06): decode → **EQ** (`Dsp::process_eq`) → spectrum tap → volume/balance (`Dsp::process_gain`) → device. The tap therefore shows the *shaped* signal; both stages run over exactly the frames really popped, never the callback's padding silence.

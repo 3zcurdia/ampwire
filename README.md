@@ -1,8 +1,8 @@
 # Ampwire
 
-Terminal Winamp 2.0 replica with modern hi-fi playback.
+A terminal player **inspired by Winamp 2**, implemented from scratch for the terminal — with modern hi-fi playback.
 
-Retro Winamp anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look.
+It borrows Winamp 2's anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look. It is *not* a port, clone or replica of Winamp: the UI, the playback engine and the library handling are all written for the terminal from scratch.
 
 > Status: Phase 6 — **Jellyfin.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track — **gapless** between same-format tracks (plan 09), ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume (`+`/`-`/`↑↓`) and balance (`[`/`]`) shape what you hear and are remembered across restarts; at 100 % / centered the samples stay bit-perfect. The format line reads `FLAC 24/96 stereo` / `MP3 320kbps 44.1kHz stereo`. With a `[jellyfin]` section in the config, `j` fetches your **whole server library** into the playlist (progressively, while the UI stays responsive) and plays it — downloaded to a rolling temp-dir cache, or streamed over HTTP `Range` requests (`stream_pure` bypasses the EQ for that path). `--demo` / `--dump` keep the mock player.
 
@@ -19,6 +19,16 @@ cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 ```
 
 `--dump` never enters raw mode or the alternate screen. Useful sizes used in tests: `40x3`, `52x12`, `80x24`, `104x18`, `160x45` (see `tests/golden/`).
+
+## Platform support
+
+| Platform | Status | Notes |
+|---|---|---|
+| **Linux** | ✅ works | Audio via ALSA — build needs the ALSA development headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch). |
+| **macOS** | ✅ works | Audio via CoreAudio, no extra setup. |
+| **Windows** | ⚠️ **untested** | The code has never been built or run on Windows, so it may not even compile there. Treat it as unsupported for now. |
+
+Only Linux and macOS are supported today. Windows is **not tested** — the project has never been built or run there, so it may not even compile, and the audio path is unverified. If you try it, expect to have to fix: the cpal/WASAPI output device (the device + `supported_output_configs()` cache and the exact-rate matching are written for the ALSA/CoreAudio backends), the device names in error notices, and the playback rule itself — Windows shared-mode devices usually expose only a couple of sample rates (44.1/48 kHz), and ampwire never resamples, so anything else is reported as unplayable. The POSIX-specific bits (config file mode `0600`, Jellyfin cache dir mode `0700`) are `cfg(unix)`-guarded, so they compile everywhere but are a no-op off unix.
 
 ## Playback
 
@@ -56,7 +66,7 @@ Automatic fallbacks (never overwrite your saved preference):
 
 ## Keys
 
-Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Plan 04 made `←` / `→` (seek ±5 s) live — the clock and bars follow the audio; plan 05 made volume (`+` `-`) and balance (`[` `]`) shape the actual samples; plan 06 made the EQ real — `↑` / `↓` in the EQ panel actually reshapes the sound; plan 08 made `j` fetch the whole Jellyfin library in the background.
+Winamp-inspired defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Plan 04 made `←` / `→` (seek ±5 s) live — the clock and bars follow the audio; plan 05 made volume (`+` `-`) and balance (`[` `]`) shape the actual samples; plan 06 made the EQ real — `↑` / `↓` in the EQ panel actually reshapes the sound; plan 08 made `j` fetch the whole Jellyfin library in the background.
 
 | Key | Action | Scope |
 |---|---|---|
@@ -172,7 +182,7 @@ Notes:
 - Run the TUI only in a real TTY; output under pipes/CI is garbage.
 - `crossterm` is imported as `ratatui::crossterm` — no direct dependency.
 - `Cargo.lock` is committed (binary crate).
-- Audio on Linux builds against ALSA (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS needs nothing. `cargo test` never opens a sound card — the end-to-end device test is `#[ignore]`d: `cargo test -- --ignored` (it plays an audible tone). Plain `cargo test` also stays off the network (its "HTTP server" is a `TcpListener` on `127.0.0.1:0`).
+- Audio on Linux builds against ALSA (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS needs nothing. **Windows is untested** — the suite has never been run there and the WASAPI path is unverified, so treat Windows as unsupported (see [Platform support](#platform-support)). `cargo test` never opens a sound card — the end-to-end device test is `#[ignore]`d: `cargo test -- --ignored` (it plays an audible tone). Plain `cargo test` also stays off the network (its "HTTP server" is a `TcpListener` on `127.0.0.1:0`).
 - The Jellyfin path has its own scripted "manual" test against a **real** server — it downloads a cache window, streams + decodes over `Range`, and plays one remote track through the engine (audible for a moment): `AMWIRE_JELLYFIN_URL=… AMWIRE_JELLYFIN_API_KEY=… cargo test -- --ignored jellyfin_real_server`.
 - Silent playback on a device? `cargo run --example devices` lists every output device with the channel counts and sample rates it advertises — ampwire plays a track only at an *exact* match on the default device (no resampling, no fallback), so a `no playable tracks: <device>: cannot play 96000 Hz 2ch` notice means the file's rate isn't in that list.
 

@@ -2,6 +2,7 @@
 name = "ampwire"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal player inspired by Winamp 2, implemented from scratch for the terminal"
 
 [dependencies]
 cpal = "0.18.2"

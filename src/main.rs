@@ -1,4 +1,5 @@
-//! Ampwire: a terminal Winamp 2.0 replica with modern hi-fi playback.
+//! Ampwire: a terminal player inspired by Winamp 2, implemented from scratch
+//! for the terminal, with modern hi-fi playback.
 //!
 //! Non-demo sessions play for real (plan 03: `crate::audio` decodes and the
 //! `player::real` backend drives it); `--demo`, `--dump` and the tests keep
