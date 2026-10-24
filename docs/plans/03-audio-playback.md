@@ -283,3 +283,12 @@ Annotated here as plan 02 did (two items were confirmed with the user first):
    `usize::MAX` for "nothing current", `prev()` with nothing current returns
    the first track, and `upcoming`/`previous` are `#[allow(dead_code)]` until
    plan 08 consumes them (they are unit-tested now).
+
+## Post-audit change (2026-10-23)
+
+"After every playlist mutation rebuild the order" now applies to ordered
+mode only. In shuffle mode, edits patch the permutation instead
+(`PlayOrder::appended` / `removed` / `swapped`): history, the current track
+and the queued order survive, so a Jellyfin page or a `Del` no longer
+reshuffles everything (and the plan-08 cache window stops churning). A
+shuffle toggle, `ReplaceTracks` and `ClearPlaylist` still rebuild.

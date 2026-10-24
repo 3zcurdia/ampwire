@@ -18,12 +18,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::audio::{
-    Analyzer, AudioOut, BANDS, Engine, EngineCmd, EngineEvent, PlaybackHandle, SEEK_UNSUPPORTED,
-    SharedParams, StreamInfo, balance_to_gains, volume_to_gain,
+    Analyzer, AudioOut, BANDS, Engine, EngineCmd, EngineEvent, PlayError, PlaybackHandle,
+    SharedParams, StreamInfo, StreamSetup, balance_to_gains, volume_to_gain,
 };
 use crate::config::{JellyfinConfig, JellyfinMode};
-use crate::jellyfin::Client;
-use crate::jellyfin::cache::{Cache, CacheEvent, compute_window};
+use crate::jellyfin::cache::{Cache, CacheEvent, STALE_AGE, compute_window, sweep_stale_dirs};
+use crate::jellyfin::{Client, ItemId};
 
 use super::order::PlayOrder;
 use super::playlist::Playlist;
@@ -93,7 +93,7 @@ pub struct RealPlayer {
     cache: Option<Cache>,
     /// A remote track is waiting for its file to finish downloading (cache
     /// mode). Cleared as soon as the download resolves or the user moves on.
-    pending_remote: Option<String>,
+    pending_remote: Option<ItemId>,
     /// `stream pure: eq bypassed` was already shown this session (plan 08:
     /// notice once, not on every track change).
     jf_pure_notice_shown: bool,
@@ -105,18 +105,28 @@ impl RealPlayer {
     /// engine's callback — one instance, written by this thread, read by the
     /// audio thread.
     ///
-    /// `jellyfin` is the session's `[jellyfin]` config: in `cache` mode it
-    /// also creates the temp-dir window (which sweeps crash leftovers at
-    /// startup); the stream modes create no directory at all.
+    /// `jellyfin` is the session's `[jellyfin]` config: crash leftovers
+    /// (`ampwire-jellyfin-<pid>` older than 24 h) are swept at startup in
+    /// every mode; `cache` mode also creates the temp-dir window, and the
+    /// stream modes create a directory only if a server forces the no-`Range`
+    /// fallback.
     pub fn new(jellyfin: Option<&JellyfinConfig>) -> Self {
         let params = Arc::new(SharedParams::new());
         let config = jellyfin.filter(|config| config.is_complete());
+        if let Some(config) = config {
+            let parent = config.cache_dir.clone().unwrap_or_else(std::env::temp_dir);
+            sweep_stale_dirs(&parent, STALE_AGE);
+        }
         // The engine holds the client for `stream*` modes (it builds the
         // HTTP source itself, so credentials never reach a `Track`) and
         // doubles its ring buffer when streaming (plan 08, step 6).
-        let client = config.map(Client::new);
-        let streaming = config.is_some_and(|config| config.mode != JellyfinMode::Cache);
-        let engine = Box::new(Engine::spawn(Arc::clone(&params), client, streaming));
+        let stream = config
+            .filter(|config| config.mode != JellyfinMode::Cache)
+            .map(|config| StreamSetup {
+                client: Client::new(config),
+                fallback_parent: config.cache_dir.clone(),
+            });
+        let engine = Box::new(Engine::spawn(Arc::clone(&params), stream));
         let mut player = Self::with_engine(engine, params);
         if let Some(config) = config {
             player.jf_mode = Some(config.mode);
@@ -242,21 +252,36 @@ impl RealPlayer {
     pub fn handle(&mut self, cmd: PlayerCommand) {
         // Playlist-mutating commands work even when the list is empty.
         match cmd {
+            // Edits keep a running shuffle's order (audit P3): `appended`,
+            // `removed` and `swapped` patch the permutation instead of
+            // reshuffling it; replace/clear/toggle still rebuild.
             PlayerCommand::AddTracks(new) => {
                 self.playlist.append_sorted(new);
-                self.rebuild_order();
+                self.order
+                    .appended(self.playlist.len(), self.playlist.current(), &mut self.rng);
+                self.update_cache_window();
                 return;
             }
             PlayerCommand::AppendInOrder(new) => {
                 self.playlist.append_in_order(new);
-                self.rebuild_order();
+                self.order
+                    .appended(self.playlist.len(), self.playlist.current(), &mut self.rng);
+                self.update_cache_window();
                 return;
             }
             PlayerCommand::RemoveRemote => {
                 // Reload rule (plan 08): drop the old remote batch; stop if
                 // one of them was playing (mirrors `RemoveTrack`).
+                let removed: Vec<bool> = self
+                    .playlist
+                    .tracks()
+                    .iter()
+                    .map(Track::is_remote)
+                    .collect();
                 let was_current = self.playlist.remove_where(|track| track.is_remote());
-                self.rebuild_order();
+                self.order
+                    .removed(&removed, self.playlist.current(), &mut self.rng);
+                self.update_cache_window();
                 if was_current {
                     self.stop_playback();
                 }
@@ -276,8 +301,14 @@ impl RealPlayer {
                 return;
             }
             PlayerCommand::RemoveTrack(i) => {
+                let mut removed = vec![false; self.playlist.len()];
+                if let Some(slot) = removed.get_mut(i) {
+                    *slot = true;
+                }
                 let was_current = self.playlist.remove(i);
-                self.rebuild_order();
+                self.order
+                    .removed(&removed, self.playlist.current(), &mut self.rng);
+                self.update_cache_window();
                 if was_current {
                     self.stop_playback();
                 }
@@ -290,12 +321,16 @@ impl RealPlayer {
                 return;
             }
             PlayerCommand::MoveTrack { from, up } => {
-                if up {
-                    self.playlist.move_up(from);
+                let to = if up {
+                    self.playlist.move_up(from)
                 } else {
-                    self.playlist.move_down(from);
+                    self.playlist.move_down(from)
+                };
+                if let Some(to) = to {
+                    self.order
+                        .swapped(from, to, self.playlist.current(), &mut self.rng);
+                    self.update_cache_window();
                 }
-                self.rebuild_order();
                 return;
             }
             // Volume/balance/swap/EQ work even with an empty playlist (they
@@ -533,12 +568,15 @@ impl RealPlayer {
     /// A track could not be played: notice + skip to the next one, or stop
     /// once the failures span the whole playlist. A failed *seek* is not a
     /// bad file: restart the same track from 0 with a notice instead.
-    fn on_error(&mut self, reason: String) {
-        if reason == SEEK_UNSUPPORTED {
-            self.notice = Some("seek not supported for this file".into());
-            self.reload_current();
-            return;
-        }
+    fn on_error(&mut self, error: PlayError) {
+        let reason = match error {
+            PlayError::SeekUnsupported => {
+                self.notice = Some("seek not supported for this file".into());
+                self.reload_current();
+                return;
+            }
+            PlayError::Failed(reason) => reason,
+        };
         self.fail_streak += 1;
         let name = self
             .playlist
@@ -642,7 +680,7 @@ impl RealPlayer {
     /// caller still re-asserts the pause state around it.
     fn start_remote(
         &mut self,
-        item_id: &str,
+        item_id: &ItemId,
         container: Option<&str>,
         start: Duration,
         keep_paused: bool,
@@ -664,7 +702,7 @@ impl RealPlayer {
                     return true;
                 }
                 self.notice = Some("buffering…".into());
-                self.pending_remote = Some(item_id.to_string());
+                self.pending_remote = Some(item_id.clone());
                 let _ = keep_paused; // the state was already set by load_track
                 false
             }
@@ -673,7 +711,7 @@ impl RealPlayer {
             // probe blocks it for a round trip.
             JellyfinMode::Stream | JellyfinMode::StreamPure => {
                 self.engine.send(EngineCmd::LoadRemote {
-                    item_id: item_id.to_string(),
+                    item_id: item_id.clone(),
                     container: container.map(str::to_string),
                     start,
                 });
@@ -723,7 +761,7 @@ impl RealPlayer {
     fn handle_cache_event(&mut self, event: CacheEvent) {
         match event {
             CacheEvent::Ready { item_id, path } => {
-                if self.pending_remote.as_deref() != Some(item_id.as_str()) {
+                if self.pending_remote.as_ref() != Some(&item_id) {
                     return; // stale: the user already moved on
                 }
                 let start = self.pending_start.unwrap_or(Duration::ZERO);
@@ -737,13 +775,13 @@ impl RealPlayer {
                 }
             }
             CacheEvent::Failed { item_id, error } => {
-                if self.pending_remote.as_deref() != Some(item_id.as_str()) {
+                if self.pending_remote.as_ref() != Some(&item_id) {
                     return;
                 }
                 self.pending_remote = None;
                 // Plan-03 path: "skipped …: reason", or give up when the
                 // failures span the playlist.
-                self.on_error(error);
+                self.on_error(PlayError::Failed(error));
             }
         }
     }
@@ -1182,7 +1220,7 @@ mod tests {
         queue(&events, fake_started_at(10 * 44_100));
         player.tick(Duration::ZERO);
         player.handle(PlayerCommand::SeekBy(5));
-        queue(&events, EngineEvent::Error(SEEK_UNSUPPORTED.into()));
+        queue(&events, EngineEvent::Error(PlayError::SeekUnsupported));
         player.tick(Duration::ZERO);
         assert_eq!(
             player.take_notice().as_deref(),
@@ -1731,7 +1769,7 @@ mod tests {
         Track {
             id: Track::next_id(),
             source: TrackSource::Remote {
-                item_id: id.to_string(),
+                item_id: id.into(),
                 container: Some("flac".into()),
             },
             artist: Some("A".into()),
@@ -1744,10 +1782,125 @@ mod tests {
     /// A client for a server that answers nothing (no window is ever
     /// *really* downloaded in these state-machine tests — events are
     /// injected through `handle_cache_event`).
+    /// The track ids along the play order: what already played (up to and
+    /// including the current track), and what is queued after it.
+    fn shuffle_view(player: &RealPlayer) -> (Vec<u64>, Vec<u64>) {
+        let tracks = player.playlist.tracks();
+        let len = tracks.len();
+        let mut played: Vec<u64> = player
+            .order
+            .previous(len)
+            .iter()
+            .rev()
+            .map(|&i| tracks[i].id)
+            .collect();
+        if let Some(current) = player.playlist.current() {
+            played.push(tracks[current].id);
+        }
+        let upcoming = player
+            .order
+            .upcoming(len)
+            .iter()
+            .map(|&i| tracks[i].id)
+            .collect();
+        (played, upcoming)
+    }
+
+    /// Audit P3: in shuffle, editing the playlist must not reshuffle what is
+    /// already queued — history, the current track and the upcoming order
+    /// survive appends (each Jellyfin page is one), removals and moves, so
+    /// the Jellyfin cache window does not churn.
+    #[test]
+    fn shuffle_keeps_its_order_across_playlist_edits() {
+        let (mut player, ..) = fake_player();
+        player.handle(PlayerCommand::AddTracks(tracks(12)));
+        player.handle(PlayerCommand::ToggleShuffle);
+        player.handle(PlayerCommand::Play);
+        player.handle(PlayerCommand::Next);
+        player.handle(PlayerCommand::Next);
+        let (played, upcoming) = shuffle_view(&player);
+        assert_eq!(played.len(), 3);
+
+        // Append: old upcoming keeps its relative order, new ids join it.
+        let added = tracks(5);
+        let added_ids: Vec<u64> = added.iter().map(|t| t.id).collect();
+        player.handle(PlayerCommand::AppendInOrder(added));
+        let (played_after, upcoming_after) = shuffle_view(&player);
+        assert_eq!(
+            played_after, played,
+            "history and current survive an append"
+        );
+        let old_only: Vec<u64> = upcoming_after
+            .iter()
+            .copied()
+            .filter(|id| !added_ids.contains(id))
+            .collect();
+        assert_eq!(old_only, upcoming, "queued order survives an append");
+        assert_eq!(
+            upcoming_after.len(),
+            upcoming.len() + 5,
+            "new tracks queued"
+        );
+
+        // Remove a queued track: everything else keeps its place.
+        let victim = upcoming_after[1];
+        let index = player
+            .playlist
+            .tracks()
+            .iter()
+            .position(|t| t.id == victim)
+            .unwrap();
+        player.handle(PlayerCommand::RemoveTrack(index));
+        let (played_now, upcoming_now) = shuffle_view(&player);
+        assert_eq!(played_now, played);
+        let expected: Vec<u64> = upcoming_after
+            .iter()
+            .copied()
+            .filter(|&id| id != victim)
+            .collect();
+        assert_eq!(upcoming_now, expected, "a removal only drops that track");
+
+        // Move a track in the playlist: play order is by track, not by row.
+        player.handle(PlayerCommand::MoveTrack { from: 4, up: true });
+        assert_eq!(
+            shuffle_view(&player),
+            (played_now, upcoming_now),
+            "a move changes nothing"
+        );
+    }
+
+    /// Audit S6: crash leftovers are swept at startup in *every* mode —
+    /// a stream-mode session can leave a fallback dir behind too.
+    #[test]
+    fn startup_sweeps_stale_dirs_in_stream_mode_too() {
+        let parent = tempfile::tempdir().unwrap();
+        let stale = parent.path().join("ampwire-jellyfin-99999");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600))
+            .unwrap();
+        let config = JellyfinConfig {
+            url: "http://127.0.0.1:9".into(),
+            api_key: "k".into(),
+            api_key_file: None,
+            user: None,
+            mode: JellyfinMode::Stream,
+            cache_ahead: 3,
+            cache_behind: 3,
+            cache_dir: Some(parent.path().to_path_buf()),
+            notice: None,
+        };
+        let player = RealPlayer::new(Some(&config)); // no device until a Load
+        assert!(!stale.exists(), "stale leftover swept in stream mode");
+        assert!(player.cache.is_none(), "still no cache dir in stream mode");
+    }
+
     fn idle_client() -> Client {
         Client::new(&JellyfinConfig {
             url: "http://127.0.0.1:9".into(),
             api_key: "k".into(),
+            api_key_file: None,
             user: None,
             mode: JellyfinMode::Cache,
             cache_ahead: 3,
@@ -1814,7 +1967,10 @@ mod tests {
             Some("buffering…"),
             "the user sees why there is no sound yet"
         );
-        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+        assert_eq!(
+            player.pending_remote.as_ref().map(ItemId::as_str),
+            Some("abc")
+        );
         assert!(load_paths(&cmds).is_empty(), "nothing sent to the engine");
 
         // Paused while buffering: the Ready load re-asserts the pause.
@@ -1844,7 +2000,10 @@ mod tests {
         let (mut player, cmds, ..) = cached_player(&dir);
         player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
         player.handle(PlayerCommand::Play);
-        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+        assert_eq!(
+            player.pending_remote.as_ref().map(ItemId::as_str),
+            Some("abc")
+        );
 
         let other = dir.path().join("zzz.flac");
         std::fs::write(&other, b"pretend flac").unwrap();
@@ -1856,7 +2015,10 @@ mod tests {
             load_paths(&cmds).is_empty(),
             "a prefetch finishing must not interrupt the buffering track"
         );
-        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+        assert_eq!(
+            player.pending_remote.as_ref().map(ItemId::as_str),
+            Some("abc")
+        );
     }
 
     #[test]
@@ -1866,7 +2028,10 @@ mod tests {
         player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
         player.handle(PlayerCommand::AddTracks(tracks(2)));
         player.handle(PlayerCommand::Play);
-        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+        assert_eq!(
+            player.pending_remote.as_ref().map(ItemId::as_str),
+            Some("abc")
+        );
 
         player.handle_cache_event(CacheEvent::Failed {
             item_id: "abc".into(),
@@ -1899,7 +2064,10 @@ mod tests {
         let (mut player, cmds, ..) = cached_player(&dir);
         player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
         player.handle(PlayerCommand::Play);
-        assert_eq!(player.pending_remote.as_deref(), Some("abc"));
+        assert_eq!(
+            player.pending_remote.as_ref().map(ItemId::as_str),
+            Some("abc")
+        );
 
         player.handle(PlayerCommand::Stop);
         assert_eq!(player.state, PlayState::Stopped);
@@ -1928,7 +2096,7 @@ mod tests {
                     item_id,
                     container,
                     start,
-                } => Some((item_id, container, start)),
+                } => Some((item_id.to_string(), container, start)),
                 _ => None,
             })
             .collect()

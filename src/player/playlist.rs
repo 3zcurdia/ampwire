@@ -70,7 +70,8 @@ impl Playlist {
     /// Stable-sort the new tracks among themselves, then append them after
     /// whatever is already in the list (manual order survives an add).
     pub fn append_sorted(&mut self, mut new: Vec<Track>) {
-        new.sort_by_key(|t| t.sort_key());
+        // One key per track, not two allocations per comparison (audit P5).
+        new.sort_by_cached_key(Track::sort_key);
         Arc::make_mut(&mut self.tracks).extend(new);
     }
 
@@ -324,7 +325,7 @@ mod tests {
         Track {
             id: Track::next_id(),
             source: TrackSource::Remote {
-                item_id: id.to_string(),
+                item_id: id.into(),
                 container: Some("flac".into()),
             },
             artist: Some(format!("artist-{id}")),

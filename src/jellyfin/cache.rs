@@ -16,11 +16,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
-use crate::jellyfin::Client;
+use crate::jellyfin::{Client, ItemId};
 use crate::player::order::PlayOrder;
 use crate::player::{Track, TrackSource};
 
@@ -38,7 +38,7 @@ const DIR_PREFIX: &str = "ampwire-jellyfin-";
 /// One remote track the cache should hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRef {
-    pub item_id: String,
+    pub item_id: ItemId,
     pub container: Option<String>,
 }
 
@@ -67,8 +67,8 @@ pub enum CacheCmd {
 /// Downloader → UI thread.
 #[derive(Debug)]
 pub enum CacheEvent {
-    Ready { item_id: String, path: PathBuf },
-    Failed { item_id: String, error: String },
+    Ready { item_id: ItemId, path: PathBuf },
+    Failed { item_id: ItemId, error: String },
 }
 
 /// What the downloader should do after one item (internal).
@@ -91,12 +91,14 @@ pub struct Cache {
     /// Item id → file on disk, kept in step with the window. A small mutex
     /// (not `&mut`) so [`Cache::set_window`] can stay `&self` as the plan
     /// specifies and be called straight from an immutable borrow.
-    ready: Mutex<HashMap<String, PathBuf>>,
+    ready: Mutex<HashMap<ItemId, PathBuf>>,
 }
 
 impl Cache {
     /// Create `ampwire-jellyfin-<pid>` under `dir_parent` (the system temp
-    /// dir when `None`), sweep stale siblings, spawn the downloader.
+    /// dir when `None`) and spawn the downloader. Crash leftovers are swept
+    /// once per session by the player, in every mode
+    /// ([`sweep_stale_dirs`]).
     pub fn new(client: Client, dir_parent: Option<PathBuf>) -> std::io::Result<Cache> {
         Self::with_limit(client, dir_parent, MAX_FILE_BYTES)
     }
@@ -108,15 +110,7 @@ impl Cache {
         max_bytes: u64,
     ) -> std::io::Result<Cache> {
         let parent = dir_parent.unwrap_or_else(std::env::temp_dir);
-        sweep_stale_dirs(&parent, STALE_AGE);
-        let dir = parent.join(format!("{DIR_PREFIX}{}", std::process::id()));
-        fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Best-effort: the cache holds the user's music, not world data.
-            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-        }
+        let dir = create_own_dir(&parent)?;
 
         let (cmd_tx, cmd_rx) = channel();
         let (ev_tx, ev_rx) = channel();
@@ -147,7 +141,7 @@ impl Cache {
 
     /// The local file for `item_id`, if it finished downloading (and still
     /// exists — eviction can race a stale bookkeeping entry).
-    pub fn path_if_ready(&self, item_id: &str) -> Option<PathBuf> {
+    pub fn path_if_ready(&self, item_id: &ItemId) -> Option<PathBuf> {
         let mut ready = self.ready.lock().expect("cache ready lock");
         let path = ready.get(item_id)?.clone();
         if path.exists() {
@@ -186,7 +180,7 @@ impl Cache {
         self.ready
             .lock()
             .expect("cache ready lock")
-            .insert(item_id.to_string(), path);
+            .insert(item_id.into(), path);
     }
 }
 
@@ -228,6 +222,58 @@ pub fn sweep_stale_dirs(parent: &Path, max_age: Duration) -> usize {
         }
     }
     removed
+}
+
+/// Create `<parent>/ampwire-jellyfin-<pid>`, fresh and `0700` (audit S4).
+///
+/// The name is predictable and the parent is usually a shared temp dir, so
+/// nothing already sitting there is ever adopted: a leftover of ours (a
+/// crashed run whose pid came back) or a planted symlink/dir is removed —
+/// `remove_dir_all` never follows a symlink — and the directory is created
+/// again by us. If that removal is refused (someone else's entry in a
+/// sticky `/tmp`), creation fails and the caller reports the cache as
+/// unavailable instead of writing into a directory it does not own.
+pub(crate) fn create_own_dir(parent: &Path) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(parent)?;
+    let dir = parent.join(format!("{DIR_PREFIX}{}", std::process::id()));
+    match make_private_dir(&dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(&dir)?.is_dir() {
+                fs::remove_dir_all(&dir)?;
+            } else {
+                fs::remove_file(&dir)?; // a symlink or a plain file
+            }
+            make_private_dir(&dir)?;
+        }
+        other => other?,
+    }
+    Ok(dir)
+}
+
+/// `mkdir` (never through an existing entry) with mode `0700` on unix.
+fn make_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder.create(dir)?;
+        // Exact, whatever the umask: the cache holds the user's music.
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    builder.create(dir)
+}
+
+/// Open `path` for writing as a brand-new file: a stale one is removed
+/// first, and `create_new` refuses to write through anything that appears
+/// in between (a symlink included).
+pub(crate) fn create_fresh_file(path: &Path) -> std::io::Result<fs::File> {
+    let _ = fs::remove_file(path);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// `ampwire-jellyfin-<pid>` and nothing else.
@@ -336,9 +382,9 @@ fn run(
     }
 }
 
-/// Fetch one item: reuse the file if it is already there, else stream the
-/// original into `<id>.part` (checking for newer windows between chunks),
-/// then rename atomically and report `Ready`.
+/// Fetch one item for the window: [`download_original`], checking for a
+/// newer window between chunks — keep going if the item is still wanted,
+/// abandon it otherwise — then report `Ready`/`Failed`.
 fn fetch(
     client: &Client,
     dir: &Path,
@@ -348,127 +394,131 @@ fn fetch(
     tx: &Sender<CacheEvent>,
     wanted: &mut Vec<RemoteRef>,
 ) -> Flow {
-    let path = dir.join(format!("{}.{}", item.item_id, ext_for(item)));
-    if path.is_file() {
-        // Already on disk (an earlier window had it): cheap re-report.
-        let _ = tx.send(CacheEvent::Ready {
-            item_id: item.item_id.clone(),
-            path: path.clone(),
-        });
-        return Flow::Continue;
-    }
-
-    let failed = |error: String| {
-        let _ = tx.send(CacheEvent::Failed {
-            item_id: item.item_id.clone(),
-            error,
-        });
-    };
-
-    let response = match client.open_original(&item.item_id, None) {
-        Ok(response) => response,
-        Err(reason) => {
-            failed(reason);
-            return Flow::Continue;
-        }
-    };
-    // Refuse up front when the server declares an over-cap file.
-    if let Some(len) = content_length(&response)
-        && len > max_bytes
-    {
-        failed(format!(
-            "file is {} — over the {} cache limit",
-            size_label(len),
-            size_label(max_bytes)
-        ));
-        return Flow::Continue;
-    }
-
-    let part = dir.join(format!("{}.part", item.item_id));
-    let mut reader = response.into_body().into_reader();
-    let cleanup = |part: &Path| {
-        let _ = fs::remove_file(part);
-    };
-    let mut file = match fs::File::create(&part) {
-        Ok(file) => file,
-        Err(reason) => {
-            cleanup(&part);
-            failed(format!("cache write failed: {reason}"));
-            return Flow::Continue;
-        }
-    };
-
-    let mut buffer = vec![0u8; CHUNK];
-    let mut written: u64 = 0;
-    let mut window_changed = false;
-    loop {
-        // A newer window (or shutdown) between chunks: apply it right away.
+    // Continue, unless a newer window (Restart) or shutdown (Stop) arrived.
+    let mut flow = Flow::Continue;
+    let result = download_original(client, item, dir, max_bytes, || {
         match rx.try_recv() {
             Ok(CacheCmd::Window(list)) => {
                 evict(dir, &list);
                 let still_wanted = list.iter().any(|ref_| ref_.item_id == item.item_id);
                 *wanted = list;
-                if !still_wanted {
-                    cleanup(&part);
-                    return Flow::Restart;
-                }
-                window_changed = true; // finish this file, then re-check
+                flow = Flow::Restart;
+                !still_wanted // still wanted: finish this file, then re-check
             }
-            Ok(CacheCmd::Shutdown) => {
-                cleanup(&part);
-                return Flow::Stop;
+            Ok(CacheCmd::Shutdown) | Err(TryRecvError::Disconnected) => {
+                flow = Flow::Stop;
+                true
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                cleanup(&part);
-                return Flow::Stop;
-            }
+            Err(TryRecvError::Empty) => false,
         }
+    });
+    match result {
+        Ok(path) => {
+            let _ = tx.send(CacheEvent::Ready {
+                item_id: item.item_id.clone(),
+                path,
+            });
+        }
+        Err(DownloadError::Interrupted) => {}
+        Err(DownloadError::Failed(error)) => {
+            let _ = tx.send(CacheEvent::Failed {
+                item_id: item.item_id.clone(),
+                error,
+            });
+        }
+    }
+    flow
+}
 
+/// Why [`download_original`] produced no file.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DownloadError {
+    /// The caller's `interrupt` asked to stop; the `.part` is gone.
+    Interrupted,
+    /// A key-free, user-facing reason (`file is over the 512 MiB cache
+    /// limit`, `jellyfin: cannot reach server`, …).
+    Failed(String),
+}
+
+/// The one way a Jellyfin original becomes a local file — for the cache
+/// window and for the stream modes' no-`Range` fallback alike (audit D1):
+/// reuse `<dir>/<id>.<ext>` when it is already there, else stream the body
+/// into a fresh `<id>.part` (never through a planted symlink), enforce
+/// `max_bytes` (declared `Content-Length` up front, running total while
+/// reading), and rename only when complete — a `.part` is never handed out.
+/// `interrupt` runs between chunks; `true` abandons the download.
+pub(crate) fn download_original(
+    client: &Client,
+    item: &RemoteRef,
+    dir: &Path,
+    max_bytes: u64,
+    mut interrupt: impl FnMut() -> bool,
+) -> Result<PathBuf, DownloadError> {
+    let path = dir.join(format!("{}.{}", item.item_id, ext_for(item)));
+    if path.is_file() {
+        return Ok(path); // an earlier window (or play) already has it
+    }
+    let failed = |reason: String| Err(DownloadError::Failed(reason));
+
+    let response = match client.open_original(&item.item_id, None) {
+        Ok(response) => response,
+        Err(reason) => return failed(reason),
+    };
+    // Refuse up front when the server declares an over-cap file.
+    if let Some(len) = content_length(&response)
+        && len > max_bytes
+    {
+        return failed(format!(
+            "file is {} — over the {} cache limit",
+            size_label(len),
+            size_label(max_bytes)
+        ));
+    }
+
+    let part = dir.join(format!("{}.part", item.item_id));
+    let mut reader = response.into_body().into_reader();
+    let mut file = match create_fresh_file(&part) {
+        Ok(file) => file,
+        Err(reason) => return failed(format!("cache write failed: {reason}")),
+    };
+    // Every early exit below takes the `.part` with it.
+    let abandon = |result: Result<PathBuf, DownloadError>| {
+        let _ = fs::remove_file(&part);
+        result
+    };
+
+    let mut buffer = vec![0u8; CHUNK];
+    let mut written: u64 = 0;
+    loop {
+        if interrupt() {
+            return abandon(Err(DownloadError::Interrupted));
+        }
         match reader.read(&mut buffer) {
             Ok(0) => break, // clean end of body
             Ok(n) => {
                 written += n as u64;
                 if written > max_bytes {
-                    cleanup(&part);
-                    failed(format!(
+                    return abandon(failed(format!(
                         "file is over the {} cache limit",
                         size_label(max_bytes)
-                    ));
-                    return Flow::Continue;
+                    )));
                 }
                 if let Err(reason) = file.write_all(&buffer[..n]) {
-                    cleanup(&part);
-                    failed(format!("cache write failed: {reason}"));
-                    return Flow::Continue;
+                    return abandon(failed(format!("cache write failed: {reason}")));
                 }
             }
-            Err(_) => {
-                // Transport failure mid-body (the fixed text keeps any URL
-                // or key out of the notice).
-                cleanup(&part);
-                failed("jellyfin: cannot reach server".into());
-                return Flow::Continue;
-            }
+            // Transport failure mid-body (the fixed text keeps any URL or
+            // key out of the notice).
+            Err(_) => return abandon(failed("jellyfin: cannot reach server".into())),
         }
     }
     drop(file);
 
-    // Complete: `.part` → `<id>.<ext>` in one rename, then announce it.
+    // Complete: `.part` → `<id>.<ext>` in one rename.
     if let Err(reason) = fs::rename(&part, &path) {
-        cleanup(&part);
-        failed(format!("cache write failed: {reason}"));
-        return Flow::Continue;
+        return abandon(failed(format!("cache write failed: {reason}")));
     }
-    let _ = tx.send(CacheEvent::Ready {
-        item_id: item.item_id.clone(),
-        path,
-    });
-    if window_changed {
-        Flow::Restart
-    } else {
-        Flow::Continue
-    }
+    Ok(path)
 }
 
 /// Delete every cached file (and `.part`) whose item id is not in `wanted`.
@@ -546,7 +596,7 @@ mod tests {
         Track {
             id: Track::next_id(),
             source: TrackSource::Remote {
-                item_id: id.to_string(),
+                item_id: id.into(),
                 container: Some("flac".into()),
             },
             artist: Some(format!("artist-{id}")),
@@ -646,12 +696,12 @@ mod tests {
         let window = compute_window(&order, &tracks, Some(0), 6, 6);
         // All-remote list: the window is the whole play order, current first.
         let mut expected: Vec<String> = vec!["r0".to_string()];
-        expected.extend(
-            order
-                .upcoming(tracks.len())
-                .iter()
-                .map(|&i| RemoteRef::from_track(&tracks[i]).expect("remote").item_id),
-        );
+        expected.extend(order.upcoming(tracks.len()).iter().map(|&i| {
+            RemoteRef::from_track(&tracks[i])
+                .expect("remote")
+                .item_id
+                .to_string()
+        }));
         assert_eq!(
             ids(&window),
             expected.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -706,6 +756,7 @@ mod tests {
         let cfg = crate::config::JellyfinConfig {
             url: "http://127.0.0.1:9".into(),
             api_key: "k".into(),
+            api_key_file: None,
             user: None,
             mode: JellyfinMode::Cache,
             cache_ahead: 3,
@@ -746,6 +797,66 @@ mod tests {
         );
     }
 
+    fn idle_config() -> crate::config::JellyfinConfig {
+        crate::config::JellyfinConfig {
+            url: "http://127.0.0.1:9".into(),
+            api_key: "k".into(),
+            api_key_file: None,
+            user: None,
+            mode: JellyfinMode::Cache,
+            cache_ahead: 3,
+            cache_behind: 3,
+            cache_dir: None,
+            notice: None,
+        }
+    }
+
+    /// Audit S4: `<parent>/ampwire-jellyfin-<pid>` is a predictable name in
+    /// a shared temp dir. Whatever already sits there — a symlink someone
+    /// planted, a leftover with loose permissions — is never adopted: the
+    /// cache only ever uses a directory it just created itself, `0700`.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_at_the_cache_name_is_never_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::set_permissions(elsewhere.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(elsewhere.path().join("keep.me"), b"x").unwrap();
+        let name = parent
+            .path()
+            .join(format!("{DIR_PREFIX}{}", std::process::id()));
+        std::os::unix::fs::symlink(elsewhere.path(), &name).unwrap();
+
+        if let Ok(cache) = Cache::new(Client::new(&idle_config()), Some(parent.path().into())) {
+            let meta = fs::symlink_metadata(cache.dir()).unwrap();
+            assert!(meta.is_dir(), "a real directory, not the symlink");
+            drop(cache);
+        }
+        let mode = fs::metadata(elsewhere.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the symlink target was chmod-ed");
+        assert!(elsewhere.path().join("keep.me").exists(), "target emptied");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_dir_is_recreated_private_and_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let name = parent
+            .path()
+            .join(format!("{DIR_PREFIX}{}", std::process::id()));
+        fs::create_dir(&name).unwrap();
+        fs::set_permissions(&name, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::write(name.join("old.part"), b"stale").unwrap();
+
+        let cache = Cache::new(Client::new(&idle_config()), Some(parent.path().into()))
+            .expect("our own leftover is reclaimed");
+        let mode = fs::metadata(cache.dir()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(cache.dir().read_dir().unwrap().next().is_none(), "emptied");
+    }
+
     // --- against the mock server (plan 08, step 7 e + f) ---
 
     use std::time::Instant;
@@ -755,7 +866,7 @@ mod tests {
     /// A wanted ref with the fixture's container.
     fn remote_ref(id: &str) -> RemoteRef {
         RemoteRef {
-            item_id: id.to_string(),
+            item_id: id.into(),
             container: Some("flac".into()),
         }
     }
@@ -789,16 +900,16 @@ mod tests {
             wait_for(&mut cache, Duration::from_secs(10), |cache| {
                 ["a", "b", "c"]
                     .iter()
-                    .all(|id| cache.path_if_ready(id).is_some())
+                    .all(|id| cache.path_if_ready(&(*id).into()).is_some())
             }),
             "the three items download: {:?}",
             ["a", "b", "c"]
                 .iter()
-                .map(|id| cache.path_if_ready(id))
+                .map(|id| cache.path_if_ready(&(*id).into()))
                 .collect::<Vec<_>>()
         );
         for id in ["a", "b", "c"] {
-            let path = cache.path_if_ready(id).expect("ready above");
+            let path = cache.path_if_ready(&(*id).into()).expect("ready above");
             assert_eq!(
                 path.file_name().unwrap().to_string_lossy(),
                 format!("{id}.flac"),
@@ -811,13 +922,13 @@ mod tests {
         cache.set_window(vec![remote_ref("b"), remote_ref("c"), remote_ref("d")]);
         assert!(
             wait_for(&mut cache, Duration::from_secs(10), |cache| {
-                cache.path_if_ready("d").is_some()
+                cache.path_if_ready(&"d".into()).is_some()
             }),
             "the new item downloads"
         );
         // The new window was applied *before* its download started, so
         // seeing `d` ready also proves `a` was evicted.
-        assert_eq!(cache.path_if_ready("a"), None, "a left the window");
+        assert_eq!(cache.path_if_ready(&"a".into()), None, "a left the window");
         assert!(!cache.dir().join("a.flac").exists(), "a's file is deleted");
         assert!(cache.dir().join("b.flac").exists(), "b survives");
         assert!(
@@ -868,7 +979,7 @@ mod tests {
         assert!(part.exists(), "the download is really in flight");
         cache.poll();
         assert_eq!(
-            cache.path_if_ready("slow"),
+            cache.path_if_ready(&"slow".into()),
             None,
             "a .part file is never ready"
         );
@@ -876,12 +987,12 @@ mod tests {
         // Once complete (renamed atomically) it is.
         assert!(
             wait_for(&mut cache, Duration::from_secs(15), |cache| {
-                cache.path_if_ready("slow").is_some()
+                cache.path_if_ready(&"slow".into()).is_some()
             }),
             "the delayed download finishes"
         );
         assert!(!part.exists(), "the .part was renamed away");
-        let ready = cache.path_if_ready("slow").expect("ready");
+        let ready = cache.path_if_ready(&"slow".into()).expect("ready");
         assert_eq!(ready.file_name().unwrap().to_string_lossy(), "slow.flac");
     }
 
@@ -921,7 +1032,11 @@ mod tests {
         );
         assert!(!error.contains(KEY), "no key in the error: {error}");
 
-        assert_eq!(cache.path_if_ready("big"), None, "nothing became ready");
+        assert_eq!(
+            cache.path_if_ready(&"big".into()),
+            None,
+            "nothing became ready"
+        );
         assert!(!cache.dir().join("big.flac").exists(), "no file");
         assert!(!cache.dir().join("big.part").exists(), "no partial left");
     }

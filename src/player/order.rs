@@ -2,7 +2,7 @@
 //! step 6).
 //!
 //! Pure data + bookkeeping — no I/O, no audio. Auto-advance at the end of a
-//! track, the manual Next/Prev keys and (later) plan 08's look-ahead all go
+//! track, the manual Next/Prev keys and plan 08's cache window all go
 //! through [`PlayOrder`], so they can never disagree about "what plays next".
 
 use super::rng::Rng;
@@ -33,8 +33,11 @@ impl PlayOrder {
         }
     }
 
-    /// Rebuild after a playlist edit or a shuffle toggle; `current` is the
-    /// playlist index being played, if any.
+    /// Rebuild from scratch — a shuffle toggle, a replaced or cleared
+    /// playlist, and every edit in ordered mode (in shuffle, edits go
+    /// through [`PlayOrder::appended`] / [`PlayOrder::removed`] /
+    /// [`PlayOrder::swapped`] instead). `current` is the playlist index being
+    /// played, if any.
     ///
     /// Ordered: `order = 0..len`, cursor on `current`. Shuffle: `current`
     /// first, the rest Fisher–Yates shuffled (no current → a free shuffle and
@@ -60,6 +63,96 @@ impl PlayOrder {
             None => {
                 fisher_yates(&mut self.order, rng);
                 self.pos = NONE;
+            }
+        }
+    }
+
+    /// The playlist grew to `len` by appending at its end (`AddTracks`, a
+    /// Jellyfin page). Shuffle: the new indices are shuffled and merged at
+    /// random into the not-yet-played part — history, the current track and
+    /// the relative order of everything already queued survive (audit P3),
+    /// so the Jellyfin cache window does not churn. Ordered: as `rebuild`.
+    pub fn appended(&mut self, len: usize, current: Option<usize>, rng: &mut Rng) {
+        let old = self.order.len();
+        if !self.shuffle || len < old {
+            self.rebuild(len, current, self.shuffle, rng);
+            return;
+        }
+        let mut added: Vec<usize> = (old..len).collect();
+        fisher_yates(&mut added, rng);
+        let first_unplayed = match self.pos {
+            NONE => 0,
+            pos => pos + 1,
+        };
+        let queued = self.order.split_off(first_unplayed.min(old));
+        // A uniformly random interleaving: take from either side with
+        // probability proportional to what is left there. O(n), and each
+        // side keeps its own order.
+        let (mut left_queued, mut left_added) = (queued.len(), added.len());
+        let (mut queued, mut added) = (queued.into_iter(), added.into_iter());
+        while left_queued + left_added > 0 {
+            if rng.next_below(left_queued + left_added) < left_queued {
+                self.order.extend(queued.next());
+                left_queued -= 1;
+            } else {
+                self.order.extend(added.next());
+                left_added -= 1;
+            }
+        }
+    }
+
+    /// Playlist indices were removed (`removed[i]` for each *old* index).
+    /// Shuffle: the survivors are renumbered and keep their order; the
+    /// cursor stays on the same track — or, if that one went, on the entry
+    /// before it, so `next()` plays what followed (audit P3). Ordered: as
+    /// `rebuild`.
+    pub fn removed(&mut self, removed: &[bool], current: Option<usize>, rng: &mut Rng) {
+        let len = removed.iter().filter(|gone| !**gone).count();
+        if !self.shuffle || removed.len() != self.order.len() {
+            self.rebuild(len, current, self.shuffle, rng);
+            return;
+        }
+        // Old playlist index → new one (`None` when removed).
+        let mut renumber = Vec::with_capacity(removed.len());
+        let mut next = 0;
+        for gone in removed {
+            renumber.push((!gone).then(|| {
+                next += 1;
+                next - 1
+            }));
+        }
+        let mut kept_before_pos = 0;
+        let mut pos_kept = false;
+        let mut order = Vec::with_capacity(len);
+        for (slot, &index) in self.order.iter().enumerate() {
+            let renumbered = renumber[index];
+            if self.pos != NONE && slot == self.pos {
+                pos_kept = renumbered.is_some();
+                kept_before_pos = order.len();
+            }
+            order.extend(renumbered);
+        }
+        self.pos = match (self.pos, pos_kept) {
+            (NONE, _) => NONE,
+            (_, true) => kept_before_pos,
+            (_, false) => kept_before_pos.checked_sub(1).unwrap_or(NONE),
+        };
+        self.order = order;
+    }
+
+    /// Playlist rows `a` and `b` swapped (a move up/down). Shuffle: the
+    /// order follows the *tracks*, so only their labels swap — nothing is
+    /// reordered (audit P3). Ordered: as `rebuild`.
+    pub fn swapped(&mut self, a: usize, b: usize, current: Option<usize>, rng: &mut Rng) {
+        if !self.shuffle {
+            self.rebuild(self.order.len(), current, false, rng);
+            return;
+        }
+        for index in &mut self.order {
+            if *index == a {
+                *index = b;
+            } else if *index == b {
+                *index = a;
             }
         }
     }
@@ -151,8 +244,6 @@ impl PlayOrder {
 
     /// Look-ahead WITHOUT moving: the next `n` playlist indices, nearest
     /// first. Never wraps and never reshuffles.
-    // plan 08 (Jellyfin look-ahead) consumes this; unit-tested here until then.
-    #[allow(dead_code)]
     pub fn upcoming(&self, n: usize) -> Vec<usize> {
         let len = self.order.len();
         if len == 0 || n == 0 {
@@ -168,8 +259,6 @@ impl PlayOrder {
 
     /// Look-behind WITHOUT moving: what `prev()` would return over `n` calls,
     /// nearest first and deduplicated at the start (the restart target).
-    // plan 08 (the "3 behind" cache) consumes this; unit-tested here until then.
-    #[allow(dead_code)]
     pub fn previous(&self, n: usize) -> Vec<usize> {
         let len = self.order.len();
         if len == 0 || n == 0 {
@@ -412,6 +501,118 @@ mod tests {
     }
 
     // --- rebuild ---
+
+    // --- playlist edits keep a running shuffle (audit P3) ---
+
+    /// The full sequence `next()` would walk from here (no repeat).
+    fn walk(order: &PlayOrder) -> Vec<usize> {
+        order.upcoming(order.order.len())
+    }
+
+    #[test]
+    fn appended_merges_new_tracks_into_the_unplayed_part_only() {
+        let mut rng = Rng::new(3);
+        let mut order = shuffled(LEN, 3);
+        order.next(false, &mut rng);
+        order.next(false, &mut rng);
+        let history = order.previous(LEN);
+        let current = order.current();
+        let queued = walk(&order);
+
+        order.appended(LEN + 4, current, &mut rng);
+        assert_eq!(order.previous(LEN + 4), history, "history untouched");
+        assert_eq!(order.current(), current, "current untouched");
+        let after = walk(&order);
+        let old_only: Vec<usize> = after.iter().copied().filter(|&i| i < LEN).collect();
+        assert_eq!(old_only, queued, "queued order kept");
+        let mut new_only: Vec<usize> = after.iter().copied().filter(|&i| i >= LEN).collect();
+        new_only.sort_unstable();
+        assert_eq!(new_only, vec![8, 9, 10, 11], "every new track queued once");
+    }
+
+    #[test]
+    fn appended_before_anything_played_queues_everything() {
+        let mut rng = Rng::new(4);
+        let mut order = shuffled(3, 4);
+        order.appended(6, None, &mut rng);
+        let mut all = walk(&order);
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(order.current(), None);
+    }
+
+    #[test]
+    fn removed_renumbers_and_keeps_the_rest_in_place() {
+        let mut rng = Rng::new(5);
+        let mut order = shuffled(LEN, 5);
+        order.next(false, &mut rng);
+        order.next(false, &mut rng);
+        let current = order.current().unwrap();
+        // Remove one queued track (not the current one).
+        let victim = walk(&order)[0];
+        let mut removed = vec![false; LEN];
+        removed[victim] = true;
+        let renumber = |i: usize| if i > victim { i - 1 } else { i };
+        let expected: Vec<usize> = walk(&order)[1..].iter().map(|&i| renumber(i)).collect();
+        order.removed(&removed, Some(renumber(current)), &mut rng);
+        assert_eq!(order.current(), Some(renumber(current)));
+        assert_eq!(walk(&order), expected);
+    }
+
+    #[test]
+    fn removing_the_current_track_continues_with_what_followed() {
+        let mut rng = Rng::new(6);
+        let mut order = shuffled(LEN, 6);
+        order.next(false, &mut rng);
+        order.next(false, &mut rng);
+        let current = order.current().unwrap();
+        let following = walk(&order)[0];
+        let mut removed = vec![false; LEN];
+        removed[current] = true;
+        order.removed(&removed, None, &mut rng);
+        let renumbered = if following > current {
+            following - 1
+        } else {
+            following
+        };
+        assert_eq!(order.next(false, &mut rng), Some(renumbered));
+    }
+
+    #[test]
+    fn swapped_relabels_without_reordering() {
+        let mut rng = Rng::new(7);
+        let mut order = shuffled(LEN, 7);
+        order.next(false, &mut rng);
+        let before = walk(&order);
+        order.swapped(2, 3, None, &mut rng);
+        let relabel = |i: usize| match i {
+            2 => 3,
+            3 => 2,
+            other => other,
+        };
+        assert_eq!(
+            walk(&order),
+            before.into_iter().map(relabel).collect::<Vec<_>>()
+        );
+    }
+
+    /// Ordered mode is unchanged by the audit: every edit still rebuilds
+    /// (identity, cursor on the playlist's current track).
+    #[test]
+    fn ordered_edits_still_rebuild_on_the_current_track() {
+        let mut rng = Rng::new(8);
+        let mut order = ordered(LEN);
+        order.jump_to(3);
+        order.appended(LEN + 2, Some(3), &mut rng);
+        assert_eq!(walk(&order), vec![4, 5, 6, 7, 8, 9]);
+        let mut removed = vec![false; LEN + 2];
+        removed[3] = true;
+        order.removed(&removed, None, &mut rng);
+        assert_eq!(order.current(), None, "current gone → before the start");
+        assert_eq!(order.next(false, &mut rng), Some(0));
+        order.swapped(0, 1, Some(1), &mut rng);
+        assert_eq!(order.current(), Some(1));
+    }
 
     #[test]
     fn rebuild_keeps_the_current_track_first_when_shuffled() {

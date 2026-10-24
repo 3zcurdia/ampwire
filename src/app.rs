@@ -1,5 +1,7 @@
 //! App: UI state, event loop, tick, and action dispatch.
 
+use std::cell::RefCell;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
@@ -129,6 +131,14 @@ impl Default for UiState {
     }
 }
 
+/// One computed [`App::visible_indices`] and what it was computed from.
+#[derive(Debug)]
+struct VisibleCache {
+    tracks: Arc<Vec<Track>>,
+    filter: Option<String>,
+    indices: Arc<[usize]>,
+}
+
 /// Which scan to run over the playlist when the files arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanMode {
@@ -212,6 +222,8 @@ pub struct App {
     /// Terminal area of the frame about to be drawn; `None` until the first
     /// frame (tests, `--dump`). Focus uses it to skip auto-dropped panels.
     last_area: Option<Rect>,
+    /// Memo behind [`App::visible_indices`].
+    visible_cache: RefCell<Option<VisibleCache>>,
     /// Omarchy is unavailable and the neon fallback is already applied.
     omarchy_fallback: bool,
     /// A background directory scan is in flight (plan 02, step 8).
@@ -265,6 +277,7 @@ impl App {
             read_only: false,
             config_dirty_since: None,
             last_area: None,
+            visible_cache: RefCell::new(None),
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
@@ -323,6 +336,7 @@ impl App {
             read_only: false,
             config_dirty_since: None,
             last_area: None,
+            visible_cache: RefCell::new(None),
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
@@ -461,18 +475,40 @@ impl App {
     /// Real track indices currently shown, in order: everything when no
     /// filter is active, else the case-insensitive `display_name` matches.
     /// The playlist cursor addresses *this* list, not the raw tracks.
-    pub fn visible_indices(&self) -> Vec<usize> {
-        let Some(filter) = self.ui.filter.as_deref() else {
-            return (0..self.snapshot.tracks.len()).collect();
+    ///
+    /// Asked for several times per frame, so it is computed once per
+    /// (track list, filter) and shared (audit P6). The key holds the
+    /// snapshot's `Arc` itself: while it is held, the player's next edit
+    /// must copy-on-write a new list, so pointer equality really means
+    /// "same tracks".
+    pub fn visible_indices(&self) -> Arc<[usize]> {
+        let tracks = &self.snapshot.tracks;
+        let filter = self.ui.filter.as_deref();
+        let mut cache = self.visible_cache.borrow_mut();
+        if let Some(hit) = cache.as_ref()
+            && Arc::ptr_eq(&hit.tracks, tracks)
+            && hit.filter.as_deref() == filter
+        {
+            return Arc::clone(&hit.indices);
+        }
+        let indices: Arc<[usize]> = match filter {
+            None => (0..tracks.len()).collect(),
+            Some(filter) => {
+                let needle = filter.to_lowercase();
+                tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.display_name().to_lowercase().contains(&needle))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
         };
-        let needle = filter.to_lowercase();
-        self.snapshot
-            .tracks
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.display_name().to_lowercase().contains(&needle))
-            .map(|(i, _)| i)
-            .collect()
+        *cache = Some(VisibleCache {
+            tracks: Arc::clone(tracks),
+            filter: filter.map(str::to_string),
+            indices: Arc::clone(&indices),
+        });
+        indices
     }
 
     /// Keep the cursor inside the visible list after it changes shape.
@@ -1592,7 +1628,7 @@ mod tests {
         // Live filter: matches update on every keystroke, cursor rewinds.
         assert_eq!(app.ui.filter.as_deref(), Some("aphex"));
         let visible = app.visible_indices();
-        assert_eq!(visible, vec![0, 17], "Aphex Twin ×2: {visible:?}");
+        assert_eq!(*visible, [0, 17], "Aphex Twin ×2: {visible:?}");
         assert_eq!(app.ui.playlist_cursor, 0);
 
         // Enter keeps the filter and closes the prompt.
@@ -1607,12 +1643,32 @@ mod tests {
         assert_eq!(app.visible_indices().len(), 24);
     }
 
+    /// Audit P6 guard: the visible rows follow every playlist edit and
+    /// every filter change — whatever caching sits behind them.
+    #[test]
+    fn visible_indices_follow_edits_and_filter_changes() {
+        let (mut app, _dir) = test_app();
+        app.ui.filter = Some("boards".into());
+        assert_eq!(app.visible_indices().to_vec(), vec![1, 16]);
+        assert_eq!(app.visible_indices().to_vec(), vec![1, 16], "stable");
+
+        app.ui.filter = Some("aphex".into());
+        assert_eq!(app.visible_indices().to_vec(), vec![0, 17], "new filter");
+
+        app.ui.playlist_cursor = 0;
+        app.dispatch(Action::Del); // removes real track 0 (Aphex Twin)
+        assert_eq!(app.visible_indices().to_vec(), vec![16], "after a removal");
+
+        app.ui.filter = None;
+        assert_eq!(app.visible_indices().len(), 23, "no filter, one fewer");
+    }
+
     #[test]
     fn select_on_a_filtered_row_plays_the_real_track() {
         let (mut app, _dir) = test_app();
         app.ui.filter = Some("boards".into());
         // "boards of canada": Roygbiv (1) and Dayvan Cowboy (16).
-        assert_eq!(app.visible_indices(), vec![1, 16]);
+        assert_eq!(*app.visible_indices(), [1, 16]);
         app.ui.playlist_cursor = 1;
         app.dispatch(Action::Select);
         assert_eq!(app.snapshot().current, Some(16), "second visible row");
@@ -2250,6 +2306,7 @@ mod tests {
         config.jellyfin = Some(crate::config::JellyfinConfig {
             url: "http://127.0.0.1:9".into(),
             api_key: "test-key".into(),
+            api_key_file: None,
             user: None,
             mode: crate::config::JellyfinMode::Cache,
             cache_ahead: 3,
@@ -2265,7 +2322,7 @@ mod tests {
         Track {
             id: Track::next_id(),
             source: crate::player::TrackSource::Remote {
-                item_id: id.to_string(),
+                item_id: id.into(),
                 container: None,
             },
             artist: None,

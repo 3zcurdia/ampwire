@@ -41,6 +41,10 @@ struct State {
     auth_fail: Arc<AtomicBool>,
     no_ranges: Arc<AtomicBool>,
     audio_delay: Arc<Mutex<Duration>>,
+    /// Overrides every page's `TotalRecordCount` (a server that lies).
+    items_total: Arc<Mutex<Option<usize>>>,
+    /// Trailing JSON whitespace appended to every `/Items` body.
+    items_padding: Arc<Mutex<usize>>,
 }
 
 /// The stand-in server. One (detached) accept thread, one thread per
@@ -61,6 +65,8 @@ impl MockServer {
             auth_fail: Arc::new(AtomicBool::new(false)),
             no_ranges: Arc::new(AtomicBool::new(false)),
             audio_delay: Arc::new(Mutex::new(Duration::ZERO)),
+            items_total: Arc::new(Mutex::new(None)),
+            items_padding: Arc::new(Mutex::new(0)),
         };
         let fixture = Arc::new(
             std::fs::read(
@@ -87,6 +93,7 @@ impl MockServer {
         Client::new(&JellyfinConfig {
             url: self.base.clone(),
             api_key: key.to_string(),
+            api_key_file: None,
             user: None,
             mode: JellyfinMode::Cache,
             cache_ahead: 3,
@@ -110,6 +117,17 @@ impl MockServer {
     /// server shape that triggers plan 08's cache fallback.
     pub fn set_no_ranges(&self, on: bool) {
         self.state.no_ranges.store(on, Ordering::Relaxed);
+    }
+
+    /// Report `total` as every page's `TotalRecordCount`, whatever the
+    /// pages really hold.
+    pub fn set_items_total(&self, total: usize) {
+        *self.state.items_total.lock().expect("total lock") = Some(total);
+    }
+
+    /// Pad every `/Items` body with `bytes` of (valid) trailing whitespace.
+    pub fn set_items_padding(&self, bytes: usize) {
+        *self.state.items_padding.lock().expect("padding lock") = bytes;
     }
 
     /// Pause between the audio headers and its body, so a test can observe
@@ -170,11 +188,20 @@ fn serve(mut stream: TcpStream, state: State, fixture: Arc<Vec<u8>>) -> std::io:
         "/Items" => {
             // Only `StartIndex=0` carries the two items; later pages are
             // empty (but keep the same total, so paging really happens).
-            let body = if target.contains("StartIndex=0") {
+            let mut body = if target.contains("StartIndex=0") {
                 ITEMS_PAGE
             } else {
                 ITEMS_EMPTY
-            };
+            }
+            .to_string();
+            if let Some(total) = *state.items_total.lock().expect("total lock") {
+                body = body.replace(
+                    "\"TotalRecordCount\":600",
+                    &format!("\"TotalRecordCount\":{total}"),
+                );
+            }
+            let padding = *state.items_padding.lock().expect("padding lock");
+            body.push_str(&" ".repeat(padding));
             send(
                 &mut stream,
                 "200 OK",

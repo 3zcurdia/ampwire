@@ -31,6 +31,6 @@ pub mod engine;
 pub mod eq;
 
 pub use analysis::{Analyzer, BANDS};
-pub use decoder::{Decoder, SEEK_UNSUPPORTED, StreamInfo};
+pub use decoder::{Decoder, PlayError, StreamInfo};
 pub use dsp::{SharedParams, balance_to_gains, volume_to_gain};
-pub use engine::{AudioOut, Engine, EngineCmd, EngineEvent, PlaybackHandle};
+pub use engine::{AudioOut, Engine, EngineCmd, EngineEvent, PlaybackHandle, StreamSetup};

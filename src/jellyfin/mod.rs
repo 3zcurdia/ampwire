@@ -14,7 +14,7 @@ pub mod cache;
 pub mod http_source;
 
 #[cfg(test)]
-mod test_server;
+pub(crate) mod test_server;
 
 use std::io::Read;
 use std::sync::mpsc::Sender;
@@ -31,6 +31,9 @@ pub const PAGE_SIZE: usize = 500;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Read budget: response headers and each body read (the plan's 15 s).
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest JSON body read into memory (audit S5): a page of 500 items with
+/// `MediaSources` is a few MiB; anything past this is not a library page.
+const MAX_JSON_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The raw HTTP response, so callers can read `Content-Range` (streaming)
 /// or stream the body straight to disk (cache downloads).
@@ -52,6 +55,16 @@ pub enum JfMsg {
     Error(String),
 }
 
+/// One `/Items` page, mapped.
+#[derive(Debug)]
+pub struct LibraryPage {
+    pub tracks: Vec<Track>,
+    /// The server's `TotalRecordCount`.
+    pub total: usize,
+    /// Items on the wire, before malformed ones were dropped.
+    pub items: usize,
+}
+
 /// A Jellyfin server + API key. Cheap to clone (shared `ureq` connection
 /// pool); `Clone` lets the engine hold one for `stream` mode while the UI
 /// holds another.
@@ -60,6 +73,8 @@ pub struct Client {
     base: String,
     key: String,
     agent: ureq::Agent,
+    /// [`MAX_JSON_BYTES`]; tests shrink it.
+    max_json_bytes: u64,
 }
 
 impl Client {
@@ -76,6 +91,7 @@ impl Client {
             base: cfg.url.trim_end_matches('/').to_string(),
             key: cfg.api_key.clone(),
             agent,
+            max_json_bytes: MAX_JSON_BYTES,
         }
     }
 
@@ -94,11 +110,19 @@ impl Client {
             .header("Authorization", &self.auth_header())
             .call()
             .map_err(map_error)?;
-        let mut body = response.into_body().into_reader();
-        let mut text = String::new();
-        body.read_to_string(&mut text)
+        // Bounded: one byte past the cap proves the body is too big, so a
+        // hostile server cannot make us buffer without limit (audit S5).
+        let mut body = response
+            .into_body()
+            .into_reader()
+            .take(self.max_json_bytes + 1);
+        let mut text = Vec::new();
+        body.read_to_end(&mut text)
             .map_err(|_| "jellyfin: cannot reach server".to_string())?;
-        serde_json::from_str(&text).map_err(|_| "jellyfin: bad response from server".to_string())
+        if text.len() as u64 > self.max_json_bytes {
+            return Err("jellyfin: bad response from server".to_string());
+        }
+        serde_json::from_slice(&text).map_err(|_| "jellyfin: bad response from server".to_string())
     }
 
     /// Resolve the configured `user` name (else the first user) to its id.
@@ -129,22 +153,23 @@ impl Client {
     }
 
     /// One page of audio items, server-sorted (`Artist, SortName`), mapped
-    /// to [`Track`]s. Returns the tracks plus `TotalRecordCount`.
-    pub fn page(
-        &self,
-        user_id: &str,
-        start: usize,
-        limit: usize,
-    ) -> Result<(Vec<Track>, usize), String> {
+    /// to [`Track`]s, plus `TotalRecordCount` and how many items the page
+    /// really carried (malformed ones are dropped from `tracks`).
+    pub fn page(&self, user_id: &str, start: usize, limit: usize) -> Result<LibraryPage, String> {
         let path = format!(
             "/Items?userId={user_id}&Recursive=true&IncludeItemTypes=Audio\
              &SortBy=Artist,SortName&SortOrder=Ascending&Fields=MediaSources\
              &StartIndex={start}&Limit={limit}"
         );
         let page: ItemsPage = self.get_json(&path)?;
+        let items = page.items.len();
         let total = page.total_record_count;
         let tracks = page.items.into_iter().filter_map(track_from_item).collect();
-        Ok((tracks, total))
+        Ok(LibraryPage {
+            tracks,
+            total,
+            items,
+        })
     }
 
     /// `GET /Audio/{id}/stream?static=true` — the original file, optionally
@@ -152,7 +177,7 @@ impl Client {
     /// status: `206` proves range support, `200` (whole body) does not.
     pub fn open_original(
         &self,
-        item_id: &str,
+        item_id: &ItemId,
         range_from: Option<u64>,
     ) -> Result<Response, String> {
         let url = format!("{}/Audio/{item_id}/stream?static=true", self.base);
@@ -198,7 +223,11 @@ pub fn spawn_library_load(client: Client, user: Option<String>, tx: Sender<JfMsg
             let mut start = 0usize;
             let mut loaded = 0usize;
             loop {
-                let (tracks, total) = match client.page(&user_id, start, PAGE_SIZE) {
+                let LibraryPage {
+                    tracks,
+                    total,
+                    items,
+                } = match client.page(&user_id, start, PAGE_SIZE) {
                     Ok(page) => page,
                     Err(reason) => {
                         let _ = tx.send(JfMsg::Error(reason));
@@ -217,9 +246,11 @@ pub fn spawn_library_load(client: Client, user: Option<String>, tx: Sender<JfMsg
                     return; // the app is gone
                 }
                 start += PAGE_SIZE;
-                // Stop at the server's total, or on an empty page (a server
-                // that keeps answering empty would loop forever otherwise).
-                if start >= total {
+                // Stop at the server's total, or on a page with no items on
+                // the wire (a server whose total lies would otherwise be
+                // paged for ever — audit S5). A page whose items were all
+                // malformed is not empty: the walk goes on.
+                if start >= total || items == 0 {
                     break;
                 }
             }
@@ -270,6 +301,57 @@ struct MediaSource {
     container: Option<String>,
 }
 
+/// A Jellyfin item id that is safe as a URL path segment **and** as a file
+/// name inside the cache dir: 1–64 ASCII alphanumerics, `-` or `_` (real ids
+/// are 32 hex digits, Emby's are numeric). Only [`ItemId::parse`] builds
+/// one, and it runs at the wire boundary ([`track_from_item`]), so no
+/// server string can steer a download out of the cache dir (audit S1).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ItemId(String);
+
+impl ItemId {
+    const MAX_LEN: usize = 64;
+
+    pub fn parse(raw: &str) -> Option<ItemId> {
+        let valid = !raw.is_empty()
+            && raw.len() <= Self::MAX_LEN
+            && raw
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        valid.then(|| ItemId(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ItemId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for ItemId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ItemId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+/// Tests name their fixtures inline (`"abc".into()`); a bad name panics.
+#[cfg(test)]
+impl From<&str> for ItemId {
+    fn from(raw: &str) -> ItemId {
+        ItemId::parse(raw).unwrap_or_else(|| panic!("invalid test item id {raw:?}"))
+    }
+}
+
 /// File extension for a container name (`"m4a"` → `"m4a"`, a comma list →
 /// its first segment, junk/missing → `"bin"`): ASCII alphanumerics only, so
 /// a hostile server string can never escape the cache directory.
@@ -289,10 +371,7 @@ pub(crate) fn container_ext(container: Option<&str>) -> String {
 /// Map one server item to a [`Track`]; `None` when the item cannot be
 /// played or identified (no `Id` / `Name`).
 fn track_from_item(item: Item) -> Option<Track> {
-    let item_id = item.id?.trim().to_string();
-    if item_id.is_empty() {
-        return None;
-    }
+    let item_id = ItemId::parse(item.id?.trim())?;
     let title = item.name?.trim().to_string();
     if title.is_empty() {
         return None;
@@ -367,7 +446,8 @@ mod tests {
     #[test]
     fn the_library_page_parses_and_maps_every_field() {
         let server = MockServer::start();
-        let (tracks, total) = server.client(KEY).page("user1", 0, PAGE_SIZE).unwrap();
+        let LibraryPage { tracks, total, .. } =
+            server.client(KEY).page("user1", 0, PAGE_SIZE).unwrap();
 
         assert_eq!(total, 600, "TotalRecordCount");
         assert_eq!(tracks.len(), 2, "both items mapped");
@@ -397,7 +477,8 @@ mod tests {
     #[test]
     fn later_pages_are_empty_and_keep_the_total() {
         let server = MockServer::start();
-        let (tracks, total) = server.client(KEY).page("user1", 500, PAGE_SIZE).unwrap();
+        let LibraryPage { tracks, total, .. } =
+            server.client(KEY).page("user1", 500, PAGE_SIZE).unwrap();
         assert!(tracks.is_empty());
         assert_eq!(total, 600);
     }
@@ -411,7 +492,7 @@ mod tests {
         client.user_id(None).expect("/Users answers");
         client.page("user1", 0, PAGE_SIZE).expect("/Items answers");
         client
-            .open_original("item1", Some(0))
+            .open_original(&"item1".into(), Some(0))
             .expect("stream answers");
 
         let log = server.log();
@@ -486,6 +567,52 @@ mod tests {
         assert!(matches!(messages[2], JfMsg::Done), "…then Done");
     }
 
+    /// Audit S5: a body past the JSON cap is refused, never buffered whole.
+    #[test]
+    fn an_oversized_json_body_is_refused() {
+        let server = MockServer::start();
+        let mut client = server.client(KEY);
+        client.max_json_bytes = 4096;
+        assert!(client.page("user1", 0, PAGE_SIZE).is_ok(), "fits the cap");
+        server.set_items_padding(8192);
+        assert_eq!(
+            client
+                .page("user1", 0, PAGE_SIZE)
+                .expect_err("over the cap"),
+            "jellyfin: bad response from server"
+        );
+    }
+
+    /// Audit S5: a server whose `TotalRecordCount` lies (huge) must not
+    /// keep the loader paging through empty pages for ever — the first
+    /// empty page ends the walk, as the loop's comment always promised.
+    #[test]
+    fn a_lying_total_stops_at_the_first_empty_page() {
+        let server = MockServer::start();
+        server.set_items_total(1_000_000_000);
+        let (tx, rx) = mpsc::channel();
+        spawn_library_load(server.client(KEY), None, tx);
+        let mut pages = 0;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(JfMsg::Page { .. }) => {
+                    pages += 1;
+                    assert!(pages <= 10, "still paging after {pages} pages");
+                }
+                Ok(JfMsg::Done) => break,
+                Ok(JfMsg::Error(reason)) => panic!("unexpected error {reason}"),
+                Err(reason) => panic!("loader did not stop: {reason:?} after {pages} pages"),
+            }
+        }
+        assert_eq!(pages, 2, "the items page, then the empty one");
+        let items_requests = server
+            .log()
+            .iter()
+            .filter(|logged| logged.line.contains("/Items"))
+            .count();
+        assert_eq!(items_requests, 2, "no request past the empty page");
+    }
+
     /// Plan 08, step 7 (d): 401 → the fixed message, key nowhere in it.
     #[test]
     fn a_401_says_invalid_api_key_without_leaking_the_key() {
@@ -499,7 +626,9 @@ mod tests {
         assert!(!err.contains(&server.base), "no URL in the error: {err}");
 
         // The same for the raw stream call.
-        let err = client.open_original("item1", None).expect_err("401");
+        let err = client
+            .open_original(&"item1".into(), None)
+            .expect_err("401");
         assert_eq!(err, "jellyfin: invalid API key");
     }
 
@@ -510,6 +639,7 @@ mod tests {
         let config = JellyfinConfig {
             url: "http://127.0.0.1:9".into(),
             api_key: KEY.into(),
+            api_key_file: None,
             user: None,
             mode: JellyfinMode::Cache,
             cache_ahead: 3,
@@ -540,6 +670,55 @@ mod tests {
         assert_eq!(server.client(KEY).user_id(None).as_deref(), Ok("user1"));
     }
 
+    /// An item whose only interesting field is its `Id`.
+    fn item_with_id(id: &str) -> Item {
+        Item {
+            id: Some(id.to_string()),
+            name: Some("Song".into()),
+            artists: None,
+            album_artist: None,
+            run_time_ticks: None,
+            container: Some("flac".into()),
+            media_sources: None,
+        }
+    }
+
+    /// Audit S1: the `Id` becomes a URL path segment *and* a file name in
+    /// the cache dir, so anything that could leave that dir (or change the
+    /// URL) is dropped at the wire boundary. Real Jellyfin ids are 32 hex
+    /// digits; Emby-style numeric ids and the fixtures' short names pass.
+    #[test]
+    fn hostile_item_ids_are_dropped_at_the_boundary() {
+        for hostile in [
+            "../../../etc/evil",
+            "/abs/path",
+            "..",
+            "a/b",
+            "a\\b",
+            "a.b",
+            "%2e%2e",
+            "id?x=1",
+            "id with space",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                track_from_item(item_with_id(hostile)).is_none(),
+                "hostile id {hostile:?} must not become a track"
+            );
+        }
+        for fine in [
+            "0123456789abcdef0123456789abcdef",
+            "12345",
+            "item1",
+            "a-b_c",
+        ] {
+            assert!(
+                track_from_item(item_with_id(fine)).is_some(),
+                "id {fine:?} is valid"
+            );
+        }
+    }
+
     /// Small helper: the item id behind a remote track.
     trait RemoteItemId {
         fn remote_item_id(&self) -> Option<&str>;
@@ -547,7 +726,7 @@ mod tests {
     impl RemoteItemId for Track {
         fn remote_item_id(&self) -> Option<&str> {
             match &self.source {
-                TrackSource::Remote { item_id, .. } => Some(item_id),
+                TrackSource::Remote { item_id, .. } => Some(item_id.as_str()),
                 TrackSource::Local(_) => None,
             }
         }
@@ -585,6 +764,7 @@ mod tests {
         let config = JellyfinConfig {
             url,
             api_key: key,
+            api_key_file: None,
             user: None,
             mode: JellyfinMode::Cache,
             cache_ahead: 3,
@@ -597,7 +777,8 @@ mod tests {
 
         // 1. The real library pages in.
         let user = client.user_id(None).expect("users on a real server");
-        let (tracks, total) = client.page(&user, 0, PAGE_SIZE).expect("first page");
+        let LibraryPage { tracks, total, .. } =
+            client.page(&user, 0, PAGE_SIZE).expect("first page");
         assert!(total > 0 && !tracks.is_empty(), "library of {total}");
         eprintln!("library: {total} tracks, first page has {}", tracks.len());
         let mut refs: Vec<RemoteRef> = Vec::new();
@@ -619,7 +800,7 @@ mod tests {
         {
             let mut cache =
                 Cache::new(client.clone(), Some(parent.path().to_path_buf())).expect("cache dir");
-            let wait_ready = |cache: &mut Cache, ids: &[String]| {
+            let wait_ready = |cache: &mut Cache, ids: &[ItemId]| {
                 let started = Instant::now();
                 while started.elapsed() < Duration::from_secs(60) {
                     cache.poll();
@@ -631,7 +812,7 @@ mod tests {
                 panic!("timed out waiting for {ids:?}");
             };
 
-            let three: Vec<String> = refs.iter().map(|r| r.item_id.clone()).collect();
+            let three: Vec<ItemId> = refs.iter().map(|r| r.item_id.clone()).collect();
             cache.set_window(refs.clone());
             wait_ready(&mut cache, &three);
             for id in &three {
@@ -711,7 +892,13 @@ mod tests {
 
         // 4. The engine really plays a remote track (audible for a moment;
         //    the device smoke test in `audio::engine` covers the rest).
-        let engine = Engine::spawn(Arc::new(SharedParams::new()), Some(client), true);
+        let engine = Engine::spawn(
+            Arc::new(SharedParams::new()),
+            Some(crate::audio::StreamSetup {
+                client,
+                fallback_parent: None,
+            }),
+        );
         engine.send(EngineCmd::LoadRemote {
             item_id: item.item_id.clone(),
             container: item.container.clone(),

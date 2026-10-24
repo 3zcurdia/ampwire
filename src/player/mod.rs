@@ -138,7 +138,7 @@ pub enum TrackSource {
     /// credentials never live here — the [`Client`][crate::jellyfin::Client]
     /// holds them.
     Remote {
-        item_id: String,
+        item_id: crate::jellyfin::ItemId,
         container: Option<String>,
     },
 }

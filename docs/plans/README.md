@@ -1,6 +1,7 @@
 # Ampwire plans — index and rules for implementers
 
-Plan `01` (layout) is done. Plans `02`–`08` turn the mock UI into a real player.
+Plan `01` (layout) is done. Plans `02`–`08` turn the mock UI into a real player;
+`09` (gapless) came out of the 2026-10-23 audit.
 **Do them in numeric order.** Each plan lists its prerequisites and assumes
 the earlier ones are merged.
 
@@ -14,6 +15,7 @@ the earlier ones are merged.
 | [06](06-equalizer-dsp.md) | ✅ done | Real 10-band equalizer + preamp | 05 |
 | [07](07-eq-presets.md) | ✅ done | Presets screen (full bass/treble, jazz, rock, …) | 06 |
 | [08](08-jellyfin.md) | ✅ done | Jellyfin server → playlist; temp-dir cache (3 ahead/3 behind) or HTTP streaming, optional EQ bypass | 03, 04, 05, 06 |
+| [09](09-gapless.md) | ⬜ not started | Gapless playback between same-format tracks; device/config cache | 03, 04, 05, 06, 08 |
 
 ## Status line — read it before you touch a plan
 

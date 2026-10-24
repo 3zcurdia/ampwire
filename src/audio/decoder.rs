@@ -30,9 +30,37 @@ use symphonia::core::units::{Time, TimeBase};
 /// keeps a malformed file from spinning forever.
 const MAX_PACKET_ERRORS: usize = 4096;
 
-/// The exact [`EngineCmd::Load`] failure a seek produced (some VBR MP3s
-/// cannot seek); the player restarts the track from 0 instead of skipping it.
-pub const SEEK_UNSUPPORTED: &str = "seek not supported";
+/// Why a track could not be opened or played. The one case the player
+/// handles differently gets its own variant — a failed *seek* (some VBR
+/// MP3s cannot seek) restarts the track from 0 instead of skipping it — so
+/// no caller ever matches on message text (audit D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayError {
+    SeekUnsupported,
+    /// Anything else, as the one-line reason shown to the user.
+    Failed(String),
+}
+
+impl std::fmt::Display for PlayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlayError::SeekUnsupported => f.write_str("seek not supported"),
+            PlayError::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for PlayError {
+    fn from(reason: String) -> PlayError {
+        PlayError::Failed(reason)
+    }
+}
+
+impl From<&str> for PlayError {
+    fn from(reason: &str) -> PlayError {
+        PlayError::Failed(reason.to_string())
+    }
+}
 
 /// Everything the player needs to know about a stream before playing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +101,7 @@ impl Decoder {
     /// skips the seek entirely (the common case). A failed seek is an error:
     /// some VBR MP3s cannot seek, and the player then restarts the track
     /// from 0 with a notice (plan §step 4).
-    pub fn open_at(path: &Path, start: Duration) -> Result<Decoder, String> {
+    pub fn open_at(path: &Path, start: Duration) -> Result<Decoder, PlayError> {
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
         let ext = path
             .extension()
@@ -90,7 +118,7 @@ impl Decoder {
         source: Box<dyn symphonia::core::io::MediaSource>,
         ext_hint: Option<&str>,
         start: Duration,
-    ) -> Result<Decoder, String> {
+    ) -> Result<Decoder, PlayError> {
         let mss = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
 
         let mut hint = Hint::new();
@@ -159,8 +187,8 @@ impl Decoder {
         let start_offset = if start.is_zero() {
             Duration::ZERO
         } else {
-            let time = Time::try_from_secs_f64(start.as_secs_f64())
-                .ok_or_else(|| SEEK_UNSUPPORTED.to_string())?;
+            let time =
+                Time::try_from_secs_f64(start.as_secs_f64()).ok_or(PlayError::SeekUnsupported)?;
             let seeked = format
                 .seek(
                     SeekMode::Accurate,
@@ -169,7 +197,7 @@ impl Decoder {
                         track_id: Some(track_id),
                     },
                 )
-                .map_err(|_| SEEK_UNSUPPORTED.to_string())?;
+                .map_err(|_| PlayError::SeekUnsupported)?;
             codec.reset();
             match time_base {
                 Some(time_base) => time_base
@@ -406,7 +434,7 @@ mod tests {
     }
 
     /// Decode everything a freshly-opened (and seeked) decoder yields.
-    fn decode_from(name: &str, start: Duration) -> Result<usize, String> {
+    fn decode_from(name: &str, start: Duration) -> Result<usize, PlayError> {
         let mut decoder = Decoder::open_at(&fixture(name), start)?;
         let mut samples = Vec::new();
         while decoder.read(&mut samples).expect("decodes after the seek") {}
@@ -459,7 +487,7 @@ mod tests {
         for start in [Duration::from_secs(5), Duration::from_secs(3_600)] {
             match decode_from("tone.wav", start) {
                 Ok(samples) => assert!(samples < 44_100, "at most a tail: {samples}"),
-                Err(reason) => assert!(!reason.is_empty(), "a real error message"),
+                Err(reason) => assert!(!reason.to_string().is_empty(), "a real error message"),
             }
         }
     }
@@ -469,9 +497,6 @@ mod tests {
         let err = Decoder::open_at(&fixture("tone.wav"), Duration::from_secs(10))
             .err()
             .expect("seeking past the end cannot yield a decoder");
-        assert!(
-            err.contains("seek") || err.contains("out-of-range"),
-            "clean seek error: {err}"
-        );
+        assert_eq!(err, PlayError::SeekUnsupported, "clean seek error: {err}");
     }
 }

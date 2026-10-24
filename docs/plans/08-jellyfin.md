@@ -337,3 +337,24 @@ Plan assumptions (remote-only counting in play order, the stream-mode
 blocking-read limitation — now also documented in the README as *"use cache
 mode on slow links"*, no startup auto-load, server order preserved) were kept
 as-is.
+
+## Post-audit corrections (2026-10-23)
+
+A security/performance audit after this plan shipped changed a few things
+the deviations above describe; the code and AGENTS.md are authoritative.
+
+- Deviation 5 overstated it: only the *extension* was sanitized. Server
+  `Id`s now go through `jellyfin::ItemId` (validated at the wire boundary),
+  so neither a URL path nor a cache file name can be steered.
+- Deviation 11: the no-`Range` fallback no longer blocks the engine thread
+  (it downloads on its own cancellable thread), honours `cache_dir`, and its
+  directory is removed when the engine exits. The stale-dir sweep runs at
+  startup in every mode, not only in `cache` mode.
+- Deviation 2: the probe's `bytes=0-` body is now kept as the first reader
+  (one request to open and read through, not two).
+- Deviation 10 does not hold in the running app: `App` takes the player's
+  notice every tick, so `buffering…` is usually gone from the player before
+  `Started` arrives and stays on screen until the next notice. Open question
+  for the owner (see the audit summary).
+- Cache directory creation is now hijack-safe (`create_own_dir`), the
+  library walk also stops on an empty page, and JSON bodies are capped.

@@ -157,7 +157,13 @@ pub struct JellyfinConfig {
     /// e.g. `http://192.168.1.10:8096`; trailing slash trimmed.
     pub url: String,
     /// API key from the Jellyfin dashboard. Header only, never a URL.
+    /// After loading it holds the *effective* key: `AMPWIRE_JELLYFIN_API_KEY`
+    /// beats `api_key_file`, which beats `api_key` (audit D6).
     pub api_key: String,
+    /// A file holding the key (whitespace trimmed), so it can stay out of
+    /// the config this app rewrites; relative paths are relative to the
+    /// config file's directory.
+    pub api_key_file: Option<std::path::PathBuf>,
     /// Optional user name; the first user is used when omitted.
     pub user: Option<String>,
     pub mode: JellyfinMode,
@@ -183,6 +189,7 @@ impl std::fmt::Debug for JellyfinConfig {
         f.debug_struct("JellyfinConfig")
             .field("url", &self.url)
             .field("api_key", &"<redacted>")
+            .field("api_key_file", &self.api_key_file)
             .field("user", &self.user)
             .field("mode", &self.mode)
             .field("cache_ahead", &self.cache_ahead)
@@ -200,6 +207,7 @@ impl std::fmt::Debug for JellyfinConfig {
 struct JellyfinConfigRepr {
     url: String,
     api_key: String,
+    api_key_file: Option<std::path::PathBuf>,
     user: Option<String>,
     mode: Option<String>,
     cache_ahead: usize,
@@ -212,6 +220,7 @@ impl Default for JellyfinConfigRepr {
         Self {
             url: String::new(),
             api_key: String::new(),
+            api_key_file: None,
             user: None,
             mode: None,
             cache_ahead: 3,
@@ -235,6 +244,7 @@ impl From<JellyfinConfigRepr> for JellyfinConfig {
         Self {
             url: repr.url.trim_end_matches('/').to_string(),
             api_key: repr.api_key,
+            api_key_file: repr.api_key_file,
             user: repr.user,
             mode,
             cache_ahead: repr.cache_ahead,
@@ -265,7 +275,9 @@ impl Config {
                 read_only: false,
             };
         };
-        Self::load_from(&path)
+        let mut loaded = Self::load_from(&path);
+        apply_env_api_key(&mut loaded.config, std::env::var(API_KEY_ENV).ok());
+        loaded
     }
 
     pub fn load_from(path: &Path) -> LoadedConfig {
@@ -285,10 +297,13 @@ impl Config {
                 read_only: true,
             },
             Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(config) => {
+                Ok(mut config) => {
                     // A bad `[jellyfin] mode` is downgraded to `cache` with a
-                    // one-line notice; everything else still loads.
-                    let notice = config.jellyfin.as_ref().and_then(|jf| jf.notice.clone());
+                    // one-line notice; everything else still loads. So does
+                    // an unreadable `api_key_file`.
+                    let key_notice = read_api_key_file(&mut config, path);
+                    let notice = key_notice
+                        .or_else(|| config.jellyfin.as_ref().and_then(|jf| jf.notice.clone()));
                     LoadedConfig {
                         config: sanitize(config),
                         notice,
@@ -297,7 +312,10 @@ impl Config {
                 }
                 Err(err) => LoadedConfig {
                     config: Config::default(),
-                    notice: Some(format!("config invalid — not saving ({err})")),
+                    notice: Some(format!(
+                        "config invalid — not saving ({})",
+                        describe_parse_error(&err, &text)
+                    )),
                     read_only: true,
                 },
             },
@@ -370,12 +388,86 @@ impl Config {
         };
         fs::create_dir_all(parent)?;
         let tmp = path.with_extension("toml.tmp");
+        // The file may hold `[jellyfin] api_key` (README: `chmod 600`), so
+        // the replacement inherits the original's permissions — set on the
+        // temp file *before* any byte is written, never widened by the
+        // rename. A stale temp file from a crashed save is removed first:
+        // its mode is unknown.
+        let original = fs::metadata(path).ok().map(|meta| meta.permissions());
+        let _ = fs::remove_file(&tmp);
         {
-            let mut file = fs::File::create(&tmp)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            if let Some(perms) = &original {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                options.mode(perms.mode() & 0o777);
+            }
+            let mut file = options.open(&tmp)?;
+            if let Some(perms) = original {
+                // `mode()` above is filtered by the umask; this is exact.
+                file.set_permissions(perms)?;
+            }
             file.write_all(doc.to_string().as_bytes())?;
             file.sync_all()?;
         }
         fs::rename(&tmp, path)
+    }
+}
+
+/// The environment variable that supplies the Jellyfin key (audit D6).
+pub const API_KEY_ENV: &str = "AMPWIRE_JELLYFIN_API_KEY";
+
+/// `[jellyfin] api_key_file` → `api_key` (trimmed). Relative paths resolve
+/// against the config file's directory. Returns the notice for a file that
+/// cannot be read — never its path's contents, and the key stays as it was.
+fn read_api_key_file(config: &mut Config, config_path: &Path) -> Option<String> {
+    let jf = config.jellyfin.as_mut()?;
+    let file = jf.api_key_file.as_ref()?;
+    let file = match config_path.parent() {
+        Some(dir) if file.is_relative() => dir.join(file),
+        _ => file.clone(),
+    };
+    match fs::read_to_string(file) {
+        Ok(key) if !key.trim().is_empty() => {
+            jf.api_key = key.trim().to_string();
+            None
+        }
+        _ => Some("jellyfin: cannot read api_key_file".into()),
+    }
+}
+
+/// `AMPWIRE_JELLYFIN_API_KEY`, when set and not blank, replaces the key of
+/// an existing `[jellyfin]` section (it never creates one: a key without a
+/// URL configures nothing). Never written back by [`Config::save`].
+pub fn apply_env_api_key(config: &mut Config, value: Option<String>) {
+    if let (Some(jf), Some(value)) = (config.jellyfin.as_mut(), value)
+        && !value.trim().is_empty()
+    {
+        jf.api_key = value.trim().to_string();
+    }
+}
+
+/// `line 3, column 24: invalid basic string` — where and what, on one line.
+/// toml's own `Display` quotes the offending source line, and serde quotes
+/// bad values in backticks; either can be the `[jellyfin] api_key`, so
+/// neither reaches the notice (audit S3).
+fn describe_parse_error(err: &toml::de::Error, text: &str) -> String {
+    let first_line = err.message().lines().next().unwrap_or("").trim();
+    // Odd segments sit between backticks: a quoted value.
+    let message: String = first_line
+        .split('`')
+        .enumerate()
+        .map(|(i, part)| if i % 2 == 1 { "`…`" } else { part })
+        .collect();
+    match err.span() {
+        Some(span) => {
+            let before = text.get(..span.start).unwrap_or(text);
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+            format!("line {line}, column {column}: {message}")
+        }
+        None => message,
     }
 }
 
@@ -497,6 +589,37 @@ mod tests {
         );
         let notice = loaded.notice.as_deref().unwrap_or("");
         assert!(notice.contains("config invalid — not saving"), "{notice}");
+    }
+
+    /// Audit S3: toml's own error text quotes the offending source line —
+    /// which can be the `api_key` line. The notice must carry where and
+    /// what, on one line, never the source text (AGENTS: the key is never
+    /// in a notice).
+    #[test]
+    fn a_parse_error_notice_never_quotes_the_config_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[jellyfin]\nurl = \"http://x\"\napi_key = \"SECRETKEY123\ncache_ahead = 3\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        assert!(loaded.read_only);
+        let notice = loaded.notice.expect("a notice");
+        assert!(!notice.contains("SECRETKEY123"), "key leaked: {notice}");
+        assert!(!notice.contains('\n'), "one line: {notice:?}");
+        assert!(
+            notice.starts_with("config invalid — not saving"),
+            "{notice}"
+        );
+        assert!(notice.contains("line 3"), "says where: {notice}");
+
+        // A type error quotes the bad *value* — redacted the same way.
+        fs::write(&path, "[jellyfin]\napi_key = 12345678\n").unwrap();
+        let notice = Config::load_from(&path).notice.expect("a notice");
+        assert!(!notice.contains("12345678"), "value leaked: {notice}");
+        assert!(notice.contains("line 2"), "{notice}");
     }
 
     #[test]
@@ -713,6 +836,79 @@ cache_ahead = 5
 cache_behind = 2
 ";
 
+    /// Audit D6: the key can live outside the auto-saved config — in a file
+    /// of its own (`api_key_file`, relative to the config's directory) …
+    #[test]
+    fn api_key_file_supplies_the_key_and_is_never_saved_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(dir.path().join("jellyfin.key"), "  filekey123\n").unwrap();
+        fs::write(
+            &path,
+            "[jellyfin]\nurl = \"http://x\"\napi_key_file = \"jellyfin.key\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.notice, None);
+        let jf = loaded.config.jellyfin.clone().expect("section");
+        assert_eq!(jf.api_key, "filekey123", "trimmed file contents");
+        assert!(jf.is_complete());
+        assert!(
+            !format!("{jf:?}").contains("filekey123"),
+            "Debug redacts it"
+        );
+
+        let mut config = loaded.config;
+        config.audio.volume = 40;
+        config.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("filekey123"), "never written back: {text}");
+        assert!(text.contains("api_key_file = \"jellyfin.key\""), "{text}");
+    }
+
+    #[test]
+    fn an_unreadable_api_key_file_is_a_notice_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[jellyfin]\nurl = \"http://x\"\napi_key_file = \"missing.key\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        assert!(!loaded.read_only, "the rest of the config still loads");
+        assert_eq!(
+            loaded.notice.as_deref(),
+            Some("jellyfin: cannot read api_key_file")
+        );
+        assert!(!loaded.config.jellyfin.unwrap().is_complete());
+    }
+
+    /// … or in the environment, which wins over both config fields.
+    #[test]
+    fn the_environment_key_overrides_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, JF_TOML).unwrap();
+        let mut loaded = Config::load_from(&path);
+        apply_env_api_key(&mut loaded.config, Some("envkey456".into()));
+        assert_eq!(
+            loaded.config.jellyfin.as_ref().unwrap().api_key,
+            "envkey456"
+        );
+        // Unset or blank: the config's key stands.
+        apply_env_api_key(&mut loaded.config, Some("  ".into()));
+        apply_env_api_key(&mut loaded.config, None);
+        assert_eq!(
+            loaded.config.jellyfin.as_ref().unwrap().api_key,
+            "envkey456"
+        );
+        // No `[jellyfin]` section: the variable alone configures nothing.
+        let mut bare = Config::default();
+        apply_env_api_key(&mut bare, Some("envkey456".into()));
+        assert!(bare.jellyfin.is_none());
+    }
+
     #[test]
     fn jellyfin_section_parses_and_normalizes() {
         let dir = tempfile::tempdir().unwrap();
@@ -786,6 +982,27 @@ cache_behind = 2
         // …and it reloads to the same thing (the key round-trips).
         let reloaded = Config::load_from(&path).config;
         assert_eq!(reloaded.jellyfin, config.jellyfin);
+    }
+
+    /// Audit S2: the README says `chmod 600 config.toml` (it holds the API
+    /// key); a debounced save must not hand back a world-readable file.
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, JF_TOML).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut config = Config::load_from(&path).config;
+        config.audio.volume = 70;
+        config.save(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "save widened the mode to {mode:o}");
+        // A sibling temp file is never left behind either.
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 
     #[test]

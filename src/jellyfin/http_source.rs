@@ -8,16 +8,19 @@
 //! Forward seeks inside that margin just discard bytes from the body that
 //! is already flowing.
 //!
-//! The type sits behind a `Mutex` because symphonia's [`MediaSource`] must
-//! be `Sync`; the lock covers only bookkeeping and the socket read — never
-//! the UI thread (decoding happens on the engine thread).
+//! The open body sits in a `Mutex` only because symphonia's [`MediaSource`]
+//! must be `Sync` and a boxed reader is not; `Read` has `&mut self`, so it
+//! reaches the body through `Mutex::get_mut` and never actually locks.
 
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use symphonia::core::io::MediaSource;
 
-use super::Client;
+use super::cache::{DownloadError, MAX_FILE_BYTES, RemoteRef, download_original};
+use super::{Client, ItemId};
 
 /// Forward seeks up to this distance are served by discarding from the
 /// open body instead of re-opening a connection (the plan's 64 KiB).
@@ -47,7 +50,7 @@ struct BodyState {
 /// A `Read + Seek` view of `GET /Audio/{id}/stream?static=true`.
 pub struct HttpRangeSource {
     client: Client,
-    item_id: String,
+    item_id: ItemId,
     /// Total length from the probe's `Content-Range` (`byte_len`).
     len: u64,
     /// Logical cursor: moved by `Seek`, advanced by `Read`.
@@ -62,7 +65,10 @@ pub struct HttpRangeSource {
 impl HttpRangeSource {
     /// Probe the item once (`Range: bytes=0-`) to learn its length and to
     /// prove the server answers `206`. `200` (whole body) → [`OpenError::NoRanges`].
-    pub fn open(client: Client, item_id: &str) -> Result<HttpRangeSource, OpenError> {
+    /// The probe's body *is* the stream from offset 0, so it becomes the
+    /// first reader — reading straight through costs this one request
+    /// (audit P4).
+    pub fn open(client: Client, item_id: &ItemId) -> Result<HttpRangeSource, OpenError> {
         let response = client
             .open_original(item_id, Some(0))
             .map_err(OpenError::Failed)?;
@@ -70,14 +76,18 @@ impl HttpRangeSource {
             return Err(OpenError::NoRanges);
         }
         let len = content_range_total(&response).ok_or(OpenError::NoRanges)?;
+        let reader: Box<dyn Read + Send> = Box::new(BufReader::with_capacity(
+            READ_BUFFER,
+            response.into_body().into_reader(),
+        ));
         Ok(HttpRangeSource {
             client,
-            item_id: item_id.to_string(),
+            item_id: item_id.clone(),
             len,
             pos: 0,
             margin: FORWARD_SEEK_LIMIT,
             body: Mutex::new(BodyState {
-                reader: None,
+                reader: Some(reader),
                 body_pos: 0,
             }),
         })
@@ -96,7 +106,8 @@ impl Read for HttpRangeSource {
         if out.is_empty() || self.pos >= self.len {
             return Ok(0); // clean EOF (a seek past the end never loops)
         }
-        let mut state = self.body.lock().expect("http source body lock");
+        // `&mut self`: no other borrow can exist, so no locking either.
+        let state = self.body.get_mut().expect("http source body lock");
 
         // Re-open when the open body cannot serve the cursor: nothing open
         // yet, a backwards move, or a forward jump past the discard margin.
@@ -180,53 +191,31 @@ impl MediaSource for HttpRangeSource {
 }
 
 /// Whole-file fallback for a server that ignores `Range` (plan 08 §6:
-/// "fall back to **cache mode for this track**"): download the original once
-/// into `ampwire-jellyfin-<pid>/<id>.<ext>` and hand back the local path, so
-/// decoding, seeking, EQ and the spectrum tap all work unchanged. A file an
-/// earlier play of the same item left behind is reused. Same 512 MiB cap as
-/// the cache, same key-free error texts.
+/// "fall back to **cache mode for this track**"): download the original
+/// into `dir` (the engine's own `ampwire-jellyfin-<pid>`, removed when the
+/// engine exits) and hand back the local path, so decoding, seeking, EQ and
+/// the spectrum tap all work unchanged. Same code path as the cache window
+/// ([`download_original`]: reuse, `.part` → rename, 512 MiB cap, key-free
+/// errors). Blocking — the engine runs it on its own thread and sets
+/// `cancel` to abandon it (audit P2).
 pub fn download_fallback(
     client: &Client,
-    item_id: &str,
+    item_id: &ItemId,
     container: Option<&str>,
-) -> Result<std::path::PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("ampwire-jellyfin-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)
-        .map_err(|reason| format!("jellyfin: cannot create the temp dir ({reason})"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
-
-    let path = dir.join(format!("{}.{}", item_id, super::container_ext(container)));
-    if path.is_file() {
-        return Ok(path);
-    }
-
-    let part = dir.join(format!("{item_id}.part"));
-    let mut reader = {
-        let response = client.open_original(item_id, None)?;
-        response
-            .into_body()
-            .into_reader()
-            .take(super::cache::MAX_FILE_BYTES + 1)
+    dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<PathBuf, String> {
+    let item = RemoteRef {
+        item_id: item_id.clone(),
+        container: container.map(str::to_string),
     };
-    let mut file = std::fs::File::create(&part)
-        .map_err(|reason| format!("jellyfin: cannot write the temp file ({reason})"))?;
-    let copied = std::io::copy(&mut reader, &mut file)
-        .map_err(|_| "jellyfin: cannot reach server".to_string())?;
-    drop(file);
-    if copied > super::cache::MAX_FILE_BYTES {
-        let _ = std::fs::remove_file(&part);
-        return Err(format!(
-            "file is over the {} MiB limit",
-            super::cache::MAX_FILE_BYTES / (1024 * 1024)
-        ));
-    }
-    std::fs::rename(&part, &path)
-        .map_err(|reason| format!("jellyfin: cannot write the temp file ({reason})"))?;
-    Ok(path)
+    download_original(client, &item, dir, MAX_FILE_BYTES, || {
+        cancel.load(Ordering::Relaxed)
+    })
+    .map_err(|error| match error {
+        DownloadError::Interrupted => "jellyfin: download cancelled".to_string(),
+        DownloadError::Failed(reason) => reason,
+    })
 }
 
 /// `Content-Range: bytes 0-1/8223082` → `8223082`.
@@ -262,7 +251,7 @@ mod tests {
         let client = server.client(KEY);
         let on_disk = fixture_bytes();
 
-        let mut source = HttpRangeSource::open(client.clone(), "any").expect("206 server");
+        let mut source = HttpRangeSource::open(client.clone(), &"any".into()).expect("206 server");
         assert_eq!(
             MediaSource::byte_len(&source),
             Some(on_disk.len() as u64),
@@ -331,7 +320,7 @@ mod tests {
     #[test]
     fn decoder_open_source_decodes_the_stream() {
         let server = MockServer::start();
-        let source = HttpRangeSource::open(server.client(KEY), "any").expect("206 server");
+        let source = HttpRangeSource::open(server.client(KEY), &"any".into()).expect("206 server");
         let mut decoder =
             crate::audio::Decoder::open_source(Box::new(source), Some("flac"), Duration::ZERO)
                 .expect("the streamed file decodes");
@@ -358,7 +347,7 @@ mod tests {
         server.set_no_ranges(true);
         let client = server.client(KEY);
 
-        let probe = HttpRangeSource::open(client.clone(), "any");
+        let probe = HttpRangeSource::open(client.clone(), &"any".into());
         let error = match probe {
             Err(error) => error,
             Ok(_) => panic!("a 200 answer must not yield a seekable source"),
@@ -366,26 +355,62 @@ mod tests {
         assert_eq!(error, OpenError::NoRanges, "200 instead of 206");
 
         // "Cache mode for this track": download once, bytes identical.
-        let path = download_fallback(&client, "any", Some("flac")).expect("downloads");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let never = AtomicBool::new(false);
+        let path = download_fallback(&client, &"any".into(), Some("flac"), dir.path(), &never)
+            .expect("downloads");
         assert_eq!(
             std::fs::read(&path).expect("readable"),
             fixture_bytes(),
             "the fallback file is the original"
         );
-        assert!(
-            path.file_name().unwrap().to_string_lossy() == "any.flac",
-            "named after the item: {path:?}"
-        );
+        assert_eq!(path, dir.path().join("any.flac"), "named after the item");
         // Reuse on a second play: no second download.
         let requests = server.log().len();
-        let again = download_fallback(&client, "any", Some("flac")).expect("reuses");
+        let again = download_fallback(&client, &"any".into(), Some("flac"), dir.path(), &never)
+            .expect("reuses");
         assert_eq!(again, path, "same file");
         assert_eq!(server.log().len(), requests, "nothing re-fetched");
+    }
 
-        // This test owns the default temp dir (nothing else in the suite
-        // uses it): clean it up like a session's exit would.
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+    /// Audit P4: the probe's `bytes=0-` answer already *is* the body from
+    /// offset 0 — opening and then reading straight through costs one
+    /// request, not a probe that is thrown away plus a re-open.
+    #[test]
+    fn opening_and_reading_through_is_a_single_request() {
+        let server = MockServer::start();
+        let mut source =
+            HttpRangeSource::open(server.client(KEY), &"any".into()).expect("206 server");
+        let mut all = Vec::new();
+        source.read_to_end(&mut all).expect("reads");
+        assert_eq!(all, fixture_bytes());
+        assert_eq!(
+            server.log().len(),
+            1,
+            "probe body reused: {:?}",
+            server.log()
+        );
+    }
+
+    /// Audit P2: the engine cancels a fallback download (Stop, Next, quit)
+    /// and nothing half-written survives.
+    #[test]
+    fn a_cancelled_fallback_download_leaves_nothing_behind() {
+        let server = MockServer::start();
+        server.set_no_ranges(true);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cancel = AtomicBool::new(true);
+        let result = download_fallback(
+            &server.client(KEY),
+            &"any".into(),
+            Some("flac"),
+            dir.path(),
+            &cancel,
+        );
+        assert_eq!(result, Err("jellyfin: download cancelled".to_string()));
+        assert!(
+            dir.path().read_dir().unwrap().next().is_none(),
+            "no .part left"
+        );
     }
 }

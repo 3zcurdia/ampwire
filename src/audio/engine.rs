@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -20,11 +20,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::jellyfin::Client;
+use crate::jellyfin::cache::create_own_dir;
 use crate::jellyfin::http_source::{HttpRangeSource, OpenError, download_fallback};
+use crate::jellyfin::{Client, ItemId};
 
 use super::dsp::{Dsp, SharedParams};
-use super::{Decoder, StreamInfo};
+use super::{Decoder, PlayError, StreamInfo};
 
 /// How often the engine thread wakes to feed the ring buffer / poll commands.
 /// Never busy-spins, never sleeps long enough to starve the callback.
@@ -51,7 +52,7 @@ pub enum EngineCmd {
     /// engine builds the seekable [`HttpRangeSource`] itself, so the
     /// credentials (the [`Client`]) live here and never in a `Track`.
     LoadRemote {
-        item_id: String,
+        item_id: ItemId,
         /// Container name from the library page, as the probe hint.
         container: Option<String>,
         start: Duration,
@@ -84,8 +85,9 @@ pub enum EngineEvent {
     Started(StreamInfo, PlaybackHandle),
     /// The decoder hit EOF **and** the ring buffer drained: auto-advance.
     Finished,
-    /// The track could not be played (bad file, unsupported device config…).
-    Error(String),
+    /// The track could not be played (bad file, unsupported device config,
+    /// a seek the container refuses…).
+    Error(PlayError),
     /// A remote track is being probed/opened — show `buffering…` *before*
     /// the blocking round trip (plan 08, step 6).
     Buffering,
@@ -109,19 +111,31 @@ pub struct Engine {
     join: Option<JoinHandle<()>>,
 }
 
+/// What the engine needs for `mode = "stream"` / `"stream_pure"` (plan 08,
+/// step 6). Present ⇔ a stream mode: remote loads, the ≈2 s ring, and the
+/// no-`Range` fallback directory.
+pub struct StreamSetup {
+    /// Builds each [`HttpRangeSource`] — the credentials stay here, never
+    /// in a `Track`.
+    pub client: Client,
+    /// Parent of the fallback's `ampwire-jellyfin-<pid>` (`[jellyfin]
+    /// cache_dir`; the system temp dir when `None`). Created on the first
+    /// fallback only, removed when the engine thread exits.
+    pub fallback_parent: Option<PathBuf>,
+}
+
 impl Engine {
     /// Spawn the engine thread. The device itself is opened lazily, on the
     /// first `Load` — spawning is safe on machines with no audio hardware.
     /// `params` are the shared volume/balance targets the callback reads
-    /// (plan 05); the engine never writes them. `client` is the Jellyfin
-    /// client for `stream*` modes (`None` without `[jellyfin]`, and unused
-    /// in `cache` mode), `streaming` picks the bigger ~2 s ring buffer.
-    pub fn spawn(params: Arc<SharedParams>, client: Option<Client>, streaming: bool) -> Engine {
+    /// (plan 05); the engine never writes them. `stream` is `Some` in the
+    /// `stream*` modes only.
+    pub fn spawn(params: Arc<SharedParams>, stream: Option<StreamSetup>) -> Engine {
         let (cmd_tx, cmd_rx) = channel();
         let (ev_tx, ev_rx) = channel();
         let join = std::thread::Builder::new()
             .name("ampwire-engine".into())
-            .spawn(move || run(cmd_rx, ev_tx, params, client, streaming))
+            .spawn(move || run(cmd_rx, ev_tx, params, stream))
             .expect("spawn the audio engine thread");
         Engine {
             tx: cmd_tx,
@@ -205,15 +219,33 @@ impl Playing {
     }
 }
 
+/// A no-`Range` fallback download running on its own thread (audit P2):
+/// the engine keeps serving commands meanwhile, and anything that replaces
+/// the track — `Load`, `LoadRemote`, `Stop`, `Shutdown` — sets `cancel` and
+/// drops it, so a late result is never played.
+struct PendingDownload {
+    done: Receiver<Result<PathBuf, String>>,
+    cancel: Arc<AtomicBool>,
+    start: Duration,
+}
+
+impl Drop for PendingDownload {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The engine thread loop: commands → feed the ring → sleep.
 fn run(
     cmd_rx: Receiver<EngineCmd>,
     ev_tx: Sender<EngineEvent>,
     params: Arc<SharedParams>,
-    client: Option<Client>,
-    streaming: bool,
+    stream: Option<StreamSetup>,
 ) {
     let mut state: Option<Playing> = None;
+    let mut download: Option<PendingDownload> = None;
+    // The fallback's own `ampwire-jellyfin-<pid>`, created on first use.
+    let mut fallback_dir: Option<PathBuf> = None;
     // Pause flag shared with the callback. It deliberately lives *outside*
     // the per-track state and survives a `Load`, so a seek-while-paused
     // (Load + Pause) never audibly blips: whoever wants playback re-sends
@@ -222,7 +254,7 @@ fn run(
     let ctx = StartCtx {
         paused: &paused,
         params: &params,
-        streaming,
+        streaming: stream.is_some(),
     };
 
     loop {
@@ -234,6 +266,7 @@ fn run(
                     // Drop the old stream first: its ring buffer dies with it,
                     // so no stale audio survives into the next track.
                     state = None;
+                    download = None;
                     match start_track(&path, start, ctx) {
                         Ok((playing, handle)) => {
                             let _ = ev_tx
@@ -251,22 +284,23 @@ fn run(
                     start,
                 } => {
                     state = None;
+                    download = None;
                     // The probe + open blocks ≈ one round trip: tell the UI
                     // to show `buffering…` first (plan 08, step 6).
                     let _ = ev_tx.send(EngineEvent::Buffering);
-                    match open_remote(
-                        client.as_ref(),
-                        &item_id,
-                        container.as_deref(),
+                    let remote = RemoteLoad {
+                        item_id: &item_id,
+                        container: container.as_deref(),
                         start,
-                        ctx,
-                        &ev_tx,
-                    ) {
-                        Ok((playing, handle)) => {
+                    };
+                    match open_remote(stream.as_ref(), &mut fallback_dir, remote, ctx, &ev_tx) {
+                        Ok(Opened::Playing(opened)) => {
+                            let (playing, handle) = *opened;
                             let _ = ev_tx
                                 .send(EngineEvent::Started(playing.decoder.info().clone(), handle));
                             state = Some(playing);
                         }
+                        Ok(Opened::Downloading(pending)) => download = Some(pending),
                         Err(reason) => {
                             let _ = ev_tx.send(EngineEvent::Error(reason));
                         }
@@ -274,7 +308,10 @@ fn run(
                 }
                 EngineCmd::Pause => paused.store(true, Ordering::Relaxed),
                 EngineCmd::Resume => paused.store(false, Ordering::Relaxed),
-                EngineCmd::Stop => state = None,
+                EngineCmd::Stop => {
+                    state = None;
+                    download = None;
+                }
                 EngineCmd::Shutdown => {
                     shutdown = true;
                     break;
@@ -283,6 +320,31 @@ fn run(
         }
         if shutdown {
             break;
+        }
+
+        // A fallback download finished: play its file like any local one.
+        let downloaded = download
+            .as_ref()
+            .and_then(|pending| match pending.done.try_recv() {
+                Ok(result) => Some(result.map(|path| (path, pending.start))),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("jellyfin: download failed".into())),
+            });
+        if let Some(result) = downloaded {
+            download = None;
+            match result
+                .map_err(PlayError::Failed)
+                .and_then(|(path, start)| start_track(&path, start, ctx))
+            {
+                Ok((playing, handle)) => {
+                    let _ =
+                        ev_tx.send(EngineEvent::Started(playing.decoder.info().clone(), handle));
+                    state = Some(playing);
+                }
+                Err(reason) => {
+                    let _ = ev_tx.send(EngineEvent::Error(reason));
+                }
+            }
         }
 
         // 2. Surface a device failure (set from cpal's error callback).
@@ -305,7 +367,7 @@ fn run(
             }
         }
         if let Some(reason) = feed_error {
-            let _ = ev_tx.send(EngineEvent::Error(reason));
+            let _ = ev_tx.send(EngineEvent::Error(PlayError::Failed(reason)));
             state = None;
             continue;
         }
@@ -316,6 +378,13 @@ fn run(
 
         // 4. Never busy-spin.
         std::thread::sleep(FEED_INTERVAL);
+    }
+
+    // Exit: cancel a running download, then remove the fallback directory
+    // (the cache's own `Drop` rule, for the stream modes — audit S6).
+    drop(download);
+    if let Some(dir) = fallback_dir {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -337,38 +406,87 @@ fn start_track(
     path: &Path,
     start: Duration,
     ctx: StartCtx<'_>,
-) -> Result<(Playing, PlaybackHandle), String> {
+) -> Result<(Playing, PlaybackHandle), PlayError> {
     let decoder = Decoder::open_at(path, start)?;
     finish_start(decoder, ctx)
 }
 
+/// One `LoadRemote` request, borrowed from the command.
+struct RemoteLoad<'a> {
+    item_id: &'a ItemId,
+    container: Option<&'a str>,
+    start: Duration,
+}
+
+/// What [`open_remote`] got going.
+enum Opened {
+    /// Boxed: a live `Playing` dwarfs the download handle.
+    Playing(Box<(Playing, PlaybackHandle)>),
+    /// No `Range` support: the original is downloading on its own thread.
+    Downloading(PendingDownload),
+}
+
 /// Open a *remote* track (plan 08, step 6): the seekable HTTP source at
 /// `start`. A server that ignores `Range` ([`OpenError::NoRanges`]) falls
-/// back to downloading this one track to the temp dir first ("cache mode
-/// for this track"), with a notice so the silence is explained.
+/// back to downloading this one track first ("cache mode for this track"),
+/// with a notice so the silence is explained — on a thread of its own, so
+/// Stop/Next/quit never wait for it (audit P2).
 fn open_remote(
-    client: Option<&Client>,
-    item_id: &str,
-    container: Option<&str>,
-    start: Duration,
+    stream: Option<&StreamSetup>,
+    fallback_dir: &mut Option<PathBuf>,
+    remote: RemoteLoad<'_>,
     ctx: StartCtx<'_>,
     ev_tx: &Sender<EngineEvent>,
-) -> Result<(Playing, PlaybackHandle), String> {
-    let client = client.ok_or_else(|| "jellyfin: no server configured".to_string())?;
-    match HttpRangeSource::open(client.clone(), item_id) {
+) -> Result<Opened, PlayError> {
+    let stream = stream.ok_or_else(|| "jellyfin: no server configured".to_string())?;
+    match HttpRangeSource::open(stream.client.clone(), remote.item_id) {
         Ok(source) => {
-            let decoder = Decoder::open_source(Box::new(source), container, start)?;
-            finish_start(decoder, ctx)
+            let decoder = Decoder::open_source(Box::new(source), remote.container, remote.start)?;
+            Ok(Opened::Playing(Box::new(finish_start(decoder, ctx)?)))
         }
-        Err(OpenError::Failed(reason)) => Err(reason),
+        Err(OpenError::Failed(reason)) => Err(PlayError::Failed(reason)),
         Err(OpenError::NoRanges) => {
             // Not seekable over HTTP: download once, then play the local
             // file (seek, EQ and tap all work as usual from here).
             let _ = ev_tx.send(EngineEvent::Notice(
                 "jellyfin: server does not support ranges, downloading".into(),
             ));
-            let path = download_fallback(client, item_id, container)?;
-            start_track(&path, start, ctx)
+            let dir = match fallback_dir {
+                Some(dir) => dir.clone(),
+                None => {
+                    let parent = stream
+                        .fallback_parent
+                        .clone()
+                        .unwrap_or_else(std::env::temp_dir);
+                    let dir = create_own_dir(&parent)
+                        .map_err(|_| "jellyfin: cache unavailable".to_string())?;
+                    fallback_dir.insert(dir).clone()
+                }
+            };
+            let (done_tx, done) = channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let thread_cancel = Arc::clone(&cancel);
+            let client = stream.client.clone();
+            let item_id = remote.item_id.clone();
+            let container = remote.container.map(str::to_string);
+            std::thread::Builder::new()
+                .name("ampwire-jellyfin-fallback".into())
+                .spawn(move || {
+                    let result = download_fallback(
+                        &client,
+                        &item_id,
+                        container.as_deref(),
+                        &dir,
+                        &thread_cancel,
+                    );
+                    let _ = done_tx.send(result);
+                })
+                .map_err(|_| "jellyfin: download failed".to_string())?;
+            Ok(Opened::Downloading(PendingDownload {
+                done,
+                cancel,
+                start: remote.start,
+            }))
         }
     }
 }
@@ -377,7 +495,10 @@ fn open_remote(
 /// own format fits, build the ring, pre-fill it (so playback starts on
 /// sound, not silence) and `play()`. `streaming` doubles the ring (≈2 s) so
 /// a network hiccup cannot starve the callback (plan 08, step 6).
-fn finish_start(decoder: Decoder, ctx: StartCtx<'_>) -> Result<(Playing, PlaybackHandle), String> {
+fn finish_start(
+    decoder: Decoder,
+    ctx: StartCtx<'_>,
+) -> Result<(Playing, PlaybackHandle), PlayError> {
     let StartCtx {
         paused,
         params,
@@ -501,24 +622,21 @@ fn fill(
         return;
     }
     let channels = channels.max(1);
-    let mut frames_popped: u64 = 0;
-    for frame in data.chunks_mut(channels) {
-        let mut popped = 0;
-        for sample in frame.iter_mut() {
-            match consumer.pop() {
-                Ok(value) => {
-                    *sample = value;
-                    popped += 1;
-                }
-                // Ring drained: pad with silence, count nothing.
-                Err(_) => *sample = 0.0,
-            }
-        }
-        if popped == channels {
-            frames_popped += 1;
-        }
+    // Whole frames only: the engine may have pushed half a frame, and
+    // popping that alone would shift every later frame by a sample. The
+    // remainder waits in the ring for the rest of its frame. One bulk
+    // chunk read, not an atomic round trip per sample.
+    let frames_popped = (data.len() / channels).min(consumer.slots() / channels);
+    let filled = frames_popped * channels;
+    if let Ok(chunk) = consumer.read_chunk(filled) {
+        let (first, second) = chunk.as_slices();
+        data[..first.len()].copy_from_slice(first);
+        data[first.len()..filled].copy_from_slice(second);
+        chunk.commit_all();
     }
-    let filled = frames_popped as usize * channels;
+    // Ring drained: pad with silence, count nothing.
+    data[filled..].fill(0.0);
+    let frames_popped = frames_popped as u64;
     // 1. EQ first: everything downstream (tap, gains, device) hears the
     //    shaped signal.
     dsp.process_eq(&mut data[..filled]);
@@ -566,12 +684,60 @@ mod tests {
     #[test]
     fn dropping_the_engine_shuts_the_thread_down_promptly() {
         // No device is opened until a `Load`, so this is safe anywhere.
-        let engine = Engine::spawn(Arc::new(SharedParams::new()), None, false);
+        let engine = Engine::spawn(Arc::new(SharedParams::new()), None);
         let started = std::time::Instant::now();
         drop(engine); // sends Shutdown and joins
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "`q` must never wait on the audio thread"
+        );
+    }
+
+    /// Audit P2: a server that ignores `Range` makes the engine download the
+    /// whole original. That must not hold the engine thread hostage — `q`
+    /// (drop → Shutdown + join) returns promptly mid-download.
+    #[test]
+    fn quitting_during_a_fallback_download_is_prompt() {
+        use crate::jellyfin::test_server::{KEY, MockServer};
+        let server = MockServer::start();
+        server.set_no_ranges(true);
+        server.set_audio_delay(Duration::from_secs(3));
+        let parent = tempfile::tempdir().expect("fallback parent");
+        let engine = Engine::spawn(
+            Arc::new(SharedParams::new()),
+            Some(StreamSetup {
+                client: server.client(KEY),
+                fallback_parent: Some(parent.path().to_path_buf()),
+            }),
+        );
+        engine.send(EngineCmd::LoadRemote {
+            item_id: "slowfallback".into(),
+            container: Some("flac".into()),
+            start: Duration::ZERO,
+        });
+        // Wait until the engine has announced the fallback download.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut noticed = false;
+        while !noticed && std::time::Instant::now() < deadline {
+            noticed = engine
+                .poll()
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Notice(_)));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(noticed, "the range fallback started");
+
+        let started = std::time::Instant::now();
+        drop(engine);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "quit waited {:?} for the download",
+            started.elapsed()
+        );
+        // Audit S6: the fallback directory goes with the engine.
+        assert!(
+            parent.path().read_dir().unwrap().next().is_none(),
+            "fallback dir removed on exit"
         );
     }
 
@@ -593,7 +759,7 @@ mod tests {
 
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.wav");
-        let engine = Engine::spawn(Arc::new(SharedParams::new()), None, false);
+        let engine = Engine::spawn(Arc::new(SharedParams::new()), None);
         engine.send(EngineCmd::Load {
             path: fixture,
             start: Duration::ZERO,
@@ -613,7 +779,7 @@ mod tests {
                     EngineEvent::Finished => {
                         outcome = Some("Finished".to_string());
                     }
-                    EngineEvent::Error(reason) => outcome = Some(reason),
+                    EngineEvent::Error(reason) => outcome = Some(reason.to_string()),
                     EngineEvent::Buffering | EngineEvent::Notice(_) => {}
                 }
             }
@@ -728,6 +894,55 @@ mod tests {
         assert_eq!(&data[..4], &[0.25, 0.0, 0.25, 0.0], "popped: ×0.25");
         assert_eq!(&data[4..], &[0.0; 4], "padding untouched by DSP");
         drop(producer);
+    }
+
+    /// Audit P1: the engine pushes `min(pending, slots)` samples, so the
+    /// ring can end mid-frame. An underrun there must leave the dangling
+    /// sample in the ring — popping it alone would shift every later frame
+    /// by one sample (L/R swapped until the next `Load`) and put the gain
+    /// stage over the wrong range.
+    #[test]
+    fn an_underrun_mid_frame_never_splits_a_frame() {
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(16);
+        // Two whole frames (L = +n, R = −n), then frame 3's left only.
+        for sample in [1.0, -1.0, 2.0, -2.0, 3.0] {
+            producer.push(sample).expect("room");
+        }
+        let (mut tap_producer, _tap) = RingBuffer::<f32>::new(16);
+        let paused = AtomicBool::new(false);
+        let played = AtomicU64::new(0);
+        let mut dsp = unity_dsp(2);
+
+        let mut data = [9.9f32; 8]; // 4 frames asked, 2.5 available
+        fill(
+            &mut data,
+            &mut consumer,
+            &mut tap_producer,
+            &paused,
+            &played,
+            2,
+            &mut dsp,
+        );
+        assert_eq!(&data, &[1.0, -1.0, 2.0, -2.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(played.load(Ordering::Relaxed), 2);
+        assert_eq!(consumer.slots(), 1, "the half frame waits in the ring");
+
+        // The decoder catches up: frame 3's right, then frame 4.
+        for sample in [-3.0, 4.0, -4.0] {
+            producer.push(sample).expect("room");
+        }
+        let mut data = [9.9f32; 4];
+        fill(
+            &mut data,
+            &mut consumer,
+            &mut tap_producer,
+            &paused,
+            &played,
+            2,
+            &mut dsp,
+        );
+        assert_eq!(&data, &[3.0, -3.0, 4.0, -4.0], "channels stay aligned");
+        assert_eq!(played.load(Ordering::Relaxed), 4);
     }
 
     #[test]
