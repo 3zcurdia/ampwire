@@ -20,6 +20,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::jellyfin::Client;
+use crate::jellyfin::http_source::{HttpRangeSource, OpenError, download_fallback};
+
 use super::dsp::{Dsp, SharedParams};
 use super::{Decoder, StreamInfo};
 
@@ -42,6 +45,15 @@ pub enum EngineCmd {
         path: PathBuf,
         /// Start offset; `Duration::ZERO` for a plain load, `≈ position ± 5 s`
         /// for a seek (the engine reloads the stream at that point).
+        start: Duration,
+    },
+    /// Play a Jellyfin item straight from the server (plan 08, step 6): the
+    /// engine builds the seekable [`HttpRangeSource`] itself, so the
+    /// credentials (the [`Client`]) live here and never in a `Track`.
+    LoadRemote {
+        item_id: String,
+        /// Container name from the library page, as the probe hint.
+        container: Option<String>,
         start: Duration,
     },
     Pause,
@@ -74,6 +86,11 @@ pub enum EngineEvent {
     Finished,
     /// The track could not be played (bad file, unsupported device config…).
     Error(String),
+    /// A remote track is being probed/opened — show `buffering…` *before*
+    /// the blocking round trip (plan 08, step 6).
+    Buffering,
+    /// A one-off engine-side note (the `stream` range-fallback notice).
+    Notice(String),
 }
 
 /// The player's seam over the engine, so state-machine tests can run without
@@ -96,13 +113,15 @@ impl Engine {
     /// Spawn the engine thread. The device itself is opened lazily, on the
     /// first `Load` — spawning is safe on machines with no audio hardware.
     /// `params` are the shared volume/balance targets the callback reads
-    /// (plan 05); the engine never writes them.
-    pub fn spawn(params: Arc<SharedParams>) -> Engine {
+    /// (plan 05); the engine never writes them. `client` is the Jellyfin
+    /// client for `stream*` modes (`None` without `[jellyfin]`, and unused
+    /// in `cache` mode), `streaming` picks the bigger ~2 s ring buffer.
+    pub fn spawn(params: Arc<SharedParams>, client: Option<Client>, streaming: bool) -> Engine {
         let (cmd_tx, cmd_rx) = channel();
         let (ev_tx, ev_rx) = channel();
         let join = std::thread::Builder::new()
             .name("ampwire-engine".into())
-            .spawn(move || run(cmd_rx, ev_tx, params))
+            .spawn(move || run(cmd_rx, ev_tx, params, client, streaming))
             .expect("spawn the audio engine thread");
         Engine {
             tx: cmd_tx,
@@ -187,13 +206,24 @@ impl Playing {
 }
 
 /// The engine thread loop: commands → feed the ring → sleep.
-fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>, params: Arc<SharedParams>) {
+fn run(
+    cmd_rx: Receiver<EngineCmd>,
+    ev_tx: Sender<EngineEvent>,
+    params: Arc<SharedParams>,
+    client: Option<Client>,
+    streaming: bool,
+) {
     let mut state: Option<Playing> = None;
     // Pause flag shared with the callback. It deliberately lives *outside*
     // the per-track state and survives a `Load`, so a seek-while-paused
     // (Load + Pause) never audibly blips: whoever wants playback re-sends
     // Resume (or the player re-sends Pause right after the seek Load).
     let paused = Arc::new(AtomicBool::new(false));
+    let ctx = StartCtx {
+        paused: &paused,
+        params: &params,
+        streaming,
+    };
 
     loop {
         // 1. Commands (non-blocking).
@@ -204,7 +234,34 @@ fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>, params: Arc<Shar
                     // Drop the old stream first: its ring buffer dies with it,
                     // so no stale audio survives into the next track.
                     state = None;
-                    match start_track(&path, start, &paused, &params) {
+                    match start_track(&path, start, ctx) {
+                        Ok((playing, handle)) => {
+                            let _ = ev_tx
+                                .send(EngineEvent::Started(playing.decoder.info().clone(), handle));
+                            state = Some(playing);
+                        }
+                        Err(reason) => {
+                            let _ = ev_tx.send(EngineEvent::Error(reason));
+                        }
+                    }
+                }
+                EngineCmd::LoadRemote {
+                    item_id,
+                    container,
+                    start,
+                } => {
+                    state = None;
+                    // The probe + open blocks ≈ one round trip: tell the UI
+                    // to show `buffering…` first (plan 08, step 6).
+                    let _ = ev_tx.send(EngineEvent::Buffering);
+                    match open_remote(
+                        client.as_ref(),
+                        &item_id,
+                        container.as_deref(),
+                        start,
+                        ctx,
+                        &ev_tx,
+                    ) {
                         Ok((playing, handle)) => {
                             let _ = ev_tx
                                 .send(EngineEvent::Started(playing.decoder.info().clone(), handle));
@@ -262,6 +319,16 @@ fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>, params: Arc<Shar
     }
 }
 
+/// The per-session pieces every track start needs (engine thread only):
+/// the pause flag shared with the callback, the shared DSP targets, and the
+/// ring-buffer policy (streamed tracks get ≈2 s, files ≈0.5 s).
+#[derive(Clone, Copy)]
+struct StartCtx<'a> {
+    paused: &'a Arc<AtomicBool>,
+    params: &'a Arc<SharedParams>,
+    streaming: bool,
+}
+
 /// Open a track end-to-end: decode it (seeking first when `start` is
 /// non-zero), find a device config it fits, pre-fill the ring (so playback
 /// starts on sound, not silence), then `play()`. Returns the live state plus
@@ -269,10 +336,53 @@ fn run(cmd_rx: Receiver<EngineCmd>, ev_tx: Sender<EngineEvent>, params: Arc<Shar
 fn start_track(
     path: &Path,
     start: Duration,
-    paused: &Arc<AtomicBool>,
-    params: &Arc<SharedParams>,
+    ctx: StartCtx<'_>,
 ) -> Result<(Playing, PlaybackHandle), String> {
     let decoder = Decoder::open_at(path, start)?;
+    finish_start(decoder, ctx)
+}
+
+/// Open a *remote* track (plan 08, step 6): the seekable HTTP source at
+/// `start`. A server that ignores `Range` ([`OpenError::NoRanges`]) falls
+/// back to downloading this one track to the temp dir first ("cache mode
+/// for this track"), with a notice so the silence is explained.
+fn open_remote(
+    client: Option<&Client>,
+    item_id: &str,
+    container: Option<&str>,
+    start: Duration,
+    ctx: StartCtx<'_>,
+    ev_tx: &Sender<EngineEvent>,
+) -> Result<(Playing, PlaybackHandle), String> {
+    let client = client.ok_or_else(|| "jellyfin: no server configured".to_string())?;
+    match HttpRangeSource::open(client.clone(), item_id) {
+        Ok(source) => {
+            let decoder = Decoder::open_source(Box::new(source), container, start)?;
+            finish_start(decoder, ctx)
+        }
+        Err(OpenError::Failed(reason)) => Err(reason),
+        Err(OpenError::NoRanges) => {
+            // Not seekable over HTTP: download once, then play the local
+            // file (seek, EQ and tap all work as usual from here).
+            let _ = ev_tx.send(EngineEvent::Notice(
+                "jellyfin: server does not support ranges, downloading".into(),
+            ));
+            let path = download_fallback(client, item_id, container)?;
+            start_track(&path, start, ctx)
+        }
+    }
+}
+
+/// Everything after the decoder exists: pick a device config the track's
+/// own format fits, build the ring, pre-fill it (so playback starts on
+/// sound, not silence) and `play()`. `streaming` doubles the ring (≈2 s) so
+/// a network hiccup cannot starve the callback (plan 08, step 6).
+fn finish_start(decoder: Decoder, ctx: StartCtx<'_>) -> Result<(Playing, PlaybackHandle), String> {
+    let StartCtx {
+        paused,
+        params,
+        streaming,
+    } = ctx;
     let info = decoder.info().clone();
 
     let host = cpal::default_host();
@@ -289,8 +399,14 @@ fn start_track(
     let config = pick_config(&device, &info).map_err(|e| format!("{label}: {e}"))?;
 
     // ≈0.5 s of the track's *own* rate and channel count: no resampling.
-    let capacity = (info.sample_rate as usize * info.channels as usize / RING_SECONDS_DIVISOR)
-        .max(MIN_CHUNK * 2);
+    // Streamed tracks get ≈2 s (`rate * channels * 2`) so a network hiccup
+    // cannot starve the callback (plan 08, step 6).
+    let capacity = if streaming {
+        (info.sample_rate as usize * info.channels as usize * 2).max(MIN_CHUNK * 2)
+    } else {
+        (info.sample_rate as usize * info.channels as usize / RING_SECONDS_DIVISOR)
+            .max(MIN_CHUNK * 2)
+    };
     let (producer, mut consumer) = RingBuffer::<f32>::new(capacity);
 
     // The spectrum tap: one mono sample per played frame, dropped (never
@@ -450,7 +566,7 @@ mod tests {
     #[test]
     fn dropping_the_engine_shuts_the_thread_down_promptly() {
         // No device is opened until a `Load`, so this is safe anywhere.
-        let engine = Engine::spawn(Arc::new(SharedParams::new()));
+        let engine = Engine::spawn(Arc::new(SharedParams::new()), None, false);
         let started = std::time::Instant::now();
         drop(engine); // sends Shutdown and joins
         assert!(
@@ -477,7 +593,7 @@ mod tests {
 
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.wav");
-        let engine = Engine::spawn(Arc::new(SharedParams::new()));
+        let engine = Engine::spawn(Arc::new(SharedParams::new()), None, false);
         engine.send(EngineCmd::Load {
             path: fixture,
             start: Duration::ZERO,
@@ -498,6 +614,7 @@ mod tests {
                         outcome = Some("Finished".to_string());
                     }
                     EngineEvent::Error(reason) => outcome = Some(reason),
+                    EngineEvent::Buffering | EngineEvent::Notice(_) => {}
                 }
             }
             std::thread::sleep(Duration::from_millis(10));

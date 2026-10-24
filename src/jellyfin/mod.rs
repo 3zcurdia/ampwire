@@ -267,6 +267,22 @@ struct MediaSource {
     container: Option<String>,
 }
 
+/// File extension for a container name (`"m4a"` → `"m4a"`, a comma list →
+/// its first segment, junk/missing → `"bin"`): ASCII alphanumerics only, so
+/// a hostile server string can never escape the cache directory.
+pub(crate) fn container_ext(container: Option<&str>) -> String {
+    let cleaned: String = container
+        .unwrap_or("bin")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if cleaned.is_empty() {
+        "bin".into()
+    } else {
+        cleaned.to_lowercase()
+    }
+}
+
 /// Map one server item to a [`Track`]; `None` when the item cannot be
 /// played or identified (no `Id` / `Name`).
 fn track_from_item(item: Item) -> Option<Track> {

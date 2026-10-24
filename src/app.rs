@@ -141,9 +141,12 @@ pub enum ScanMode {
 /// The player driving the UI: the mock (demo, `--dump`, every test) or the
 /// real engine (a real, non-demo session). Both speak the same
 /// [`PlayerCommand`] / [`PlayerSnapshot`] contract, so `ui` never notices.
+/// Both variants are boxed: with plan 08's cache state the real player grew
+/// far past the mock, and the enum would otherwise carry the fat variant on
+/// every frame.
 pub enum Backend {
-    Mock(MockPlayer),
-    Real(RealPlayer),
+    Mock(Box<MockPlayer>),
+    Real(Box<RealPlayer>),
 }
 
 impl Backend {
@@ -241,7 +244,7 @@ impl App {
             eq_bands: DETERMINISTIC_EQ_BANDS,
             ..UiState::default()
         };
-        let player = Backend::Mock(MockPlayer::deterministic());
+        let player = Backend::Mock(Box::new(MockPlayer::deterministic()));
         let snapshot = player.snapshot();
         let now = Instant::now();
         Self {
@@ -294,8 +297,8 @@ impl App {
         // The low-level constructor always builds the mock: `--demo`, every
         // test and the golden frames depend on the 24-track fake playlist.
         // Real sessions come from `new_session` below (plan 02's precedent,
-        // re-confirmed for plan 03).
-        let player = Backend::Mock(MockPlayer::animated());
+        // re-confirmed for plan 03). `MockPlayer::default()` IS `animated()`.
+        let player = Backend::Mock(Box::default());
         let snapshot = player.snapshot();
         ui.playlist_cursor = ui
             .playlist_cursor
@@ -338,7 +341,7 @@ impl App {
         // the engine thread (dropped → Shutdown + join, so `q` exits fast).
         // `[jellyfin]` decides whether a rolling cache directory exists.
         let jellyfin = app.config.jellyfin.clone();
-        app.player = Backend::Real(RealPlayer::new(jellyfin.as_ref()));
+        app.player = Backend::Real(Box::new(RealPlayer::new(jellyfin.as_ref())));
         // Restore the remembered audio settings before anything plays.
         let audio = app.config.audio;
         app.player.handle(PlayerCommand::SetVolume(audio.volume));

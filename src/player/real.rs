@@ -28,7 +28,7 @@ use crate::jellyfin::cache::{Cache, CacheEvent, compute_window};
 use super::order::PlayOrder;
 use super::playlist::Playlist;
 use super::rng::Rng;
-use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, TrackSource};
+use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, Track, TrackSource};
 
 /// Only the last `TAP_ANALYZE` tapped samples feed one FFT frame.
 const TAP_ANALYZE: usize = 4096;
@@ -94,6 +94,9 @@ pub struct RealPlayer {
     /// A remote track is waiting for its file to finish downloading (cache
     /// mode). Cleared as soon as the download resolves or the user moves on.
     pending_remote: Option<String>,
+    /// `stream pure: eq bypassed` was already shown this session (plan 08:
+    /// notice once, not on every track change).
+    jf_pure_notice_shown: bool,
 }
 
 impl RealPlayer {
@@ -107,15 +110,23 @@ impl RealPlayer {
     /// startup); the stream modes create no directory at all.
     pub fn new(jellyfin: Option<&JellyfinConfig>) -> Self {
         let params = Arc::new(SharedParams::new());
-        let engine = Box::new(Engine::spawn(Arc::clone(&params)));
+        let config = jellyfin.filter(|config| config.is_complete());
+        // The engine holds the client for `stream*` modes (it builds the
+        // HTTP source itself, so credentials never reach a `Track`) and
+        // doubles its ring buffer when streaming (plan 08, step 6).
+        let client = config.map(Client::new);
+        let streaming = config.is_some_and(|config| config.mode != JellyfinMode::Cache);
+        let engine = Box::new(Engine::spawn(Arc::clone(&params), client, streaming));
         let mut player = Self::with_engine(engine, params);
-        if let Some(config) = jellyfin.filter(|config| config.is_complete()) {
+        if let Some(config) = config {
             player.jf_mode = Some(config.mode);
             player.jf_ahead = config.cache_ahead;
             player.jf_behind = config.cache_behind;
             if config.mode == JellyfinMode::Cache {
                 match Cache::new(Client::new(config), config.cache_dir.clone()) {
-                    Ok(cache) => player.cache = Some(cache),
+                    Ok(cache) => {
+                        player.cache = Some(cache);
+                    }
                     Err(reason) => {
                         player.notice = Some(format!("jellyfin: cache unavailable ({reason})"))
                     }
@@ -158,6 +169,7 @@ impl RealPlayer {
             jf_behind: 3,
             cache: None,
             pending_remote: None,
+            jf_pure_notice_shown: false,
         }
     }
 
@@ -168,15 +180,16 @@ impl RealPlayer {
             let mut format = self.format.clone();
             // Bit-perfect marker (plan 05/06): only a lossless source with
             // no DSP touching the samples — full volume, centered balance,
-            // no channel swap, and an EQ that is off or flat. A swap
-            // reorders the stream — sample *values* survive, but the device
-            // no longer receives the decoded layout — so it counts as
-            // processing too.
+            // no channel swap, and an EQ that is off, flat or bypassed for
+            // this track (`stream_pure`, plan 08 — same condition the DSP
+            // uses). A swap reorders the stream — sample *values* survive,
+            // but the device no longer receives the decoded layout — so it
+            // counts as processing too.
             format.bit_perfect = format.lossless
                 && self.volume == 100
                 && self.balance == 0
                 && !self.swap_channels
-                && !self.eq_active;
+                && !self.eq_shaping();
             format
         };
         PlayerSnapshot {
@@ -327,6 +340,23 @@ impl RealPlayer {
         self.params.set_eq(enabled, gains);
     }
 
+    /// Whether `stream_pure` has the EQ bypassed *right now*: the mode is
+    /// `stream_pure` and the current track is a Jellyfin item.
+    fn eq_bypassed(&self) -> bool {
+        matches!(self.jf_mode, Some(JellyfinMode::StreamPure))
+            && self
+                .playlist
+                .current()
+                .and_then(|index| self.playlist.tracks().get(index))
+                .is_some_and(Track::is_remote)
+    }
+
+    /// The EQ really shaping the samples right now — what the bit-perfect
+    /// marker must account for: on, not flat, and not bypassed.
+    fn eq_shaping(&self) -> bool {
+        self.eq_active && !self.eq_bypassed()
+    }
+
     /// Transport — everything that needs a non-empty playlist.
     fn handle_transport(&mut self, cmd: PlayerCommand) {
         if self.playlist.is_empty() {
@@ -435,6 +465,10 @@ impl RealPlayer {
                 EngineEvent::Started(info, handle) => self.on_started(info, handle),
                 EngineEvent::Finished => self.advance_after_end(),
                 EngineEvent::Error(reason) => self.on_error(reason),
+                // Plan 08, step 6: the engine announced the (blocking) probe
+                // of a remote track, or the stream range-fallback notice.
+                EngineEvent::Buffering => self.notice = Some("buffering…".into()),
+                EngineEvent::Notice(text) => self.notice = Some(text),
             }
         }
         self.poll_cache();
@@ -446,6 +480,11 @@ impl RealPlayer {
     /// tag is off by more than a second).
     fn on_started(&mut self, info: StreamInfo, handle: PlaybackHandle) {
         self.fail_streak = 0;
+        // Buffering is over: retire that exact notice if it is still up
+        // (anything else queued meanwhile keeps its place).
+        if self.notice.as_deref() == Some("buffering…") {
+            self.notice = None;
+        }
         if let Some(decoded) = info.duration {
             let tagged = self
                 .playlist
@@ -482,6 +521,13 @@ impl RealPlayer {
             bitrate_kbps,
             lossless: info.lossless,
         };
+        // `stream_pure` (plan 08): first remote track of the session — say
+        // what is different about it. Shown at `Started`, so it is never
+        // clobbered by (and never hides) the `buffering…` it follows.
+        if self.eq_bypassed() && !self.jf_pure_notice_shown {
+            self.jf_pure_notice_shown = true;
+            self.notice = Some("stream pure: eq bypassed".into());
+        }
     }
 
     /// A track could not be played: notice + skip to the next one, or stop
@@ -563,6 +609,11 @@ impl RealPlayer {
         self.handle = None;
         self.pending_start = Some(start);
         self.pending_remote = None;
+        // `stream_pure` (plan §6): while a remote track plays, the EQ is
+        // bypassed on the audio side; the very next local load restores it.
+        let bypass = matches!(self.jf_mode, Some(JellyfinMode::StreamPure))
+            && self.playlist.tracks().get(i).is_some_and(Track::is_remote);
+        self.params.set_eq_bypass(bypass);
         let engine_load = match source {
             TrackSource::Local(path) => {
                 self.engine.send(EngineCmd::Load { path, start });
@@ -592,7 +643,7 @@ impl RealPlayer {
     fn start_remote(
         &mut self,
         item_id: &str,
-        _container: Option<&str>,
+        container: Option<&str>,
         start: Duration,
         keep_paused: bool,
     ) -> bool {
@@ -617,13 +668,16 @@ impl RealPlayer {
                 let _ = keep_paused; // the state was already set by load_track
                 false
             }
-            // Plan 08, step 6 wires the HTTP `Range` source into the engine
-            // for these two modes; until then a remote track in stream mode
-            // stops with a reason rather than pretending to play.
+            // Stream modes (plan 08, step 6): the engine opens the seekable
+            // HTTP source itself — and announces `buffering…` before the
+            // probe blocks it for a round trip.
             JellyfinMode::Stream | JellyfinMode::StreamPure => {
-                self.stop_playback();
-                self.notice = Some("jellyfin: streaming not available yet".into());
-                false
+                self.engine.send(EngineCmd::LoadRemote {
+                    item_id: item_id.to_string(),
+                    container: container.map(str::to_string),
+                    start,
+                });
+                true
             }
         }
     }
@@ -1728,7 +1782,7 @@ mod tests {
         player.handle(PlayerCommand::Play);
         assert_eq!(
             load_paths(&cmds),
-            [path.clone()],
+            std::slice::from_ref(&path),
             "a cache hit is a plain local Load"
         );
         assert_eq!(player.state, PlayState::Playing);
@@ -1860,6 +1914,168 @@ mod tests {
         assert!(
             load_paths(&cmds).is_empty(),
             "a stale Ready must never start playback"
+        );
+    }
+
+    // --- stream modes (plan 08, step 6) ---
+
+    /// Every `LoadRemote`, as `(item_id, container, start)` triples.
+    fn remotes_of(cmds: &Arc<Mutex<Vec<EngineCmd>>>) -> Vec<(String, Option<String>, Duration)> {
+        log_of(cmds)
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                EngineCmd::LoadRemote {
+                    item_id,
+                    container,
+                    start,
+                } => Some((item_id, container, start)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A player in `mode` with one remote + one local track, no cache.
+    fn stream_player(mode: JellyfinMode) -> Harness {
+        let (mut player, cmds, events, params) = fake_player();
+        player.jf_mode = Some(mode);
+        player.handle(PlayerCommand::AddTracks(vec![remote_track("abc")]));
+        player.handle(PlayerCommand::AddTracks(tracks(1)));
+        (player, cmds, events, params)
+    }
+
+    #[test]
+    fn stream_mode_asks_the_engine_for_a_remote_load() {
+        let (mut player, cmds, _events, ..) = stream_player(JellyfinMode::Stream);
+        assert!(player.cache.is_none(), "no cache dir in stream mode");
+
+        player.handle(PlayerCommand::PlayTrack(0));
+        assert_eq!(
+            remotes_of(&cmds),
+            vec![("abc".to_string(), Some("flac".to_string()), Duration::ZERO)],
+            "stream mode never touches the cache"
+        );
+        assert_eq!(player.state, PlayState::Playing);
+
+        // A seek is the same remote load at a new offset (the engine's
+        // `HttpRangeSource` re-opens at the cursor, no request on seek).
+        player.handle(PlayerCommand::SeekBy(30));
+        assert_eq!(
+            remotes_of(&cmds).last(),
+            Some(&(
+                "abc".to_string(),
+                Some("flac".to_string()),
+                Duration::from_secs(30)
+            ))
+        );
+
+        // Moving to the local track uses the plain path load again.
+        player.handle(PlayerCommand::PlayTrack(1));
+        assert_eq!(load_paths(&cmds).last(), Some(&PathBuf::from("/m/0.flac")));
+    }
+
+    #[test]
+    fn buffering_event_notices_and_started_retires_it() {
+        let (mut player, _cmds, events, ..) = stream_player(JellyfinMode::Stream);
+        player.handle(PlayerCommand::PlayTrack(0));
+
+        // The engine announces the blocking probe → the notice goes up
+        // (the App drains it on its next frame; read it straight off the
+        // player here so the retirement below can still be observed).
+        queue(&events, EngineEvent::Buffering);
+        player.tick(Duration::ZERO);
+        assert_eq!(player.notice.as_deref(), Some("buffering…"));
+
+        // The stream opens: the buffering notice must not linger.
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert_eq!(
+            player.take_notice(),
+            None,
+            "Started retires the buffering notice"
+        );
+    }
+
+    #[test]
+    fn stream_pure_bypasses_the_eq_for_remote_tracks_only() {
+        let (mut player, _cmds, events, params) = stream_player(JellyfinMode::StreamPure);
+        // An EQ that is on and very much not flat.
+        player.handle(PlayerCommand::SetEq {
+            enabled: true,
+            gains: [6, 12, 6, 0, 0, 0, 0, 0, 0, 0, 0],
+        });
+        assert!(
+            !params.eq_bypass.load(Ordering::Relaxed),
+            "default: no bypass"
+        );
+
+        // Remote track: bypassed (DSP side *and* the bit-perfect marker —
+        // lossless source, full volume, centered balance, hot EQ).
+        player.handle(PlayerCommand::PlayTrack(0));
+        assert!(
+            params.eq_bypass.load(Ordering::Relaxed),
+            "stream_pure bypasses while a remote track plays"
+        );
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert!(
+            player.snapshot().format.bit_perfect,
+            "bypassed EQ → nothing but the decoder is in the path"
+        );
+        assert_eq!(
+            player.take_notice().as_deref(),
+            Some("stream pure: eq bypassed"),
+            "said once, when the first pure stream starts"
+        );
+
+        // …and the local track after it gets the EQ right back.
+        player.handle(PlayerCommand::PlayTrack(1));
+        assert!(
+            !params.eq_bypass.load(Ordering::Relaxed),
+            "local track: bypass lifts"
+        );
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert!(
+            !player.snapshot().format.bit_perfect,
+            "hot EQ shapes local tracks again"
+        );
+        assert_eq!(
+            player.take_notice(),
+            None,
+            "the stream-pure notice is a once-per-session thing"
+        );
+
+        // Back to a remote track: bypassed again, but no second notice.
+        player.handle(PlayerCommand::PlayTrack(0));
+        assert!(params.eq_bypass.load(Ordering::Relaxed));
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert_eq!(player.take_notice(), None, "noticed once per session");
+
+        // In `stream` mode (not pure) the EQ keeps working remotely.
+        let (mut player, _cmds, events, params) = stream_player(JellyfinMode::Stream);
+        player.handle(PlayerCommand::SetEq {
+            enabled: true,
+            gains: [0; 11],
+        });
+        player.handle(PlayerCommand::PlayTrack(0));
+        assert!(
+            !params.eq_bypass.load(Ordering::Relaxed),
+            "plain streaming keeps the EQ"
+        );
+        let mut hot = fake_started();
+        hot.codec = "FLAC".into();
+        hot.lossless = true;
+        hot.bit_depth = Some(16);
+        queue(&events, EngineEvent::Started(hot, fake_handle(0)));
+        player.handle(PlayerCommand::SetEq {
+            enabled: true,
+            gains: [12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        });
+        player.tick(Duration::ZERO);
+        assert!(
+            !player.snapshot().format.bit_perfect,
+            "EQ on and not flat: still processing while streaming"
         );
     }
 }

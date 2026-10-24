@@ -75,10 +75,26 @@ impl Decoder {
     /// from 0 with a notice (plan §step 4).
     pub fn open_at(path: &Path, start: Duration) -> Result<Decoder, String> {
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_string);
+        Self::open_source(Box::new(file), ext.as_deref(), start)
+    }
+
+    /// Open any symphonia [`MediaSource`](symphonia::core::io::MediaSource)
+    /// — a local file (plan 03), or plan 08's seekable HTTP `Range` stream —
+    /// and seek to `start` first. `ext_hint` is the container name (`"m4a"`)
+    /// used as a probe hint when the source has no file name to take it from.
+    pub fn open_source(
+        source: Box<dyn symphonia::core::io::MediaSource>,
+        ext_hint: Option<&str>,
+        start: Duration,
+    ) -> Result<Decoder, String> {
+        let mss = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
 
         let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+        if let Some(ext) = ext_hint {
             hint.with_extension(ext);
         }
         let mut format = symphonia::default::get_probe()

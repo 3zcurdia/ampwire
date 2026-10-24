@@ -497,18 +497,7 @@ fn evict(dir: &Path, wanted: &[RemoteRef]) {
 /// The file extension for an item: the media source's container (`m4a`),
 /// stripped to ASCII alphanumerics, falling back to `bin`.
 fn ext_for(item: &RemoteRef) -> String {
-    let cleaned: String = item
-        .container
-        .as_deref()
-        .unwrap_or("bin")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    if cleaned.is_empty() {
-        "bin".into()
-    } else {
-        cleaned.to_lowercase()
-    }
+    super::container_ext(item.container.as_deref())
 }
 
 /// `Content-Length` of a response, when the server sent one.

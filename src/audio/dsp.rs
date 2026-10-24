@@ -49,6 +49,11 @@ pub struct SharedParams {
     /// Writer bumps this **after** writing gains/enabled; the callback
     /// recomputes its coefficients when it sees a value it hasn't applied.
     pub eq_version: AtomicU32,
+    /// Bypass the whole EQ stage regardless of `eq_enabled`/gains (plan 08,
+    /// `stream_pure`): while a Jellyfin track streams, only the decoder sits
+    /// between the server's bytes and the speakers. Read per `process_eq`
+    /// call (a plain atomic load), so flipping it needs no version bump.
+    pub eq_bypass: AtomicBool,
 }
 
 impl SharedParams {
@@ -64,6 +69,7 @@ impl SharedParams {
             eq_enabled: AtomicBool::new(true),
             eq_gains: std::array::from_fn(|_| AtomicI32::new(0)),
             eq_version: AtomicU32::new(0),
+            eq_bypass: AtomicBool::new(false),
         }
     }
 
@@ -82,6 +88,13 @@ impl SharedParams {
     /// Turn the L/R swap on or off (read once per `Dsp::process_gain` call).
     pub fn set_swap_channels(&self, swap: bool) {
         self.swap_channels.store(swap, Ordering::Relaxed);
+    }
+
+    /// Bypass the EQ stage while a `stream_pure` Jellyfin track plays
+    /// (plan 08). Independent of `set_eq`: the panel's state is untouched
+    /// and applies again the moment the bypass lifts.
+    pub fn set_eq_bypass(&self, bypass: bool) {
+        self.eq_bypass.store(bypass, Ordering::Relaxed);
     }
 
     /// Write the EQ state (UI thread): gains, then enabled, then bump the
@@ -137,9 +150,10 @@ impl Dsp {
     ///
     /// Notices a bumped [`SharedParams::eq_version`] first (reads the gains,
     /// recomputes the coefficients — nothing allocated), then bypasses
-    /// immediately when the EQ is off or flat: a flat or disabled EQ leaves
-    /// the buffer **bit-identical**. Runs **before** the spectrum tap, so
-    /// the bars show what is actually heard.
+    /// immediately when the EQ is off, flat **or** bypassed for this track
+    /// (`stream_pure`, plan 08): in every one of those cases the buffer is
+    /// left **bit-identical**. Runs **before** the spectrum tap, so the bars
+    /// show what is actually heard.
     pub fn process_eq(&mut self, samples: &mut [f32]) {
         let version = self.params.eq_version.load(Ordering::Acquire);
         if version != self.seen_version {
@@ -152,7 +166,9 @@ impl Dsp {
             self.eq_on = enabled && gains.iter().any(|g| *g != 0);
             self.seen_version = version;
         }
-        if self.eq_on {
+        // The bypass is re-read every call: it changes with the *current
+        // track*, not with the EQ settings (no version bump involved).
+        if self.eq_on && !self.params.eq_bypass.load(Ordering::Relaxed) {
             self.eq.process(samples);
         }
     }
@@ -514,5 +530,36 @@ mod tests {
         let eqd = buffer.clone();
         dsp.process_gain(&mut buffer);
         assert_eq!(buffer, eqd, "unity gain stage bypasses");
+    }
+
+    // --- stream_pure EQ bypass (plan 08, step 6) ---
+
+    #[test]
+    fn eq_bypass_keeps_the_buffer_bit_identical_with_hot_gains() {
+        let (mut dsp, params) = dsp(2);
+        // EQ on and very much not flat…
+        params.set_eq(true, [12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12]);
+        // …but a `stream_pure` Jellyfin track is playing.
+        params.set_eq_bypass(true);
+
+        let buffer: Vec<f32> = (0..1024)
+            .map(|i| (i as f32 * 0.013 - 1.0).sin() * 0.9)
+            .collect();
+        let mut processed = buffer.clone();
+        dsp.process_eq(&mut processed);
+        assert_eq!(
+            processed, buffer,
+            "bypassed EQ must not touch a single sample"
+        );
+
+        // The local track after it restores the EQ on the very next pass —
+        // no version bump, no restart, just the atomic.
+        params.set_eq_bypass(false);
+        let mut resumed = buffer.clone();
+        dsp.process_eq(&mut resumed);
+        assert_ne!(
+            resumed, buffer,
+            "bypass off: the hot gains shape again immediately"
+        );
     }
 }
