@@ -3,6 +3,12 @@ name = "ampwire"
 version = "0.1.0"
 edition = "2024"
 description = "A terminal player inspired by Winamp 2, implemented from scratch for the terminal"
+license = "MIT"
+repository = "https://github.com/3zcurdia/ampwire"
+homepage = "https://github.com/3zcurdia/ampwire"
+readme = "README.md"
+keywords = ["tui", "music", "audio", "jellyfin", "player"]
+categories = ["multimedia", "command-line-utilities"]
 
 [dependencies]
 cpal = "0.18.2"
@@ -21,3 +27,8 @@ serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
