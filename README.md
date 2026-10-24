@@ -4,7 +4,7 @@ Terminal Winamp 2.0 replica with modern hi-fi playback.
 
 Retro Winamp anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look.
 
-> Status: Phase 5 — **volume & balance.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track, ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume (`+`/`-`/`↑↓`) and balance (`[`/`]`) shape what you hear and are remembered across restarts; at 100 % / centered the samples stay bit-perfect. The format line reads `FLAC 24/96 stereo` / `MP3 320kbps 44.1kHz stereo`. No Jellyfin yet. `--demo` / `--dump` keep the mock player.
+> Status: Phase 6 — **Jellyfin.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track, ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume (`+`/`-`/`↑↓`) and balance (`[`/`]`) shape what you hear and are remembered across restarts; at 100 % / centered the samples stay bit-perfect. The format line reads `FLAC 24/96 stereo` / `MP3 320kbps 44.1kHz stereo`. With a `[jellyfin]` section in the config, `j` fetches your **whole server library** into the playlist (progressively, while the UI stays responsive) and plays it — downloaded to a rolling temp-dir cache, or streamed over HTTP `Range` requests (`stream_pure` bypasses the EQ for that path). `--demo` / `--dump` keep the mock player.
 
 ## Quickstart
 
@@ -29,6 +29,11 @@ cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 - Volume & balance are real (plan 05): software gain in the audio callback with click-free smoothing, volume 0–100 (squared law, default 100 = unity), balance −100…+100 (attenuates only the opposite channel, stereo only). Both live in `config.toml` `[audio]` and are restored on startup, together with `swap_channels` (L/R to opposite ears — for headsets/DACs with reversed wiring; it fixes the balance direction and the stereo image). At volume 100 / balance 0 / swap off the DSP is skipped entirely — lossless stays bit-perfect, as the format line's `bit-perfect` marker shows.
 - The format line is per-codec: `FLAC 24/96 stereo` (lossless: depth + rate) vs `MP3 320kbps 44.1kHz stereo` (lossy: bitrate + rate, bitrate from tags). Codec/depth/rate/channels come from the decoder, never the tags.
 - Not yet: gapless playback, and resampling for device-unsupported rates (such a track is skipped with `<device>: cannot play 48000 Hz 8ch` — ampwire plays only at the device's own rates, no fallback to a second device).
+- Jellyfin (plan 08): with `[jellyfin]` configured, `j` loads every audio track on the server into the playlist (appended to what is there; pressing `j` again first drops the previous remote batch). Loading pages the server 500 items at a time in the background — the playlist stays fully usable — and keeps the server's `Artist, SortName` order. Remote tracks play like local files in one of three `mode`s:
+  - **`cache` (default)** — originals are downloaded to a rolling temp-dir window of **3 remote tracks ahead and 3 behind** the current one (in *play* order, so shuffle is respected) and played from disk: seek, EQ, volume, balance and the spectrum all work unchanged.
+  - **`stream`** — the original file streams over HTTP `Range` requests (seekable, nothing stored). **The EQ works while streaming**: it is local DSP on the decoded samples, it doesn't care where the bytes came from. The engine's ring buffer doubles to ≈2 s to survive network hiccups.
+  - **`stream_pure`** — the same streaming, but the **EQ is bypassed** while a Jellyfin track plays (`stream pure: eq bypassed`, once per session), so the only thing between the server's bytes and the speakers is the decoder (plus volume/balance if you moved them). The EQ panel is untouched and applies again on local tracks.
+  - A read stall in `stream*` can block Stop/Next for up to the 15 s read timeout — **use cache mode on slow links**. Never transcoding: ampwire always asks for the original file (`static=true`) and decodes locally.
 
 ## Layout
 
@@ -50,13 +55,14 @@ Automatic fallbacks (never overwrite your saved preference):
 
 ## Keys
 
-Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Plan 04 made `←` / `→` (seek ±5 s) live — the clock and bars follow the audio; plan 05 made volume (`+` `-`) and balance (`[` `]`) shape the actual samples; plan 06 made the EQ real — `↑` / `↓` in the EQ panel actually reshapes the sound.
+Winamp-style defaults, Space for play/pause. Every action is remappable. Since plan 03 these are **real**: `z x c v b` / `Space` drive the audio engine, `s` / `r` toggle shuffle / repeat with a `shuffle on`-style notice, `l` opens a path for real. Plan 04 made `←` / `→` (seek ±5 s) live — the clock and bars follow the audio; plan 05 made volume (`+` `-`) and balance (`[` `]`) shape the actual samples; plan 06 made the EQ real — `↑` / `↓` in the EQ panel actually reshapes the sound; plan 08 made `j` fetch the whole Jellyfin library in the background.
 
 | Key | Action | Scope |
 |---|---|---|
 | `Space` | play / pause | global |
 | `z` `x` `c` `v` `b` | prev / play / pause / stop / next | global |
 | `l` | open: replace playlist from a path | global |
+| `j` | load the whole Jellyfin library (`[jellyfin]` required) | global |
 | `s` / `r` | shuffle / repeat | global |
 | `←` / `→` | seek ∓5s | player, playlist |
 | `←` / `→` | select EQ band | eq |
@@ -117,6 +123,15 @@ on = true
 preamp = 0
 bands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # 60, 170, 310, 600, 1k, 3k, 6k, 12k, 14k, 16k Hz
 
+[jellyfin]                 # optional: `j` loads the whole server library
+url = "http://192.168.1.10:8096"  # trailing slash is trimmed
+api_key = "0123456789abcdef"      # Jellyfin dashboard → API key; header only, never in a URL
+user = "luis"              # optional; the first user is used if omitted
+mode = "cache"             # "cache" (download) | "stream" (HTTP Range) | "stream_pure" (stream, EQ bypassed)
+cache_ahead = 3            # cache mode: remote tracks to prefetch ahead (0–10)
+cache_behind = 3           # cache mode: …and to keep behind the current one
+# cache_dir = "/var/tmp"   # optional: parent of ampwire-jellyfin-<pid> (default: system temp dir)
+
 [keys]
 next = ["n"]
 ```
@@ -125,6 +140,8 @@ next = ["n"]
 - Saves use `toml_edit` (comments and formatting survive), written atomically via temp-file + rename.
 - Volume/balance/EQ changes are saved 500 ms after the last keypress (and on quit); layout hotkeys save immediately.
 - If the on-disk config failed to parse, the session is read-only: layout hotkeys still work in memory but nothing is written back (`config invalid — not saving`).
+- `Config::save` never touches `[jellyfin]` (the key is yours), and the section is never printed — its `Debug` output shows `api_key: "<redacted>"`, and the key only ever travels as the `Authorization` header. **Recommend `chmod 600 config.toml`** — the file holds your API key. An unknown `mode` falls back to `cache` with a notice instead of failing the config.
+- Jellyfin cache location & cleanup: `cache` mode downloads into `ampwire-jellyfin-<pid>/` (mode `0700`) under the system temp dir — or under `cache_dir` if you set it. On exit the directory is deleted; leftovers older than 24 h from crashed runs are swept at the next startup, and the OS also cleans its temp dir. Downloads land in `<item>.part` and are renamed only when complete — a `.part` file is never decoded. The window holds at most `1 + cache_ahead + cache_behind` remote files (each capped at 512 MiB).
 
 ## Theming
 
@@ -152,7 +169,8 @@ Notes:
 - Run the TUI only in a real TTY; output under pipes/CI is garbage.
 - `crossterm` is imported as `ratatui::crossterm` — no direct dependency.
 - `Cargo.lock` is committed (binary crate).
-- Audio on Linux builds against ALSA (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS needs nothing. `cargo test` never opens a sound card — the end-to-end device test is `#[ignore]`d: `cargo test -- --ignored` (it plays an audible tone).
+- Audio on Linux builds against ALSA (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS needs nothing. `cargo test` never opens a sound card — the end-to-end device test is `#[ignore]`d: `cargo test -- --ignored` (it plays an audible tone). Plain `cargo test` also stays off the network (its "HTTP server" is a `TcpListener` on `127.0.0.1:0`).
+- The Jellyfin path has its own scripted "manual" test against a **real** server — it downloads a cache window, streams + decodes over `Range`, and plays one remote track through the engine (audible for a moment): `AMWIRE_JELLYFIN_URL=… AMWIRE_JELLYFIN_API_KEY=… cargo test -- --ignored jellyfin_real_server`.
 - Silent playback on a device? `cargo run --example devices` lists every output device with the channel counts and sample rates it advertises — ampwire plays a track only at an *exact* match on the default device (no resampling, no fallback), so a `no playable tracks: <device>: cannot play 96000 Hz 2ch` notice means the file's rate isn't in that list.
 
 ## Project structure
@@ -172,6 +190,11 @@ src/
     eq.rs            10-band peaking EQ (RBJ cookbook biquads + preamp), f64 state, interleaved f32
   library/
     mod.rs           audio-file scan (walkdir) + tag reading (lofty) on a thread
+  jellyfin/
+    mod.rs           Jellyfin client (ureq): header auth, paged library load, item → Track
+    cache.rs         rolling temp-dir window: downloader thread, evict, compute_window, sweep
+    http_source.rs   seekable HTTP Range MediaSource (+ whole-file fallback for non-range servers)
+    test_server.rs   #[cfg(test)] mock Jellyfin: real HTTP + Range over tests/fixtures/tone.flac
   player/
     mod.rs           PlayerSnapshot view model + PlayerCommand + Track + FormatInfo
     eq_presets.rs    10 named EQ presets (preamp + 10 gains) + find_matching
@@ -196,8 +219,8 @@ tests/golden/        --dump snapshots at 5 sizes
 docs/plans/          design plans (01-winamp-layout.md, 02-playlist-loading.md, …)
 ```
 
-Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; engine events come back over a channel polled from `App::tick` (notices land in the playlist border). `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
+Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; a Jellyfin load goes `j → jellyfin::spawn_library_load (thread) → JfMsg → App::tick → RemoveRemote (once) + AppendInOrder`, and remote playback goes `TrackSource::Remote → Cache window (downloader thread) → Load` or `→ EngineCmd::LoadRemote → HttpRangeSource`. Engine events come back over a channel polled from `App::tick` (notices land in the playlist border). `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
 
 ## Roadmap
 
-Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05), 10-band equalizer + preamp that really shapes the sound (plan 06), EQ presets screen with live preview (plan 07). Next: Jellyfin client (plan 08). Still out of scope: mouse, media keys / MPRIS / Now Playing.
+Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05), 10-band equalizer + preamp that really shapes the sound (plan 06), EQ presets screen with live preview (plan 07), Jellyfin server → playlist with cache / stream / stream_pure modes (plan 08). Still out of scope: mouse, media keys / MPRIS / Now Playing.
