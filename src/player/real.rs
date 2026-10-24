@@ -18,8 +18,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::audio::{
-    Analyzer, AudioOut, BANDS, Engine, EngineCmd, EngineEvent, PlayError, PlaybackHandle,
-    SharedParams, StreamInfo, StreamSetup, balance_to_gains, volume_to_gain,
+    Analyzer, AudioOut, BANDS, Engine, EngineCmd, EngineEvent, NO_BOUNDARY, PlayError,
+    PlaybackHandle, QueueSource, SharedParams, StreamInfo, StreamSetup, balance_to_gains,
+    volume_to_gain,
 };
 use crate::config::{JellyfinConfig, JellyfinMode};
 use crate::jellyfin::cache::{Cache, CacheEvent, STALE_AGE, compute_window, sweep_stale_dirs};
@@ -60,6 +61,18 @@ pub struct RealPlayer {
     format: FormatInfo,
     /// Live clock + sample tap from the engine; `None` while stopped.
     handle: Option<PlaybackHandle>,
+    /// The next track's info from [`EngineEvent::Advanced`], waiting for the
+    /// audio to reach `PlaybackHandle::boundary` (plan 09, step 4): the
+    /// event can precede the audio by the ring's length, so the cursor
+    /// moves only when the clock really crosses.
+    pending_advance: Option<StreamInfo>,
+    /// Frames-played value the current track started at (plan 09): `0` for
+    /// a loaded track (its decoder's `start_offset` carries the seek), the
+    /// boundary for a gapless-advanced one.
+    track_base: u64,
+    /// Where the current track's own clock starts (plan 09): the decoder's
+    /// start offset for a loaded track, `ZERO` after a gapless advance.
+    track_start_offset: Duration,
     /// Where the in-flight `Load` should start reading. Shown as the
     /// position until the engine's `Started` replaces the handle, so a
     /// seek jumps the clock instantly (no `0:00` flash) and a second seek
@@ -164,6 +177,9 @@ impl RealPlayer {
             params,
             format: FormatInfo::blank(),
             handle: None,
+            pending_advance: None,
+            track_base: 0,
+            track_start_offset: Duration::ZERO,
             pending_start: None,
             analyzer: Box::new(Analyzer::new()),
             tap_buf: Vec::new(),
@@ -218,16 +234,20 @@ impl RealPlayer {
     }
 
     /// Where the music is right now: the seek offset plus the frames the
-    /// callback really delivered, clamped to the duration when known. While
-    /// a `Load` is still in flight (no handle yet), the pending start offset
-    /// stands in, so seeks jump the clock instantly.
+    /// callback really delivered *since this track started* — after a
+    /// gapless advance (plan 09) that is measured from the boundary, and
+    /// the new track counts from 0 with no offset. Clamped to the duration
+    /// when known. While a `Load` is still in flight (no handle yet), the
+    /// pending start offset stands in, so seeks jump the clock instantly.
     fn position(&self) -> Duration {
         let position = match (&self.handle, self.pending_start) {
-            (Some(handle), _) => position(
-                handle.start_offset,
-                handle.played.load(Ordering::Relaxed),
-                handle.sample_rate,
-            ),
+            (Some(handle), _) => {
+                let frames = handle
+                    .played
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(self.track_base);
+                self.track_start_offset + position(Duration::ZERO, frames, handle.sample_rate)
+            }
             (None, Some(start)) => start,
             (None, None) => return Duration::ZERO, // stopped: no clock
         };
@@ -260,6 +280,7 @@ impl RealPlayer {
                 self.order
                     .appended(self.playlist.len(), self.playlist.current(), &mut self.rng);
                 self.update_cache_window();
+                self.refresh_queue();
                 return;
             }
             PlayerCommand::AppendInOrder(new) => {
@@ -267,6 +288,7 @@ impl RealPlayer {
                 self.order
                     .appended(self.playlist.len(), self.playlist.current(), &mut self.rng);
                 self.update_cache_window();
+                self.refresh_queue();
                 return;
             }
             PlayerCommand::RemoveRemote => {
@@ -282,6 +304,7 @@ impl RealPlayer {
                 self.order
                     .removed(&removed, self.playlist.current(), &mut self.rng);
                 self.update_cache_window();
+                self.refresh_queue();
                 if was_current {
                     self.stop_playback();
                 }
@@ -309,6 +332,7 @@ impl RealPlayer {
                 self.order
                     .removed(&removed, self.playlist.current(), &mut self.rng);
                 self.update_cache_window();
+                self.refresh_queue();
                 if was_current {
                     self.stop_playback();
                 }
@@ -330,6 +354,7 @@ impl RealPlayer {
                     self.order
                         .swapped(from, to, self.playlist.current(), &mut self.rng);
                     self.update_cache_window();
+                    self.refresh_queue();
                 }
                 return;
             }
@@ -446,6 +471,9 @@ impl RealPlayer {
             PlayerCommand::ToggleShuffle => {
                 self.shuffle = !self.shuffle;
                 self.rebuild_order();
+                // The order changed: the queued next track must follow it
+                // (plan 09, step 5).
+                self.refresh_queue();
                 self.notice = Some(
                     if self.shuffle {
                         "shuffle on"
@@ -461,6 +489,8 @@ impl RealPlayer {
                 // triggers; the wanted set cannot change, but recomputing
                 // it is one cheap vector.
                 self.update_cache_window();
+                // Re-send the queue on every repeat toggle too (plan 09).
+                self.refresh_queue();
                 self.notice = Some(
                     if self.repeat {
                         "repeat on"
@@ -498,6 +528,9 @@ impl RealPlayer {
         for event in self.engine.poll() {
             match event {
                 EngineEvent::Started(info, handle) => self.on_started(info, handle),
+                // Plan 09, step 4: remember the switch; the track change
+                // itself happens when the clock reaches the boundary.
+                EngineEvent::Advanced(info) => self.pending_advance = Some(info),
                 EngineEvent::Finished => self.advance_after_end(),
                 EngineEvent::Error(reason) => self.on_error(reason),
                 // Plan 08, step 6: the engine announced the (blocking) probe
@@ -506,13 +539,62 @@ impl RealPlayer {
                 EngineEvent::Notice(text) => self.notice = Some(text),
             }
         }
+        self.check_boundary();
         self.poll_cache();
         self.update_spectrum();
     }
 
-    /// The track opened: clock + tap handle, hi-fi line, streak reset, and
-    /// the decoder's accurate duration when the tag had none or lied (the
-    /// tag is off by more than a second).
+    /// Plan 09, step 4: move `current` (cursor, clock base, format line)
+    /// exactly when the audio crosses the engine's boundary — never when
+    /// [`EngineEvent::Advanced`] arrives, which can precede the audio by
+    /// the ring's length. The stream, the handle and the tap carry on
+    /// untouched; only this side changes track.
+    fn check_boundary(&mut self) {
+        let Some(info) = self.pending_advance.take() else {
+            return;
+        };
+        let Some(handle) = &self.handle else {
+            return; // stopped before the boundary: nothing to advance to
+        };
+        let boundary = handle.boundary.load(Ordering::Acquire);
+        // `NO_BOUNDARY` = the engine never recorded one (defensive: an
+        // `Advanced` always precedes its store, but a handle without a
+        // boundary can never be crossed).
+        if boundary == NO_BOUNDARY || handle.played.load(Ordering::Acquire) < boundary {
+            self.pending_advance = Some(info); // not heard yet: wait a tick
+            return;
+        }
+        // The audio really crossed into the queued track (the engine had
+        // queued `order.upcoming(1)`, so `order.next` returns exactly it —
+        // repeat wraps and end-of-order were never queued).
+        self.track_base = boundary;
+        self.track_start_offset = Duration::ZERO;
+        self.pending_start = None;
+        self.fail_streak = 0;
+        match self.order.next(self.repeat, &mut self.rng) {
+            Some(i) => {
+                self.playlist.set_current(Some(i));
+                self.apply_format(&info, Some(i));
+                // `stream_pure` (plan 08): same once-per-session notice as
+                // at `Started`, for the case that starts locally.
+                if self.eq_bypassed() && !self.jf_pure_notice_shown {
+                    self.jf_pure_notice_shown = true;
+                    self.notice = Some("stream pure: eq bypassed".into());
+                }
+                self.update_cache_window();
+                // The next-next track becomes the queued one (plan 09).
+                self.refresh_queue();
+            }
+            // The playlist emptied under the queue (an edit raced the
+            // audio): fall back to the normal end-of-track stop.
+            None => self.stop_playback(),
+        }
+    }
+
+    /// The track opened: clock + tap handle, hi-fi line, streak reset, the
+    /// decoder's accurate duration when the tag had none or lied (the tag
+    /// is off by more than a second) — and the gapless queue for what
+    /// plays next (plan 09, step 5).
     fn on_started(&mut self, info: StreamInfo, handle: PlaybackHandle) {
         self.fail_streak = 0;
         // Buffering is over: retire that exact notice if it is still up
@@ -520,32 +602,51 @@ impl RealPlayer {
         if self.notice.as_deref() == Some("buffering…") {
             self.notice = None;
         }
+        // The fresh stream's clock starts at its own offset (a seeked-to
+        // position), and supersedes any in-flight gapless advance: that
+        // boundary died with the stream the engine just dropped.
+        self.track_start_offset = handle.start_offset;
+        self.track_base = 0;
+        self.pending_advance = None;
+        let current = self.playlist.current();
+        self.handle = Some(handle);
+        self.pending_start = None; // the live clock takes over
+        self.apply_format(&info, current);
+        // `stream_pure` (plan 08): first remote track of the session — say
+        // what is different about it. Shown at `Started`, so it is never
+        // clobbered by (and never hides) the `buffering…` it follows.
+        if self.eq_bypassed() && !self.jf_pure_notice_shown {
+            self.jf_pure_notice_shown = true;
+            self.notice = Some("stream pure: eq bypassed".into());
+        }
+        self.refresh_queue();
+    }
+
+    /// The format line — and the playlist's duration fix — for track `i`
+    /// from the decoder's [`StreamInfo`]. Shared by [`Self::on_started`]
+    /// and the gapless [`EngineEvent::Advanced`] crossing (plan 09), which
+    /// swaps the current track without touching the live stream.
+    fn apply_format(&mut self, info: &StreamInfo, i: Option<usize>) {
         if let Some(decoded) = info.duration {
-            let tagged = self
-                .playlist
-                .current()
+            let tagged = i
                 .and_then(|i| self.playlist.tracks().get(i))
                 .and_then(|t| t.duration);
             let tag_lies = tagged
                 .is_none_or(|tagged| (tagged.as_secs_f64() - decoded.as_secs_f64()).abs() > 1.0);
-            if tag_lies && let Some(i) = self.playlist.current() {
+            if tag_lies && let Some(i) = i {
                 self.playlist.set_duration(i, decoded);
             }
         }
-        self.handle = Some(handle);
-        self.pending_start = None; // the live clock takes over
         // Codec / depth / rate / channels / lossless come from the decoder's
         // StreamInfo; the bitrate (lossy only) from the scanned tag.
         let bitrate_kbps = if info.lossless {
             None
         } else {
-            self.playlist
-                .current()
-                .and_then(|i| self.playlist.tracks().get(i))
+            i.and_then(|i| self.playlist.tracks().get(i))
                 .and_then(|t| t.bitrate_kbps)
         };
         self.format = FormatInfo {
-            codec: info.codec,
+            codec: info.codec.clone(),
             // The marker itself is computed in `snapshot()` from the live
             // volume/balance (plan 05); the stored format only carries the
             // source's losslessness.
@@ -556,13 +657,6 @@ impl RealPlayer {
             bitrate_kbps,
             lossless: info.lossless,
         };
-        // `stream_pure` (plan 08): first remote track of the session — say
-        // what is different about it. Shown at `Started`, so it is never
-        // clobbered by (and never hides) the `buffering…` it follows.
-        if self.eq_bypassed() && !self.jf_pure_notice_shown {
-            self.jf_pure_notice_shown = true;
-            self.notice = Some("stream pure: eq bypassed".into());
-        }
     }
 
     /// A track could not be played: notice + skip to the next one, or stop
@@ -720,6 +814,60 @@ impl RealPlayer {
         }
     }
 
+    /// Keep the engine's gapless queue in step with the play order (plan
+    /// 09, step 5): the next track of `PlayOrder::upcoming(1)` is
+    /// pre-opened right after every `Started` and every boundary crossing,
+    /// and re-sent (or dropped) whenever the order changes — shuffle/repeat
+    /// toggle, playlist edit, `PlayTrack`. End of order and a stopped
+    /// player queue nothing (`Unqueue`); repeat *wraps* are never queued
+    /// either, because `upcoming` never wraps.
+    fn refresh_queue(&mut self) {
+        let queued = if self.state == PlayState::Stopped {
+            None
+        } else {
+            self.order
+                .upcoming(1)
+                .first()
+                .copied()
+                .and_then(|i| self.queue_source(i))
+        };
+        match queued {
+            Some((source, eq_bypass)) => {
+                self.engine.send(EngineCmd::Queue {
+                    source,
+                    start: Duration::ZERO,
+                    eq_bypass,
+                });
+            }
+            None => self.engine.send(EngineCmd::Unqueue),
+        }
+    }
+
+    /// What the engine should pre-open for playlist track `i` (plan 09),
+    /// as `(source, stream_pure bypass)`: a local path — a cache-mode
+    /// remote track only once its file has been downloaded — or a
+    /// `stream*`-mode HTTP source.
+    fn queue_source(&self, i: usize) -> Option<(QueueSource, bool)> {
+        let track = self.playlist.tracks().get(i)?;
+        let source = match &track.source {
+            TrackSource::Local(path) => QueueSource::Local(path.clone()),
+            TrackSource::Remote { item_id, container } => match self.jf_mode {
+                // Cache mode plays remote tracks from disk: only a file
+                // that already exists can be pre-opened (still downloading
+                // → no queue; the normal buffering path takes over).
+                Some(JellyfinMode::Cache) | None => {
+                    QueueSource::Local(self.cache.as_ref()?.path_if_ready(item_id)?)
+                }
+                Some(JellyfinMode::Stream | JellyfinMode::StreamPure) => QueueSource::Remote {
+                    item_id: item_id.clone(),
+                    container: container.clone(),
+                },
+            },
+        };
+        let eq_bypass = matches!(self.jf_mode, Some(JellyfinMode::StreamPure)) && track.is_remote();
+        Some((source, eq_bypass))
+    }
+
     /// Push the current rolling window to the cache downloader: the current
     /// remote track → the next `jf_ahead` → the previous `jf_behind`, in
     /// *play* order (so shuffle is respected). Called after every track
@@ -788,11 +936,16 @@ impl RealPlayer {
 
     /// Halt playback but keep the current track selected (Stop semantics).
     fn stop_playback(&mut self) {
+        // Plan 09: drop the queued next track first — the engine's `Stop`
+        // takes the whole stream (and with it the queue) anyway, but the
+        // explicit `Unqueue` keeps UI intent and engine state aligned.
+        self.engine.send(EngineCmd::Unqueue);
         self.engine.send(EngineCmd::Stop);
         self.state = PlayState::Stopped;
         self.format = FormatInfo::blank();
         self.handle = None;
         self.pending_start = None;
+        self.pending_advance = None;
         // Nothing is playing, so nothing waits for a download either: a
         // late `Ready` for it must be ignored, not loaded.
         self.pending_remote = None;
@@ -1002,10 +1155,12 @@ mod tests {
         }
     }
 
-    /// A handle reporting `played_frames` frames into the stream.
+    /// A handle reporting `played_frames` frames into the stream, with no
+    /// gapless boundary recorded (`NO_BOUNDARY`).
     fn fake_handle(played_frames: u64) -> PlaybackHandle {
         PlaybackHandle {
             played: Arc::new(AtomicU64::new(played_frames)),
+            boundary: Arc::new(AtomicU64::new(NO_BOUNDARY)),
             sample_rate: 44_100,
             start_offset: Duration::ZERO,
             tap: RingBuffer::<f32>::new(64).1,
@@ -1702,6 +1857,216 @@ mod tests {
             "one full round: {visited:?}"
         );
         assert_eq!(player.state, PlayState::Stopped, "round over, repeat off");
+    }
+
+    // --- gapless: queue maintenance + the boundary clock (plan 09) ---
+
+    /// Every `Queue`, as `(source, eq_bypass)` pairs.
+    fn queues_of(cmds: &Arc<Mutex<Vec<EngineCmd>>>) -> Vec<(QueueSource, bool)> {
+        log_of(cmds)
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                EngineCmd::Queue {
+                    source,
+                    start,
+                    eq_bypass,
+                } => {
+                    assert_eq!(start, Duration::ZERO, "a gapless queue starts at 0");
+                    Some((source, eq_bypass))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every queued *local* path (remote sources are asserted separately).
+    fn queued_paths(cmds: &Arc<Mutex<Vec<EngineCmd>>>) -> Vec<PathBuf> {
+        queues_of(cmds)
+            .into_iter()
+            .filter_map(|(source, _)| match source {
+                QueueSource::Local(path) => Some(path),
+                QueueSource::Remote { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_next_track_is_queued_after_started_and_requeued_on_order_changes() {
+        let (mut player, cmds, events, ..) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        assert!(
+            queues_of(&cmds).is_empty(),
+            "nothing queued before the engine reports Started"
+        );
+
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert_eq!(
+            queued_paths(&cmds),
+            [PathBuf::from("/m/1.flac")],
+            "upcoming(1) is pre-opened right after Started"
+        );
+
+        // A shuffle toggle re-queues whatever the new order puts next.
+        player.handle(PlayerCommand::ToggleShuffle);
+        let queued = queued_paths(&cmds);
+        assert_eq!(queued.len(), 2, "re-sent after the order changed");
+        assert_ne!(
+            queued[1],
+            PathBuf::from("/m/0.flac"),
+            "never the track already playing"
+        );
+
+        // The repeat toggle and a playlist edit re-send it too (plan §step 5).
+        player.handle(PlayerCommand::ToggleRepeat);
+        assert_eq!(queued_paths(&cmds).len(), 3, "re-sent on the repeat toggle");
+        player.handle(PlayerCommand::AddTracks(tracks(1)));
+        assert_eq!(
+            queued_paths(&cmds).len(),
+            4,
+            "re-sent after a playlist edit"
+        );
+    }
+
+    #[test]
+    fn end_of_order_and_a_stopped_player_queue_nothing() {
+        let (mut player, cmds, events, ..) = three_tracks();
+        player.handle(PlayerCommand::PlayTrack(2)); // the last track
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert!(
+            queued_paths(&cmds).is_empty(),
+            "no next track after the end of the order"
+        );
+        assert!(matches!(log_of(&cmds).last(), Some(EngineCmd::Unqueue)));
+
+        // Stop drops the queue *before* stopping the stream (plan §Seek/Stop).
+        player.handle(PlayerCommand::PlayTrack(0));
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        assert_eq!(queued_paths(&cmds), [PathBuf::from("/m/1.flac")]);
+        player.handle(PlayerCommand::Stop);
+        let log = log_of(&cmds);
+        let unqueue = log
+            .iter()
+            .rposition(|c| matches!(c, EngineCmd::Unqueue))
+            .expect("Stop goes with an Unqueue");
+        let stop = log
+            .iter()
+            .rposition(|c| matches!(c, EngineCmd::Stop))
+            .expect("Stop");
+        assert!(unqueue < stop, "the queue is dropped before Stop: {log:?}");
+
+        // …and a stopped player never re-queues, even when the order changes.
+        let queued_before = queued_paths(&cmds).len();
+        player.handle(PlayerCommand::AddTracks(tracks(1)));
+        assert_eq!(
+            queued_paths(&cmds).len(),
+            queued_before,
+            "stopped: no queue traffic"
+        );
+    }
+
+    /// Plan 09, step 4: the `Advanced` event may precede the audio by the
+    /// ring's length — `current`, the clock and the format line move only
+    /// when `played` really crosses `boundary`, exactly at that frame.
+    #[test]
+    fn advanced_moves_the_current_track_exactly_at_the_boundary() {
+        let (mut player, cmds, events, ..) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        let played = Arc::new(AtomicU64::new(0));
+        let boundary = Arc::new(AtomicU64::new(110_250)); // 2.5 s in
+        let handle = PlaybackHandle {
+            played: Arc::clone(&played),
+            boundary: Arc::clone(&boundary),
+            sample_rate: 44_100,
+            start_offset: Duration::ZERO,
+            tap: RingBuffer::<f32>::new(64).1,
+        };
+        queue(&events, EngineEvent::Started(fake_started(), handle));
+        player.tick(Duration::ZERO);
+        assert_eq!(player.playlist.current(), Some(0));
+
+        // The engine switched decoders; the audio has not arrived yet.
+        let mut next_info = fake_started();
+        next_info.codec = "MP3".into();
+        next_info.lossless = false;
+        next_info.bit_depth = None;
+        queue(&events, EngineEvent::Advanced(next_info));
+        player.tick(Duration::ZERO);
+        assert_eq!(
+            player.playlist.current(),
+            Some(0),
+            "the event alone moves nothing"
+        );
+        assert_eq!(player.snapshot().format.codec, "FLAC", "not yet");
+
+        // One frame short of the boundary: still the old track.
+        played.store(110_249, Ordering::Relaxed);
+        player.tick(Duration::ZERO);
+        assert_eq!(player.playlist.current(), Some(0), "one frame early");
+
+        // Exactly the boundary frame: the track change happens now.
+        played.store(110_250, Ordering::Relaxed);
+        player.tick(Duration::ZERO);
+        assert_eq!(player.playlist.current(), Some(1), "crossed");
+        let snapshot = player.snapshot();
+        assert_eq!(snapshot.format.codec, "MP3", "format line switched");
+        assert_eq!(
+            snapshot.position,
+            Duration::ZERO,
+            "the new track counts from 0, not from the stream's start"
+        );
+
+        // The clock keeps counting from the boundary (not from frame 0).
+        played.store(110_250 + 44_100, Ordering::Relaxed);
+        assert_eq!(player.snapshot().position, Duration::from_secs(1));
+
+        // The queue moved on to the track after that.
+        assert_eq!(
+            queued_paths(&cmds).last(),
+            Some(&PathBuf::from("/m/2.flac")),
+            "the boundary crossing re-queues for the next one"
+        );
+    }
+
+    /// The `stream_pure` bypass rides inside the `Queue` (plan 09, step 6):
+    /// the engine flips the shared flag at the boundary, so the flag must
+    /// belong to the *queued* track, not to the current one.
+    #[test]
+    fn stream_pure_carries_the_bypass_flag_into_the_queue() {
+        let (mut player, cmds, events, _params) = fake_player();
+        player.jf_mode = Some(JellyfinMode::StreamPure);
+        player.handle(PlayerCommand::AddTracks(vec![
+            remote_track("abc"),
+            remote_track("def"),
+        ]));
+        player.handle(PlayerCommand::AddTracks(tracks(2)));
+
+        // A remote next track → queued with the bypass set.
+        player.handle(PlayerCommand::PlayTrack(0));
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        let queued = queues_of(&cmds);
+        let last = queued.last().expect("the next track is queued");
+        assert_eq!(
+            last.0,
+            QueueSource::Remote {
+                item_id: "def".into(),
+                container: Some("flac".into()),
+            },
+            "stream mode pre-opens the HTTP source itself"
+        );
+        assert!(last.1, "queued remote track in stream_pure: bypass set");
+
+        // A local next track → queued without it.
+        player.handle(PlayerCommand::PlayTrack(2));
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        let queued = queues_of(&cmds);
+        let last = queued.last().expect("the next track is queued");
+        assert_eq!(last.0, QueueSource::Local(PathBuf::from("/m/1.flac")));
+        assert!(!last.1, "a local next track keeps the EQ working");
     }
 
     // --- position math (pure) ---

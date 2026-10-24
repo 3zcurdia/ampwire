@@ -911,7 +911,10 @@ mod tests {
                 match event {
                     EngineEvent::Started(info, _handle) => outcome = Some(Ok(info)),
                     EngineEvent::Error(reason) => outcome = Some(Err(reason)),
-                    EngineEvent::Buffering | EngineEvent::Notice(_) | EngineEvent::Finished => {}
+                    EngineEvent::Buffering
+                    | EngineEvent::Notice(_)
+                    | EngineEvent::Finished
+                    | EngineEvent::Advanced(_) => {}
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
