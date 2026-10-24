@@ -52,6 +52,10 @@ pub struct HttpRangeSource {
     len: u64,
     /// Logical cursor: moved by `Seek`, advanced by `Read`.
     pos: u64,
+    /// How far forward a seek may still be served by discarding from the
+    /// open body ([`FORWARD_SEEK_LIMIT`] in production; tests shrink it so a
+    /// 14 KiB fixture can exercise the far-forward re-open path).
+    margin: u64,
     body: Mutex<BodyState>,
 }
 
@@ -71,11 +75,19 @@ impl HttpRangeSource {
             item_id: item_id.to_string(),
             len,
             pos: 0,
+            margin: FORWARD_SEEK_LIMIT,
             body: Mutex::new(BodyState {
                 reader: None,
                 body_pos: 0,
             }),
         })
+    }
+
+    /// Test hook: shrink the forward-discard margin, so a small fixture can
+    /// exercise the far-forward *re-open* path.
+    #[cfg(test)]
+    pub(crate) fn set_forward_margin(&mut self, margin: u64) {
+        self.margin = margin;
     }
 }
 
@@ -91,7 +103,7 @@ impl Read for HttpRangeSource {
         let reopen = match &state.reader {
             None => true,
             Some(_) if state.body_pos > self.pos => true,
-            Some(_) if self.pos - state.body_pos > FORWARD_SEEK_LIMIT => true,
+            Some(_) if self.pos - state.body_pos > self.margin => true,
             Some(_) => false,
         };
         if reopen {
@@ -225,4 +237,155 @@ fn content_range_total(response: &ureq::http::Response<ureq::Body>) -> Option<u6
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.rsplit('/').next())
         .and_then(|total| total.trim().parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::jellyfin::test_server::{KEY, MockServer};
+
+    /// The bytes the mock server streams (`tests/fixtures/tone.flac`).
+    fn fixture_bytes() -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.flac"),
+        )
+        .expect("tone.flac fixture")
+    }
+
+    /// Plan 08, step 7 (g): byte-identical reads, backwards and forwards,
+    /// and never a request for a mere `Seek`.
+    #[test]
+    fn the_source_reads_and_seeks_exactly_like_the_file_on_disk() {
+        let server = MockServer::start();
+        let client = server.client(KEY);
+        let on_disk = fixture_bytes();
+
+        let mut source = HttpRangeSource::open(client.clone(), "any").expect("206 server");
+        assert_eq!(
+            MediaSource::byte_len(&source),
+            Some(on_disk.len() as u64),
+            "length from the probe's Content-Range"
+        );
+        let probe_requests = server.log().len();
+
+        // Whole file, byte for byte.
+        let mut all = Vec::new();
+        source.read_to_end(&mut all).expect("reads");
+        assert_eq!(all, on_disk, "identical to the file on disk");
+
+        // Backwards seek → the next read re-opens at the cursor.
+        source.seek(SeekFrom::Start(10)).expect("seek");
+        let mut buf = [0u8; 64];
+        source.read_exact(&mut buf).expect("read after seek");
+        assert_eq!(&buf[..], &on_disk[10..74]);
+
+        // Forward seek inside the margin → discard, no new request.
+        let before_discard = server.log().len();
+        source.seek(SeekFrom::Current(100)).expect("seek");
+        source.read_exact(&mut buf).expect("read after seek");
+        assert_eq!(&buf[..], &on_disk[174..238]);
+        assert_eq!(
+            server.log().len(),
+            before_discard,
+            "a small forward seek discards instead of re-opening"
+        );
+
+        // Beyond the margin → re-open (the test hook shrinks it so the
+        // 14 KiB fixture can reach it).
+        source.set_forward_margin(16);
+        let before_far = server.log().len();
+        source.seek(SeekFrom::Current(1_000)).expect("seek");
+        let mut tail = Vec::new();
+        source.read_to_end(&mut tail).expect("read to the end");
+        assert_eq!(server.log().len(), before_far + 1, "re-opened once");
+        assert_eq!(
+            tail,
+            on_disk[238 + 1_000..],
+            "…and the far-forward bytes are exact"
+        );
+
+        // A plain `Seek` never talks to the network.
+        let before_seek = server.log().len();
+        source.seek(SeekFrom::Start(0)).expect("seek");
+        source.seek(SeekFrom::End(0)).expect("seek");
+        source.seek(SeekFrom::Current(-7)).expect("seek");
+        assert_eq!(server.log().len(), before_seek, "no request on seek alone");
+        assert!(probe_requests >= 1, "the probe ran first");
+
+        // Every request that *did* happen carried the header, never the key.
+        for logged in server.log() {
+            assert!(!logged.line.contains(KEY), "key in a line: {}", logged.line);
+            assert_eq!(
+                logged.auth.as_deref(),
+                Some(format!("MediaBrowser Token=\"{KEY}\"").as_str()),
+                "missing auth on: {}",
+                logged.line
+            );
+        }
+    }
+
+    /// Plan 08, step 7 (g): the source decodes through symphonia exactly
+    /// like the file would.
+    #[test]
+    fn decoder_open_source_decodes_the_stream() {
+        let server = MockServer::start();
+        let source = HttpRangeSource::open(server.client(KEY), "any").expect("206 server");
+        let mut decoder =
+            crate::audio::Decoder::open_source(Box::new(source), Some("flac"), Duration::ZERO)
+                .expect("the streamed file decodes");
+
+        let info = decoder.info().clone();
+        assert_eq!(info.codec, "FLAC");
+        assert!(info.lossless, "the fixture is lossless");
+        assert_eq!(info.sample_rate, 44_100);
+
+        let mut samples = Vec::new();
+        while decoder.read(&mut samples).expect("decodes") {}
+        assert!(
+            samples.len() > 40_000,
+            "≈0.5 s of stereo audio over HTTP: {} samples",
+            samples.len()
+        );
+    }
+
+    /// Plan 08, step 7 (g): a server that answers `200` to the probe
+    /// triggers the fallback — and the fallback really downloads the file.
+    #[test]
+    fn a_server_without_range_support_triggers_the_download_fallback() {
+        let server = MockServer::start();
+        server.set_no_ranges(true);
+        let client = server.client(KEY);
+
+        let probe = HttpRangeSource::open(client.clone(), "any");
+        let error = match probe {
+            Err(error) => error,
+            Ok(_) => panic!("a 200 answer must not yield a seekable source"),
+        };
+        assert_eq!(error, OpenError::NoRanges, "200 instead of 206");
+
+        // "Cache mode for this track": download once, bytes identical.
+        let path = download_fallback(&client, "any", Some("flac")).expect("downloads");
+        assert_eq!(
+            std::fs::read(&path).expect("readable"),
+            fixture_bytes(),
+            "the fallback file is the original"
+        );
+        assert!(
+            path.file_name().unwrap().to_string_lossy() == "any.flac",
+            "named after the item: {path:?}"
+        );
+        // Reuse on a second play: no second download.
+        let requests = server.log().len();
+        let again = download_fallback(&client, "any", Some("flac")).expect("reuses");
+        assert_eq!(again, path, "same file");
+        assert_eq!(server.log().len(), requests, "nothing re-fetched");
+
+        // This test owns the default temp dir (nothing else in the suite
+        // uses it): clean it up like a session's exit would.
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }

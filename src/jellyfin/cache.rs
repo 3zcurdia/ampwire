@@ -377,9 +377,9 @@ fn fetch(
         && len > max_bytes
     {
         failed(format!(
-            "file is {} MiB — over the {} MiB cache limit",
-            len / (1024 * 1024),
-            max_bytes / (1024 * 1024)
+            "file is {} — over the {} cache limit",
+            size_label(len),
+            size_label(max_bytes)
         ));
         return Flow::Continue;
     }
@@ -432,8 +432,8 @@ fn fetch(
                 if written > max_bytes {
                     cleanup(&part);
                     failed(format!(
-                        "file is over the {} MiB cache limit",
-                        max_bytes / (1024 * 1024)
+                        "file is over the {} cache limit",
+                        size_label(max_bytes)
                     ));
                     return Flow::Continue;
                 }
@@ -498,6 +498,18 @@ fn evict(dir: &Path, wanted: &[RemoteRef]) {
 /// stripped to ASCII alphanumerics, falling back to `bin`.
 fn ext_for(item: &RemoteRef) -> String {
     super::container_ext(item.container.as_deref())
+}
+
+/// `512 MiB` / `14 KiB` / `900 B` — human caps for the cache-limit notices
+/// (the injected test cap is 1 KiB, so MiB alone would round to zero).
+fn size_label(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{} MiB", bytes / (1024 * 1024))
+    } else if bytes >= 1024 {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// `Content-Length` of a response, when the server sent one.
@@ -732,5 +744,185 @@ mod tests {
             parent.path().read_dir().unwrap().next().is_none(),
             "nothing left behind in the parent"
         );
+    }
+
+    // --- against the mock server (plan 08, step 7 e + f) ---
+
+    use std::time::Instant;
+
+    use crate::jellyfin::test_server::{KEY, MockServer};
+
+    /// A wanted ref with the fixture's container.
+    fn remote_ref(id: &str) -> RemoteRef {
+        RemoteRef {
+            item_id: id.to_string(),
+            container: Some("flac".into()),
+        }
+    }
+
+    /// Poll (draining events) until `pred` holds, or give up at the
+    /// deadline. Returns what `pred` last saw.
+    fn wait_for(cache: &mut Cache, deadline: Duration, pred: impl Fn(&mut Cache) -> bool) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < deadline {
+            cache.poll();
+            if pred(cache) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Plan 08, step 7 (e): a 3-item window downloads, a shifted window
+    /// evicts the dropped item and fetches the new one, and items already
+    /// on disk are re-reported without another HTTP request.
+    #[test]
+    fn the_window_downloads_evicts_and_reuses_files() {
+        let server = MockServer::start();
+        let parent = tempfile::tempdir().unwrap();
+        let mut cache =
+            Cache::new(server.client(KEY), Some(parent.path().to_path_buf())).expect("cache");
+
+        cache.set_window(vec![remote_ref("a"), remote_ref("b"), remote_ref("c")]);
+        assert!(
+            wait_for(&mut cache, Duration::from_secs(10), |cache| {
+                ["a", "b", "c"]
+                    .iter()
+                    .all(|id| cache.path_if_ready(id).is_some())
+            }),
+            "the three items download: {:?}",
+            ["a", "b", "c"]
+                .iter()
+                .map(|id| cache.path_if_ready(id))
+                .collect::<Vec<_>>()
+        );
+        for id in ["a", "b", "c"] {
+            let path = cache.path_if_ready(id).expect("ready above");
+            assert_eq!(
+                path.file_name().unwrap().to_string_lossy(),
+                format!("{id}.flac"),
+                "named <id>.<container>"
+            );
+            assert!(path.is_file());
+        }
+
+        // Shift the window: `a` drops out, `d` joins.
+        cache.set_window(vec![remote_ref("b"), remote_ref("c"), remote_ref("d")]);
+        assert!(
+            wait_for(&mut cache, Duration::from_secs(10), |cache| {
+                cache.path_if_ready("d").is_some()
+            }),
+            "the new item downloads"
+        );
+        // The new window was applied *before* its download started, so
+        // seeing `d` ready also proves `a` was evicted.
+        assert_eq!(cache.path_if_ready("a"), None, "a left the window");
+        assert!(!cache.dir().join("a.flac").exists(), "a's file is deleted");
+        assert!(cache.dir().join("b.flac").exists(), "b survives");
+        assert!(
+            !cache.dir().join("a.part").exists(),
+            "no stray partials either"
+        );
+
+        // Re-announcing the same window re-reports the files on disk —
+        // a `Ready` arrives, but not a single new HTTP request.
+        let requests_before = server.log().len();
+        cache.set_window(vec![remote_ref("b"), remote_ref("c"), remote_ref("d")]);
+        let started = Instant::now();
+        let mut re_reported = false;
+        while started.elapsed() < Duration::from_secs(5) && !re_reported {
+            for event in cache.poll() {
+                if let CacheEvent::Ready { item_id, .. } = event {
+                    re_reported = re_reported || item_id == "b";
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(re_reported, "an on-disk item is re-announced as Ready");
+        assert_eq!(
+            server.log().len(),
+            requests_before,
+            "…without fetching it again"
+        );
+    }
+
+    /// Plan 08, step 7 (e): a download in flight is a `.part` file, which
+    /// is *never* reported ready (and therefore never decoded).
+    #[test]
+    fn a_part_file_is_never_reported_ready() {
+        let server = MockServer::start();
+        // Hold the body back long enough to observe the in-flight state.
+        server.set_audio_delay(Duration::from_millis(1500));
+        let parent = tempfile::tempdir().unwrap();
+        let mut cache =
+            Cache::new(server.client(KEY), Some(parent.path().to_path_buf())).expect("cache");
+
+        cache.set_window(vec![remote_ref("slow")]);
+        let part = cache.dir().join("slow.part");
+        let started = Instant::now();
+        while !part.exists() && started.elapsed() < Duration::from_secs(5) {
+            cache.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(part.exists(), "the download is really in flight");
+        cache.poll();
+        assert_eq!(
+            cache.path_if_ready("slow"),
+            None,
+            "a .part file is never ready"
+        );
+
+        // Once complete (renamed atomically) it is.
+        assert!(
+            wait_for(&mut cache, Duration::from_secs(15), |cache| {
+                cache.path_if_ready("slow").is_some()
+            }),
+            "the delayed download finishes"
+        );
+        assert!(!part.exists(), "the .part was renamed away");
+        let ready = cache.path_if_ready("slow").expect("ready");
+        assert_eq!(ready.file_name().unwrap().to_string_lossy(), "slow.flac");
+    }
+
+    /// Plan 08, step 7 (f): the size cap (injected as 1 KiB here) refuses
+    /// the file before anything lands on disk.
+    #[test]
+    fn the_size_cap_refuses_a_bigger_file() {
+        let server = MockServer::start();
+        let parent = tempfile::tempdir().unwrap();
+        let mut cache = Cache::with_limit(
+            server.client(KEY),
+            Some(parent.path().to_path_buf()),
+            1024, // 1 KiB: the fixture is ~14 KiB
+        )
+        .expect("cache");
+
+        cache.set_window(vec![remote_ref("big")]);
+        let started = Instant::now();
+        let mut error = None;
+        while started.elapsed() < Duration::from_secs(5) && error.is_none() {
+            for event in cache.poll() {
+                if let CacheEvent::Failed {
+                    item_id,
+                    error: reason,
+                } = event
+                    && item_id == "big"
+                {
+                    error = Some(reason);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let error = error.expect("the oversized download is refused");
+        assert!(
+            error.contains("over the 1 KiB cache limit"),
+            "cap in the notice: {error}"
+        );
+        assert!(!error.contains(KEY), "no key in the error: {error}");
+
+        assert_eq!(cache.path_if_ready("big"), None, "nothing became ready");
+        assert!(!cache.dir().join("big.flac").exists(), "no file");
+        assert!(!cache.dir().join("big.part").exists(), "no partial left");
     }
 }
