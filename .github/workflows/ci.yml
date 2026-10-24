@@ -1,0 +1,43 @@
+name: CI
+
+# Runs the full verification suite on every push, PR, and version tag.
+# Discipline: only push a version tag (which triggers the Release
+# workflow) when CI is green on that commit — a tag push also runs
+# this workflow, so a red tag is visible immediately.
+on:
+  push:
+    branches: ["**"]
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install ALSA headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: check
+        run: cargo check --all-targets
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      # Never touches a sound card or the network (device + real-server
+      # tests are #[ignore]d); safe on hosted runners.
+      - name: test
+        run: cargo test
