@@ -1,7 +1,12 @@
 # Plan 08 — Jellyfin: load the whole server library and play it
 
-**Status:** 🟨 in progress — since 2026-10-23 (plans 03–07 all done; Step 0
-spike passed, all three modes ship).
+**Status:** ✅ done — 2026-10-23, f68124c. 357 tests pass (3 `#[ignore]`d: a
+visual dump, the audio-device smoke test, and the real-server Jellyfin smoke),
+goldens unchanged, `cargo fmt --check` + `clippy --all-targets -- -D warnings`
+clean. Built in steps 0–8 (`2a61909`…`f68124c`); Step 0's spike passed against
+a real server (see **Spike result**), so all three modes shipped, and the
+real-server smoke ran to completion against that same server (library → cache
+window → `Range` decode → device playback). Deviations annotated at the end.
 
 Goal: with a `[jellyfin]` section in `config.toml`, pressing `j` fetches every
 audio track on the server into the playlist (appended to whatever is there).
@@ -223,3 +228,112 @@ Verdict: the server answers `206` + `Content-Range` + `Accept-Ranges: bytes`
 for both head and tail ranges → seekable streaming is possible, so **all three
 modes (`cache`, `stream`, `stream_pure`) are implemented** (no
 "streaming not verified" fallback needed).
+
+## Deviations
+
+Everything the plan asked for is in; these are the places the implementation
+diverges in detail, newest concerns first grouped by area:
+
+1. **Interactive checks replaced by a scripted smoke test.** The plan's
+   *"Manual (needs a real server)"* list (watch the temp dir slide under
+   next/prev/shuffle, seek over the network, hear the `stream_pure` bypass) is
+   covered by the env-gated `#[ignore]`d test
+   `jellyfin::tests::jellyfin_real_server_smoke` (library paging → a real
+   cache window downloading/evicting → dir removed on drop → `Range`
+   read + symphonia decode → one real `EngineCmd::LoadRemote` playing through
+   the device), plus the deterministic unit tests for the sliding-window
+   logic (`compute_window`: ordered/shuffle/mixed/edges/zero) and the EQ
+   bypass (`dsp`, `real.rs`). Run it with
+   `AMWIRE_JELLYFIN_URL=… AMWIRE_JELLYFIN_API_KEY=… cargo test -- --ignored jellyfin_real_server`.
+   **Ran to completion against the live server (2026-10-23)**: the 2 523-track
+   library paged, a real cache window of 3 downloaded then slid (dropped item
+   evicted, directory removed on drop), the whole original streamed back
+   byte-exact and decoded (`AAC 44100 Hz 2ch`, 22 784 000 samples ≈ 258 s),
+   and `EngineCmd::LoadRemote` really started playback
+   (`StreamInfo { codec: "AAC", sample_rate: 44100, duration: 258.31 s }`).
+   What stays *interactive-only* by nature: watching the directory slide while
+   pressing next/prev in the TUI and ear-checking `stream_pure` — the logic
+   behind each is unit-tested (`compute_window`, `dsp::eq_bypass`,
+   `real.rs` buffering/stream tests).
+2. **Range probe sends `bytes=0-`, not `bytes=0-0`.** `open_original`'s
+   `range_from: Option<u64>` builds `bytes={from}-` (plan §API). The probe's
+   purpose — status `206` + total length from `Content-Range` after the last
+   `/` — is identical; the real-server spike answered both forms with `206`.
+3. **Unknown `mode` needs a string-level parse.** A serde enum would abort the
+   whole config on an unknown variant, so `JellyfinConfig` deserializes
+   through a private `JellyfinConfigRepr` (`#[serde(from)]`) where `mode` is
+   an `Option<String>`; the `From` conversion maps `cache`/`stream`/
+   `stream_pure`, downgrades anything else to `Cache` **with** the notice
+   `jellyfin: unknown mode "x", using cache`, and trims the URL's trailing
+   slash. `JellyfinMode` itself keeps `#[serde(rename_all = "snake_case")]`
+   names for its `Serialize` side.
+4. **A configured-but-unknown `user` is an error**, not "fall back to the
+   first user": `jellyfin: user "<name>" not found`. Silently playing as a
+   different account because of a typo seemed worse than failing; omitting
+   `user` still picks the first user, exactly as planned.
+5. **Container comes from `MediaSources[0].Container` first** (e.g. `m4a`) —
+   the item-level `Container` is a comma list (`mov,mp4,m4a,…`) and only its
+   first segment can act as a file extension. All extension values are
+   sanitized to ASCII alphanumerics (`bin` fallback), so a hostile server
+   string cannot escape the cache directory.
+6. **Paging advances `StartIndex` by the page size (500)**, not by the number
+   of *mapped* tracks — a malformed item dropped during mapping can neither
+   stall nor duplicate the walk. The stop conditions are unchanged: `start ≥
+   TotalRecordCount`, or an empty page.
+7. **An incomplete `[jellyfin]` section** (present, but empty `url`/`api_key`)
+   shows the same notice as no section at all:
+   `jellyfin: add [jellyfin] url and api_key to config.toml`.
+8. **`Cache` internals.** `ready` is a `Mutex<HashMap<id, PathBuf>>` rather
+   than a `HashSet`, which is what lets `set_window` keep the plan's
+   `&self` signature (bookkeeping prune + send) and lets `path_if_ready`
+   remember each item's extension; it also re-checks `path.exists()` and
+   drops stale entries (eviction can race bookkeeping by one tick). `Cache`
+   additionally owns a `JoinHandle` — `Drop` needs to join before
+   `remove_dir_all`.
+9. **Cache unavailable (temp dir not creatable):** a remote track in `cache`
+   mode stops with `jellyfin: cache unavailable` instead of taking the
+   plan-03 skip path — the error would fire *inside* `load_track` (re-entrant
+   advance), and skipping would just churn through every remote track for the
+   same unfixable reason. Download `Failed` events still use the plan-03
+   skip path exactly (`skipped <name>: <reason>`).
+10. **Notice lifecycle.** Notices persist until replaced in this codebase, so
+    two timings were pinned down: `buffering…` is retired by the engine's
+    `Started` (only if it is still the current notice — anything else queued
+    meanwhile keeps its place), and `stream pure: eq bypassed` is raised at
+    `Started` (first remote stream of the session) rather than at `Load`, so
+    it can neither be clobbered by nor hide `EngineEvent::Buffering`.
+11. **The `200`-to-`Range` fallback lives in the engine.** For a server that
+    ignores `Range`, the engine downloads that one original into
+    `ampwire-jellyfin-<pid>/` (same `0700` dir, same 512 MiB cap) and plays
+    it as a local file, preceded by the plan's notice
+    `jellyfin: server does not support ranges, downloading`. This is the
+    plan's *"cache mode for this track"* without constructing a `Cache` —
+    the plan forbids a cache directory in stream modes, so this directory is
+    the documented exception, reached only from `OpenError::NoRanges`.
+12. **`HttpRangeSource`'s body sits behind a `Mutex<BodyState>`** — symphonia
+    `MediaSource: Read + Seek + Send + Sync`, so the plan's
+    `body: Option<Box<dyn Read + Send>>` field alone would not be `Sync`.
+    Behaviour is as specified: `Seek` moves only the cursor (never a
+    request), `Read` re-opens when the open body cannot serve it (nothing
+    open, backwards, or farther forward than the 64 KiB margin), otherwise
+    discards forward; reads never run past the probe's length.
+13. **`EngineEvent` gained `Buffering` (as planned) and `Notice(String)`** —
+    the latter carries the range-fallback message from the engine thread to
+    the player's notice slot.
+14. **`app::Backend` variants are boxed** (`Mock(Box<MockPlayer>)`,
+    `Real(Box<RealPlayer>)`): plan 08's cache state grew `RealPlayer` past
+    clippy's `large_enum_variant` threshold, and boxing only the real side
+    would have inverted the complaint.
+15. **Test-only hook:** `HttpRangeSource::set_forward_margin` shrinks the
+    64 KiB discard margin so the 14 KiB fixture can exercise the
+    far-forward re-open path; production behaviour is untouched.
+16. **`Config::save` / `[jellyfin]`** needed no code change — the save path
+    only ever writes the `layout`/`theme`/`audio`/`eq` tables — but the
+    plan-required regression test (`save_leaves_the_jellyfin_table_untouched`)
+    is in place, along with the `cache_ahead`/`cache_behind` 0–10 clamp in
+    `sanitize` (the plan listed the range only in passing).
+
+Plan assumptions (remote-only counting in play order, the stream-mode
+blocking-read limitation — now also documented in the README as *"use cache
+mode on slow links"*, no startup auto-load, server order preserved) were kept
+as-is.
