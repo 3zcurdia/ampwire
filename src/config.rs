@@ -62,7 +62,7 @@ pub struct ThemeConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            preset: "neon".into(),
+            preset: "omarchy".into(),
             transparent: true,
             colors: HashMap::new(),
         }
@@ -574,6 +574,17 @@ mod tests {
         let loaded = Config::load_from(&dir.path().join("nope.toml"));
         assert_eq!(loaded.config, Config::default());
         assert!(loaded.notice.is_none());
+    }
+
+    #[test]
+    fn default_theme_follows_the_os_theme() {
+        // Fresh installs follow Omarchy and live-reload it; `neon` is only
+        // the fallback when no Omarchy theme is present.
+        assert_eq!(Config::default().theme.preset, "omarchy");
+        assert!(
+            crate::ui::theme::Theme::preset("neon").is_some(),
+            "fallback still exists"
+        );
     }
 
     #[test]

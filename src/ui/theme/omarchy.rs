@@ -317,4 +317,24 @@ cyan = "#449dab"
         let err = watch.check_dir(dir.path(), true).unwrap_err();
         assert!(err.contains("colors.toml"), "{err}");
     }
+
+    #[test]
+    fn live_os_theme_loads_when_present() {
+        // On Omarchy machines this proves the real `colors.toml` maps onto
+        // ampwire roles; elsewhere it gracefully skips (no Omarchy dir).
+        let Some(dir) = theme_dir() else {
+            return;
+        };
+        let theme = load_theme(&dir, true).expect("real theme must parse");
+        let text = fs::read_to_string(dir.join("colors.toml")).unwrap();
+        let palette = parse_colors_toml(&text);
+        // Primary always tracks the theme accent (or its color4 fallback).
+        let expected = palette.accent.or(palette.color[4]).unwrap();
+        assert_eq!(theme.color(Role::Primary), expected);
+        // And a second poll with no changes reports no change (live-reload
+        // only fires on real edits).
+        let mut watch = OmarchyWatch::new();
+        assert!(watch.check(true).unwrap().is_some(), "first poll loads");
+        assert!(watch.check(true).unwrap().is_none(), "second poll is quiet");
+    }
 }

@@ -248,7 +248,8 @@ impl App {
     }
 
     /// Deterministic app for `--dump` and golden tests: frozen player state,
-    /// fixed EQ bands, no config persistence, no Omarchy polling.
+    /// fixed EQ bands, no config persistence, no Omarchy polling (the config
+    /// is pinned to `neon` so ticks never touch the OS theme).
     pub fn deterministic(keymap: Keymap, theme: Theme) -> Self {
         let ui = UiState {
             vis: Visibility::all(),
@@ -259,11 +260,13 @@ impl App {
         let player = Backend::Mock(Box::new(MockPlayer::deterministic()));
         let snapshot = player.snapshot();
         let now = Instant::now();
+        let mut config = Config::default();
+        config.theme.preset = "neon".into();
         Self {
             ui,
             theme,
             keymap,
-            config: Config::default(),
+            config,
             should_quit: false,
             snapshot,
             player,
@@ -1287,11 +1290,15 @@ mod tests {
     use crate::action::Action;
 
     /// App wired to a temp config file so saves never touch the real one.
+    /// The theme preset is pinned to `neon` so ticks never poll the OS
+    /// theme — unit tests stay hermetic on Omarchy machines.
     fn test_app() -> (App, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.theme.preset = "neon".into();
         let app = App::with_config_path(
-            Config::default(),
+            config,
             Keymap::defaults(),
             crate::ui::theme::neon(),
             false,

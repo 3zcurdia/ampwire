@@ -177,7 +177,7 @@ fn resolve_theme(config: &Config) -> Theme {
         name => {
             let mut theme = Theme::preset(name).unwrap_or_else(|| {
                 eprintln!(
-                    "ampwire: unknown theme preset `{name}` (available: {}), using neon",
+                    "ampwire: unknown theme preset `{name}` (available: {}, omarchy), using neon",
                     Theme::preset_names().join(", ")
                 );
                 Theme::preset("neon").expect("neon preset exists")

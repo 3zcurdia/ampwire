@@ -243,7 +243,10 @@ impl Theme {
     }
 }
 
-/// Default preset: neon orange main, aqua accent (plan §3.2).
+/// Fallback preset: neon orange main, aqua accent (plan §3.2).
+/// Used when `preset = "omarchy"` but no Omarchy theme is found, and for
+/// `--dump`/golden frames. The default preset is `omarchy` (see `omarchy.rs`):
+/// fresh installs follow the OS theme and live-reload it once a second.
 pub fn neon() -> Theme {
     build([
         (Role::Bg, Color::Reset),

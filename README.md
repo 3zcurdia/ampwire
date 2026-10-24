@@ -118,7 +118,7 @@ single_order = ["player", "eq", "playlist"]
 visible = ["player", "eq", "playlist"]
 
 [theme]
-preset = "neon"      # "neon" | "amber" | "matrix" | "synthwave" | "omarchy"
+preset = "omarchy"   # "omarchy" (default: follows the OS theme, live-reloads) | "neon" | "amber" | "matrix" | "synthwave"
 transparent = true   # false → paint panel background
 
 [theme.colors]       # optional per-role overrides
@@ -160,11 +160,11 @@ next = ["n"]
 
 Widgets use semantic roles (`bg`, `fg`, `primary`, `glow`, `accent`, `muted`, `warn` + spectrum gradient), never raw colors. Presets:
 
-- `neon` (default): neon orange primary, aqua accent, transparent bg
+- `omarchy` (default): auto-follow the active Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`, fallback `~/.config/omarchy/current/theme`), re-checked once per second. Missing/unreadable → silent fallback to `neon`. `AMPWIRE_OMARCHY_DIR` overrides the path for tests.
+- `neon` (fallback): neon orange primary, aqua accent, transparent bg
 - `amber`: single-color amber CRT
 - `matrix`: green-on-black
 - `synthwave`: magenta + cyan
-- `omarchy`: auto-follow the active Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`, fallback `~/.config/omarchy/current/theme`), re-checked once per second. Missing/unreadable → silent fallback to `neon`. `AMPWIRE_OMARCHY_DIR` overrides the path for tests.
 
 Color depth: non-truecolor terminals get nearest 256-color mapping; 16-color terminals map to ANSI slots.
 
