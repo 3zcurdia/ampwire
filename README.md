@@ -1,6 +1,6 @@
 # Ampwire
 
-|![horizontal](images/horizontal.png)|![vertical](images/vertical.png)|
+|![horizontal](docs/images/horizontal.png)|![vertical](docs/images/vertical.png)|
 |-|-|
 
 
@@ -188,11 +188,11 @@ next = ["n"]
 
 ## Theming
 
-|![omarchy](images/omarchy-compatible.png)|![omarchy-green](images/omarchy-green.png)|
+|![omarchy](docs/images/omarchy-compatible.png)|![omarchy-green](docs/images/omarchy-green.png)|
 |-|-|
 
 
-|![vertical](images/vertical.png)|![green](images/vertical-green.png)|![lumon](images/vertical-lumon.png)|
+|![vertical](docs/images/vertical.png)|![green](docs/images/vertical-green.png)|![lumon](docs/images/vertical-lumon.png)|
 |-|-|-|
 
 
