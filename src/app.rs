@@ -839,11 +839,21 @@ impl App {
         self.scan_loaded = false;
     }
 
-    /// How to log in for `url`: the URL's own server (always), credentials
-    /// from `[smb]` in `config.toml` — guest when none are configured
-    /// (plan 10, steps 3/4).
+    /// How to log in for `url`: the URL's own server (the URL rule makes it
+    /// mandatory), the account/secret/domain from `[smb]` — resolved by
+    /// `Config::load` as `AMPWIRE_SMB_PASSWORD` > `password_file` >
+    /// `password`. No section at all → guest (plan 10, step 4).
     fn smb_client_cfg(&self, url: &crate::smb::SmbUrl) -> crate::smb::SmbClientCfg {
-        crate::smb::SmbClientCfg::new(&url.server, "", "")
+        let mut cfg = match &self.config.smb {
+            Some(smb) => crate::smb::SmbClientCfg::new(
+                url.server.clone(),
+                smb.username.clone(),
+                smb.password.clone(),
+            ),
+            None => crate::smb::SmbClientCfg::new(url.server.clone(), "", ""),
+        };
+        cfg.domain = self.config.smb.as_ref().and_then(|smb| smb.domain.clone());
+        cfg
     }
 
     /// [`load_inputs`][Self::load_inputs] for local paths only — the plan
@@ -892,9 +902,20 @@ impl App {
     /// A worker that could not even start (plan 10, step 3: `smb: cannot
     /// connect`, `not found: smb://…`): show its fixed line. The other
     /// workers of the same load keep running.
+    ///
+    /// With no `[smb]` section we cannot tell a refused login from an
+    /// unreachable server, so the plan's answer stands: point at where the
+    /// credentials go. Once a section exists the line is the plain
+    /// `smb: cannot connect`.
     fn finish_failure(&mut self, reason: &str) {
         self.scan_pending = self.scan_pending.saturating_sub(1);
-        self.ui.notice = Some(reason.to_string());
+        self.ui.notice = Some(
+            if reason == "smb: cannot connect" && self.config.smb.is_none() {
+                "smb: add [smb] credentials to config.toml".to_string()
+            } else {
+                reason.to_string()
+            },
+        );
     }
 
     fn finish_scan(&mut self, tracks: Vec<Track>, skipped: usize) {
@@ -1964,10 +1985,33 @@ mod tests {
         assert_eq!(app.scan_pending, 0, "nothing left to report");
         assert_eq!(
             app.ui.notice.as_deref(),
-            Some("smb: cannot connect"),
-            "a fixed line, no URL or credential in it"
+            Some("smb: add [smb] credentials to config.toml"),
+            "no `[smb]` section → the plan's pointer, a fixed line with no \
+             URL or credential in it"
         );
         assert_eq!(app.snapshot().tracks.len(), 24, "playlist untouched");
+
+        // With a `[smb]` section the line is the plain connect failure.
+        let config = toml::from_str::<crate::config::Config>("[smb]\n").expect("section");
+        app.config = config;
+        let LoadInput::Smb(url) =
+            crate::smb::parse_load_input("smb://127.0.0.1/Music").expect("valid url")
+        else {
+            panic!("expected an smb input");
+        };
+        app.load_inputs(vec![LoadInput::Smb(url)], ScanMode::Replace);
+        for _ in 0..200 {
+            app.tick(Duration::from_millis(1));
+            if app.scan_rx.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("smb: cannot connect"),
+            "a configured section reports the plain failure"
+        );
     }
 
     /// Plan 10, step 3: a mixed command line runs both halves at once over
@@ -2006,7 +2050,9 @@ mod tests {
         // Whichever worker finished last owns the notice.
         let notice = app.ui.notice.clone().unwrap_or_default();
         assert!(
-            notice == "smb: cannot connect" || notice.starts_with("loaded 2 tracks"),
+            notice == "smb: add [smb] credentials to config.toml"
+                || notice == "smb: cannot connect"
+                || notice.starts_with("loaded 2 tracks"),
             "unexpected notice: {notice}"
         );
     }

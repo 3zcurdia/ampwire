@@ -79,6 +79,10 @@ pub struct Config {
     /// `[jellyfin]` (plan 08): `None` when the section is absent, so `j`
     /// can tell "not configured" from "configured".
     pub jellyfin: Option<JellyfinConfig>,
+    /// `[smb]` (plan 10): `None` when the section is absent — then every
+    /// `smb://` URL connects as guest, and a failed connection points the
+    /// user at this section.
+    pub smb: Option<SmbConfig>,
     /// `[keys]` action → list of key specs.
     pub keys: HashMap<String, Vec<String>>,
 }
@@ -255,6 +259,124 @@ impl From<JellyfinConfigRepr> for JellyfinConfig {
     }
 }
 
+/// How SMB tracks are fetched (plan 10). Unknown strings in the config
+/// downgrade to [`Cache`](SmbMode::Cache) with a notice (the `From`
+/// conversion below), exactly like [`JellyfinMode`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmbMode {
+    /// Download to a rolling `ampwire-smb-<pid>` window (the default).
+    #[default]
+    Cache,
+    /// Read the original file over positioned SMB reads, store nothing.
+    Stream,
+}
+
+/// `[smb]`: who to log in as, and how tracks are fetched.
+///
+/// There is deliberately **no** `server`/`share` here: the plan's URL rule
+/// makes `smb://server/share/…` mandatory, so those defaults could never
+/// apply (decided with the owner, 2026-10-25 — see the plan's deviations).
+///
+/// Never written back — `Config::save` leaves the table untouched (the
+/// password lives only in the user's own file) — and never printed: the
+/// `Debug` impl below redacts it. After loading, `password` holds the
+/// *effective* secret: `AMPWIRE_SMB_PASSWORD` beats `password_file`, which
+/// beats `password`.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "SmbConfigRepr")]
+pub struct SmbConfig {
+    /// Account name; the default (`guest`) means anonymous — Samba accepts
+    /// it spelled `/GUEST`, which the client retries (plan 10, step 3).
+    pub username: String,
+    pub password: String,
+    /// A file holding the password (whitespace trimmed), so it can stay out
+    /// of the config this app rewrites; relative paths are relative to the
+    /// config file's directory.
+    pub password_file: Option<std::path::PathBuf>,
+    /// NTLM domain/workgroup, optional.
+    pub domain: Option<String>,
+    pub mode: SmbMode,
+    /// `cache` mode only: how many *SMB* tracks to prefetch, 0–10.
+    pub cache_ahead: usize,
+    pub cache_behind: usize,
+    /// Parent of `ampwire-smb-<pid>`; the system temp dir by default.
+    pub cache_dir: Option<std::path::PathBuf>,
+    /// One-line notice when the file held an unrecognized `mode`.
+    #[serde(skip)]
+    pub notice: Option<String>,
+}
+
+impl std::fmt::Debug for SmbConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmbConfig")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("password_file", &self.password_file)
+            .field("domain", &self.domain)
+            .field("mode", &self.mode)
+            .field("cache_ahead", &self.cache_ahead)
+            .field("cache_behind", &self.cache_behind)
+            .field("cache_dir", &self.cache_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the TOML holds: every field optional/defaulted, `mode` as a raw
+/// string so a typo is reported instead of rejected (an unknown enum
+/// variant would abort the whole config parse).
+#[derive(Deserialize)]
+#[serde(default)]
+struct SmbConfigRepr {
+    username: String,
+    password: String,
+    password_file: Option<std::path::PathBuf>,
+    domain: Option<String>,
+    mode: Option<String>,
+    cache_ahead: usize,
+    cache_behind: usize,
+    cache_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for SmbConfigRepr {
+    fn default() -> Self {
+        Self {
+            username: "guest".into(),
+            password: String::new(),
+            password_file: None,
+            domain: None,
+            mode: None,
+            cache_ahead: 3,
+            cache_behind: 3,
+            cache_dir: None,
+        }
+    }
+}
+
+impl From<SmbConfigRepr> for SmbConfig {
+    fn from(repr: SmbConfigRepr) -> Self {
+        let (mode, notice) = match repr.mode.as_deref() {
+            None | Some("cache") => (SmbMode::Cache, None),
+            Some("stream") => (SmbMode::Stream, None),
+            Some(other) => (
+                SmbMode::Cache,
+                Some(format!("smb: unknown mode \"{other}\", using cache")),
+            ),
+        };
+        Self {
+            username: repr.username,
+            password: repr.password,
+            password_file: repr.password_file,
+            domain: repr.domain,
+            mode,
+            cache_ahead: repr.cache_ahead,
+            cache_behind: repr.cache_behind,
+            cache_dir: repr.cache_dir,
+            notice,
+        }
+    }
+}
+
 pub struct LoadedConfig {
     pub config: Config,
     /// One-line notice for the playlist bottom border, if anything went wrong.
@@ -277,6 +399,7 @@ impl Config {
         };
         let mut loaded = Self::load_from(&path);
         apply_env_api_key(&mut loaded.config, std::env::var(API_KEY_ENV).ok());
+        apply_env_smb_password(&mut loaded.config, std::env::var(SMB_PASSWORD_ENV).ok());
         loaded
     }
 
@@ -298,12 +421,14 @@ impl Config {
             },
             Ok(text) => match toml::from_str::<Config>(&text) {
                 Ok(mut config) => {
-                    // A bad `[jellyfin] mode` is downgraded to `cache` with a
-                    // one-line notice; everything else still loads. So does
-                    // an unreadable `api_key_file`.
-                    let key_notice = read_api_key_file(&mut config, path);
-                    let notice = key_notice
-                        .or_else(|| config.jellyfin.as_ref().and_then(|jf| jf.notice.clone()));
+                    // A bad `[jellyfin] mode` / `[smb] mode` is downgraded
+                    // with a one-line notice; everything else still loads.
+                    // So does an unreadable `api_key_file`/`password_file`.
+                    let file_notice = read_api_key_file(&mut config, path)
+                        .or_else(|| read_smb_password_file(&mut config, path));
+                    let notice = file_notice
+                        .or_else(|| config.jellyfin.as_ref().and_then(|jf| jf.notice.clone()))
+                        .or_else(|| config.smb.as_ref().and_then(|smb| smb.notice.clone()));
                     LoadedConfig {
                         config: sanitize(config),
                         notice,
@@ -388,11 +513,11 @@ impl Config {
         };
         fs::create_dir_all(parent)?;
         let tmp = path.with_extension("toml.tmp");
-        // The file may hold `[jellyfin] api_key` (README: `chmod 600`), so
-        // the replacement inherits the original's permissions — set on the
-        // temp file *before* any byte is written, never widened by the
-        // rename. A stale temp file from a crashed save is removed first:
-        // its mode is unknown.
+        // The file may hold `[jellyfin] api_key` or `[smb] password`
+        // (README: `chmod 600`), so the replacement inherits the original's
+        // permissions — set on the temp file *before* any byte is written,
+        // never widened by the rename. A stale temp file from a crashed save
+        // is removed first: its mode is unknown.
         let original = fs::metadata(path).ok().map(|meta| meta.permissions());
         let _ = fs::remove_file(&tmp);
         {
@@ -445,6 +570,41 @@ pub fn apply_env_api_key(config: &mut Config, value: Option<String>) {
         && !value.trim().is_empty()
     {
         jf.api_key = value.trim().to_string();
+    }
+}
+
+/// The environment variable that supplies the SMB password (plan 10,
+/// step 4): `AMPWIRE_SMB_PASSWORD` beats `password_file`, which beats
+/// `[smb] password`.
+pub const SMB_PASSWORD_ENV: &str = "AMPWIRE_SMB_PASSWORD";
+
+/// `[smb] password_file` → `password` (trimmed). Relative paths resolve
+/// against the config file's directory. Returns the notice for a file that
+/// cannot be read — never its contents, and the password stays as it was.
+fn read_smb_password_file(config: &mut Config, config_path: &Path) -> Option<String> {
+    let smb = config.smb.as_mut()?;
+    let file = smb.password_file.as_ref()?;
+    let file = match config_path.parent() {
+        Some(dir) if file.is_relative() => dir.join(file),
+        _ => file.clone(),
+    };
+    match fs::read_to_string(file) {
+        Ok(secret) if !secret.trim().is_empty() => {
+            smb.password = secret.trim().to_string();
+            None
+        }
+        _ => Some("smb: cannot read password_file".into()),
+    }
+}
+
+/// `AMPWIRE_SMB_PASSWORD`, when set and not blank, replaces the password
+/// of an existing `[smb]` section (it never creates one: a secret without
+/// a section configures nobody). Never written back by [`Config::save`].
+pub fn apply_env_smb_password(config: &mut Config, value: Option<String>) {
+    if let (Some(smb), Some(value)) = (config.smb.as_mut(), value)
+        && !value.trim().is_empty()
+    {
+        smb.password = value.trim().to_string();
     }
 }
 
@@ -548,6 +708,11 @@ fn sanitize(mut config: Config) -> Config {
     if let Some(jf) = config.jellyfin.as_mut() {
         jf.cache_ahead = jf.cache_ahead.min(10);
         jf.cache_behind = jf.cache_behind.min(10);
+    }
+    // SMB cache window: the same range and defaults (plan 10, step 4).
+    if let Some(smb) = config.smb.as_mut() {
+        smb.cache_ahead = smb.cache_ahead.min(10);
+        smb.cache_behind = smb.cache_behind.min(10);
     }
     config
 }
@@ -1045,5 +1210,156 @@ cache_behind = 2
         let jf = Config::load_from(&path).config.jellyfin.expect("parsed");
         assert_eq!(jf.cache_ahead, 10);
         assert_eq!(jf.cache_behind, 10);
+    }
+
+    // --- `[smb]` (plan 10, step 4) ---
+
+    /// The section parses with the plan's defaults, an unknown `mode`
+    /// downgrades to `cache` *with a notice* (and does not fail the parse),
+    /// and the window is clamped to 0–10. No section at all → `None`, which
+    /// the loader reads as "connect as guest".
+    #[test]
+    fn smb_section_parses_with_defaults_and_notices_unknown_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[smb]\nusername = \"luis\"\npassword = \"literal\"\nmode = \"warp\"\ncache_ahead = 99\ncache_behind = 7\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        let smb = loaded.config.smb.clone().expect("section");
+        assert_eq!(smb.username, "luis");
+        assert_eq!(smb.mode, SmbMode::Cache, "unknown mode → cache");
+        assert_eq!(
+            loaded.notice.as_deref(),
+            Some("smb: unknown mode \"warp\", using cache")
+        );
+        assert_eq!(smb.cache_ahead, 10, "clamped");
+        assert_eq!(smb.cache_behind, 7, "in range, kept");
+
+        // `mode = "stream"` is accepted, and the defaults are the plan's.
+        fs::write(&path, "[smb]\nmode = \"stream\"\n").unwrap();
+        let loaded = Config::load_from(&path);
+        assert!(loaded.notice.is_none(), "{:?}", loaded.notice);
+        let smb = loaded.config.smb.expect("section");
+        assert_eq!(smb.mode, SmbMode::Stream);
+        assert_eq!(smb.username, "guest", "the plan's default account");
+        assert_eq!(smb.password, "", "no secret until one is configured");
+        assert_eq!((smb.cache_ahead, smb.cache_behind), (3, 3));
+
+        // No section → guest, not an error.
+        assert!(Config::default().smb.is_none());
+    }
+
+    /// Plan 10, step 4: `AMPWIRE_SMB_PASSWORD` > `password_file` (trimmed,
+    /// relative to the config dir) > `password`.
+    #[test]
+    fn smb_password_precedence_is_env_then_file_then_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(dir.path().join("smb.pass"), "  filesecret \n").unwrap();
+        fs::write(
+            &path,
+            "[smb]\nusername = \"luis\"\npassword = \"literal\"\npassword_file = \"smb.pass\"\n",
+        )
+        .unwrap();
+
+        // File beats the literal (and is trimmed).
+        let mut config = Config::load_from(&path).config;
+        assert_eq!(config.smb.as_ref().expect("section").password, "filesecret");
+
+        // Env beats the file.
+        apply_env_smb_password(&mut config, Some("envsecret".into()));
+        assert_eq!(config.smb.as_ref().expect("section").password, "envsecret");
+
+        // A blank env value changes nothing…
+        apply_env_smb_password(&mut config, Some("   ".into()));
+        assert_eq!(config.smb.as_ref().expect("section").password, "envsecret");
+        // …and without a section the variable configures nobody.
+        let mut plain = Config::default();
+        apply_env_smb_password(&mut plain, Some("envsecret".into()));
+        assert!(plain.smb.is_none());
+
+        // A missing `password_file` is a notice, never the file's contents
+        // and never a crash: the literal password survives.
+        fs::write(
+            &path,
+            "[smb]\nusername = \"luis\"\npassword = \"literal\"\npassword_file = \"missing.pass\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(
+            loaded.notice.as_deref(),
+            Some("smb: cannot read password_file")
+        );
+        assert_eq!(
+            loaded.config.smb.expect("section").password,
+            "literal",
+            "an unreadable file leaves the configured password alone"
+        );
+    }
+
+    /// Plan 10, step 4: `Debug` never carries the secret — neither does the
+    /// parse-error notice, which never quotes the source line.
+    #[test]
+    fn smb_secrets_never_reach_debug_or_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[smb]\nusername = \"luis\"\npassword = \"hunter2\"\n",
+        )
+        .unwrap();
+        let config = Config::load_from(&path).config;
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("hunter2"), "leaked: {printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        let smb = config.smb.expect("parsed");
+        assert!(!format!("{smb:?}").contains("hunter2"), "leaked");
+        assert!(format!("{smb:?}").contains("<redacted>"));
+
+        // A password on the broken line: the notice says where, never what.
+        fs::write(&path, "[smb]\nusername = \"luis\"\npassword = \"hunter2\n").unwrap();
+        let loaded = Config::load_from(&path);
+        assert!(loaded.read_only);
+        let notice = loaded.notice.expect("a notice");
+        assert!(!notice.contains("hunter2"), "leaked: {notice}");
+        assert!(
+            notice.starts_with("config invalid — not saving"),
+            "{notice}"
+        );
+        assert!(notice.contains("line 3"), "says where: {notice}");
+    }
+
+    /// Plan 10, step 4: `Config::save` never touches `[smb]` — the secret
+    /// lives only in the user's own file, comments and all.
+    #[test]
+    fn save_leaves_the_smb_section_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# my NAS note\n[smb]\nusername = \"luis\" # who\npassword = \"hunter2\"\nmode = \"stream\"\ncache_ahead = 5\n";
+        fs::write(&path, original).unwrap();
+
+        let mut config = Config::load_from(&path).config;
+        config.audio.volume = 55; // a change worth saving
+        config.save(&path).expect("saves");
+
+        let saved = fs::read_to_string(&path).expect("readable");
+        assert!(
+            saved.contains("# my NAS note"),
+            "comments survive:\n{saved}"
+        );
+        assert!(saved.contains("password = \"hunter2\""), "{saved}");
+        assert!(saved.contains("mode = \"stream\""), "{saved}");
+        assert!(saved.contains("cache_ahead = 5"), "{saved}");
+        assert!(saved.contains("volume = 55"), "the change landed: {saved}");
+
+        // Reloading gives the same section back.
+        let reloaded = Config::load_from(&path).config.smb.expect("section");
+        assert_eq!(reloaded.username, "luis");
+        assert_eq!(reloaded.password, "hunter2");
+        assert_eq!(reloaded.mode, SmbMode::Stream);
+        assert_eq!(reloaded.cache_ahead, 5);
     }
 }
