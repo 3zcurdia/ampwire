@@ -11,6 +11,7 @@
 //! engine thread — never on the UI thread, and never inside the audio
 //! callback (plans-README rules 5 and 6).
 
+pub mod cache;
 pub mod scan;
 pub mod source;
 
@@ -131,6 +132,16 @@ impl SmbUrl {
         } else {
             format!("smb://{server}/{}/{}", self.share, self.path)
         }
+    }
+    /// The `\\server\share\path` the `smb` crate opens — share root when
+    /// `path` is empty (the URL rule guarantees a share is always there).
+    pub(crate) fn unc(&self) -> Result<UncPath, smb::Error> {
+        let unc = UncPath::new(&self.server)?.with_share(&self.share)?;
+        Ok(if self.path.is_empty() {
+            unc
+        } else {
+            unc.with_path(&self.path)
+        })
     }
 }
 
@@ -296,6 +307,24 @@ impl SmbClientCfg {
             }
         }
         candidates
+    }
+
+    /// The login for `url`: its server (the URL rule makes it mandatory),
+    /// the account/secret/domain from a `[smb]` section — resolved by
+    /// `Config::load` as `AMPWIRE_SMB_PASSWORD` > `password_file` >
+    /// `password` — and guest when there is no section at all (plan 10,
+    /// step 4). The URL's server always wins over any configured default.
+    pub fn for_url(url: &SmbUrl, config: Option<&crate::config::SmbConfig>) -> Self {
+        let mut cfg = match config {
+            Some(config) => Self::new(
+                url.server.clone(),
+                config.username.clone(),
+                config.password.clone(),
+            ),
+            None => Self::new(url.server.clone(), "", ""),
+        };
+        cfg.domain = config.and_then(|config| config.domain.clone());
+        cfg
     }
 
     /// `DOMAIN\user` when a domain is configured, else the bare user name

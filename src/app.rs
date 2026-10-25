@@ -368,9 +368,12 @@ impl App {
             Self::with_config_path(config, keymap, theme, false, crate::config::config_path());
         // The real session starts empty and plays for real: this backend owns
         // the engine thread (dropped → Shutdown + join, so `q` exits fast).
-        // `[jellyfin]` decides whether a rolling cache directory exists.
+        // `[jellyfin]` decides whether a rolling cache directory exists;
+        // `[smb]` is the same switch for the SMB window (and is cloned into
+        // the player, which creates that window on the first SMB track).
         let jellyfin = app.config.jellyfin.clone();
-        app.player = Backend::Real(Box::new(RealPlayer::new(jellyfin.as_ref())));
+        let smb = app.config.smb.clone();
+        app.player = Backend::Real(Box::new(RealPlayer::new(jellyfin.as_ref(), smb.as_ref())));
         // Restore the remembered audio settings before anything plays.
         let audio = app.config.audio;
         app.player.handle(PlayerCommand::SetVolume(audio.volume));
@@ -839,21 +842,10 @@ impl App {
         self.scan_loaded = false;
     }
 
-    /// How to log in for `url`: the URL's own server (the URL rule makes it
-    /// mandatory), the account/secret/domain from `[smb]` — resolved by
-    /// `Config::load` as `AMPWIRE_SMB_PASSWORD` > `password_file` >
-    /// `password`. No section at all → guest (plan 10, step 4).
+    /// How to log in for `url` (plan 10, step 4): its server plus the
+    /// `[smb]` account/secret/domain, guest when there is no section.
     fn smb_client_cfg(&self, url: &crate::smb::SmbUrl) -> crate::smb::SmbClientCfg {
-        let mut cfg = match &self.config.smb {
-            Some(smb) => crate::smb::SmbClientCfg::new(
-                url.server.clone(),
-                smb.username.clone(),
-                smb.password.clone(),
-            ),
-            None => crate::smb::SmbClientCfg::new(url.server.clone(), "", ""),
-        };
-        cfg.domain = self.config.smb.as_ref().and_then(|smb| smb.domain.clone());
-        cfg
+        crate::smb::SmbClientCfg::for_url(url, self.config.smb.as_ref())
     }
 
     /// [`load_inputs`][Self::load_inputs] for local paths only — the plan

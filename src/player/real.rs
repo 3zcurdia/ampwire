@@ -22,9 +22,16 @@ use crate::audio::{
     PlaybackHandle, QueueSource, SharedParams, StreamInfo, StreamSetup, balance_to_gains,
     volume_to_gain,
 };
-use crate::config::{JellyfinConfig, JellyfinMode};
-use crate::jellyfin::cache::{Cache, CacheEvent, STALE_AGE, compute_window, sweep_stale_dirs};
+use crate::config::{JellyfinConfig, JellyfinMode, SmbConfig, SmbMode};
+use crate::jellyfin::cache::{
+    Cache, CacheEvent, DIR_PREFIX as JELLYFIN_DIR_PREFIX, STALE_AGE, compute_window,
+    sweep_stale_dirs,
+};
 use crate::jellyfin::{Client, ItemId};
+use crate::smb::SmbUrl;
+use crate::smb::cache::{
+    DIR_PREFIX as SMB_DIR_PREFIX, SmbCache, SmbCacheEvent, compute_smb_window,
+};
 
 use super::order::PlayOrder;
 use super::playlist::Playlist;
@@ -107,6 +114,16 @@ pub struct RealPlayer {
     /// A remote track is waiting for its file to finish downloading (cache
     /// mode). Cleared as soon as the download resolves or the user moves on.
     pending_remote: Option<ItemId>,
+    /// `[smb]` for this session (plan 10, step 5): credentials, mode and
+    /// window size. `None` → guest credentials, `cache` mode, 3/3 — the
+    /// plan's defaults, so a guest-only share needs no config at all.
+    smb: Option<SmbConfig>,
+    /// The rolling SMB window (`mode = "cache"`), created on the *first*
+    /// SMB track: a session that never touches SMB never opens a directory.
+    smb_cache: Option<SmbCache>,
+    /// An SMB track is waiting for its file to finish downloading (cache
+    /// mode) — the mirror of `pending_remote`.
+    pending_smb: Option<SmbUrl>,
     /// `stream pure: eq bypassed` was already shown this session (plan 08:
     /// notice once, not on every track change).
     jf_pure_notice_shown: bool,
@@ -118,18 +135,27 @@ impl RealPlayer {
     /// engine's callback — one instance, written by this thread, read by the
     /// audio thread.
     ///
-    /// `jellyfin` is the session's `[jellyfin]` config: crash leftovers
-    /// (`ampwire-jellyfin-<pid>` older than 24 h) are swept at startup in
-    /// every mode; `cache` mode also creates the temp-dir window, and the
-    /// stream modes create a directory only if a server forces the no-`Range`
-    /// fallback.
-    pub fn new(jellyfin: Option<&JellyfinConfig>) -> Self {
+    /// `jellyfin` is the session's `[jellyfin]` config and `smb` its
+    /// `[smb]` config: crash leftovers (`ampwire-jellyfin-<pid>` and
+    /// `ampwire-smb-<pid>`, older than 24 h) are swept at startup in every
+    /// mode; the Jellyfin `cache` mode also creates its temp-dir window
+    /// eagerly (the stream modes create one only if a server forces the
+    /// no-`Range` fallback), while the SMB window is created on the first
+    /// SMB track.
+    pub fn new(jellyfin: Option<&JellyfinConfig>, smb: Option<&SmbConfig>) -> Self {
         let params = Arc::new(SharedParams::new());
         let config = jellyfin.filter(|config| config.is_complete());
         if let Some(config) = config {
             let parent = config.cache_dir.clone().unwrap_or_else(std::env::temp_dir);
-            sweep_stale_dirs(&parent, STALE_AGE);
+            sweep_stale_dirs(&parent, STALE_AGE, JELLYFIN_DIR_PREFIX);
         }
+        // Plan 10, step 4/5: same rule for the SMB window's directory, in
+        // every mode — `cache_dir` (or the system temp dir) is where it
+        // would have been created.
+        let smb_parent = smb
+            .and_then(|config| config.cache_dir.clone())
+            .unwrap_or_else(std::env::temp_dir);
+        sweep_stale_dirs(&smb_parent, crate::smb::cache::STALE_AGE, SMB_DIR_PREFIX);
         // The engine holds the client for `stream*` modes (it builds the
         // HTTP source itself, so credentials never reach a `Track`) and
         // doubles its ring buffer when streaming (plan 08, step 6).
@@ -156,6 +182,7 @@ impl RealPlayer {
                 }
             }
         }
+        player.smb = smb.cloned();
         player
     }
 
@@ -195,6 +222,9 @@ impl RealPlayer {
             jf_behind: 3,
             cache: None,
             pending_remote: None,
+            smb: None,
+            smb_cache: None,
+            pending_smb: None,
             jf_pure_notice_shown: false,
         }
     }
@@ -544,6 +574,7 @@ impl RealPlayer {
         }
         self.check_boundary();
         self.poll_cache();
+        self.poll_smb_cache();
         self.update_spectrum();
     }
 
@@ -744,6 +775,7 @@ impl RealPlayer {
         self.handle = None;
         self.pending_start = Some(start);
         self.pending_remote = None;
+        self.pending_smb = None;
         // `stream_pure` (plan §6): while a *Jellyfin* remote track plays,
         // the EQ is bypassed on the audio side; the very next load restores
         // it. SMB tracks are remote too, but never bypassed (plan 10).
@@ -823,20 +855,76 @@ impl RealPlayer {
         }
     }
 
-    /// Start an SMB track (plan 10, steps 5–6): cache mode plays the local
-    /// file once the rolling window has downloaded it (else `buffering…`
-    /// and wait), stream mode hands the engine an `LoadSmb` command. Until
-    /// both land this stops with a fixed notice instead of pretending to
-    /// play — same shape as `start_remote` with no cache dir.
-    fn start_smb(
-        &mut self,
-        url: &crate::smb::SmbUrl,
-        _start: Duration,
-        _keep_paused: bool,
-    ) -> bool {
-        self.stop_playback();
-        self.notice = Some(format!("smb: {}", url.canonical()));
-        false
+    /// Start an SMB track (plan 10, step 5): cache mode plays the local file
+    /// once the rolling window has downloaded it (else `buffering…`, keep
+    /// `state = Playing` and remember the URL until its [`SmbCacheEvent`]
+    /// arrives) — exactly the shape of `start_remote`. Stream mode hands the
+    /// engine an `EngineCmd::LoadSmb` (step 6). Returns true when a `Load`
+    /// went to the engine, so the caller still re-asserts the pause state
+    /// around it.
+    fn start_smb(&mut self, url: &SmbUrl, start: Duration, keep_paused: bool) -> bool {
+        match self.smb_mode() {
+            SmbMode::Cache => {
+                // Created here rather than in `new()`: a session that never
+                // touches SMB never opens a cache directory — and a
+                // guest-only share needs no `[smb]` section to have one.
+                if self.smb_cache.is_none() {
+                    let parent = self
+                        .smb
+                        .as_ref()
+                        .and_then(|config| config.cache_dir.clone());
+                    let cfg = crate::smb::SmbClientCfg::for_url(url, self.smb.as_ref());
+                    match SmbCache::new(cfg, parent) {
+                        Ok(cache) => self.smb_cache = Some(cache),
+                        Err(_) => {
+                            // No window to download into: stop with the
+                            // reason instead of skipping through every SMB
+                            // track in the list (the plan's cache rule).
+                            self.stop_playback();
+                            self.notice = Some("smb: cache unavailable".into());
+                            return false;
+                        }
+                    }
+                }
+                let ready = self
+                    .smb_cache
+                    .as_ref()
+                    .and_then(|cache| cache.path_if_ready(url));
+                if let Some(path) = ready {
+                    // A local file under our own name: seek, EQ and the
+                    // spectrum tap all work unchanged.
+                    self.engine.send(EngineCmd::Load { path, start });
+                    return true;
+                }
+                self.notice = Some("buffering…".into());
+                self.pending_smb = Some(url.clone());
+                let _ = keep_paused; // the state was already set by load_track
+                false
+            }
+            // Plan 10, step 6 wires `EngineCmd::LoadSmb` here; until then
+            // stop with a fixed notice instead of pretending to play.
+            SmbMode::Stream => {
+                self.stop_playback();
+                self.notice = Some("smb: stream mode is not wired up yet".into());
+                false
+            }
+        }
+    }
+
+    /// The session's SMB mode: `cache` when there is no `[smb]` section
+    /// (the plan's default).
+    fn smb_mode(&self) -> SmbMode {
+        self.smb
+            .as_ref()
+            .map_or(SmbMode::Cache, |config| config.mode)
+    }
+
+    /// The rolling window's size (plan 10: `[smb] cache_ahead/behind`,
+    /// defaulting to the plan's 3/3).
+    fn smb_window(&self) -> (usize, usize) {
+        self.smb
+            .as_ref()
+            .map_or((3, 3), |config| (config.cache_ahead, config.cache_behind))
     }
 
     /// Keep the engine's gapless queue in step with the play order (plan
@@ -906,6 +994,10 @@ impl RealPlayer {
     /// what "a library page batch finished" becomes, since each page lands
     /// as an `AppendInOrder` mutation.
     fn update_cache_window(&self) {
+        // Plan 10, step 5: the SMB rolling window moves on exactly the same
+        // events (track change, playlist edit, order toggle) as the
+        // Jellyfin one — one call site, two windows.
+        self.update_smb_window();
         if self.cache.is_none() {
             return;
         }
@@ -919,6 +1011,25 @@ impl RealPlayer {
         if let Some(cache) = &self.cache {
             cache.set_window(wanted);
         }
+    }
+
+    /// Push the current rolling window to the SMB downloader: the current
+    /// SMB track → the next `cache_ahead` → the previous `cache_behind`, in
+    /// *play* order (so shuffle is respected). A no-op until the first SMB
+    /// track creates the window.
+    fn update_smb_window(&self) {
+        let Some(cache) = &self.smb_cache else {
+            return;
+        };
+        let (ahead, behind) = self.smb_window();
+        let wanted = compute_smb_window(
+            &self.order,
+            self.playlist.tracks(),
+            self.playlist.current(),
+            ahead,
+            behind,
+        );
+        cache.set_window(wanted);
     }
 
     /// Drain downloader events (plan §5): the `Ready` of the track we are
@@ -965,6 +1076,50 @@ impl RealPlayer {
         }
     }
 
+    /// Drain the SMB downloader's events (plan 10, step 5): the `Ready` of
+    /// the track we are waiting on becomes the engine `Load`, a `Failed`
+    /// takes the plan-03 error/skip path, and anything else is a prefetch
+    /// result the cache already recorded — ignored here.
+    fn poll_smb_cache(&mut self) {
+        let events = match self.smb_cache.as_mut() {
+            Some(cache) => cache.poll(),
+            None => return,
+        };
+        for event in events {
+            self.handle_smb_cache_event(event);
+        }
+    }
+
+    /// Apply one SMB downloader event (split out of `poll_smb_cache` so the
+    /// state machine is testable without a server).
+    fn handle_smb_cache_event(&mut self, event: SmbCacheEvent) {
+        match event {
+            SmbCacheEvent::Ready { url, path } => {
+                if self.pending_smb.as_ref() != Some(&url) {
+                    return; // stale: the user already moved on
+                }
+                let start = self.pending_start.unwrap_or(Duration::ZERO);
+                let keep_paused = self.state == PlayState::Paused;
+                self.pending_smb = None;
+                self.engine.send(EngineCmd::Load { path, start });
+                if keep_paused {
+                    self.engine.send(EngineCmd::Pause);
+                } else {
+                    self.engine.send(EngineCmd::Resume);
+                }
+            }
+            SmbCacheEvent::Failed { url, error } => {
+                if self.pending_smb.as_ref() != Some(&url) {
+                    return;
+                }
+                self.pending_smb = None;
+                // Plan-03 path: "skipped …: reason", or give up when the
+                // failures span the playlist.
+                self.on_error(PlayError::Failed(error));
+            }
+        }
+    }
+
     /// Halt playback but keep the current track selected (Stop semantics).
     fn stop_playback(&mut self) {
         // Plan 09: drop the queued next track first — the engine's `Stop`
@@ -980,6 +1135,7 @@ impl RealPlayer {
         // Nothing is playing, so nothing waits for a download either: a
         // late `Ready` for it must be ignored, not loaded.
         self.pending_remote = None;
+        self.pending_smb = None;
     }
 
     /// Smooth the analyzer's band levels into the bars (plan §step 6):
@@ -1045,7 +1201,7 @@ impl RealPlayer {
 
 impl Default for RealPlayer {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, None)
     }
 }
 
@@ -2287,7 +2443,7 @@ mod tests {
             cache_dir: Some(parent.path().to_path_buf()),
             notice: None,
         };
-        let player = RealPlayer::new(Some(&config)); // no device until a Load
+        let player = RealPlayer::new(Some(&config), None); // no device until a Load
         assert!(!stale.exists(), "stale leftover swept in stream mode");
         assert!(player.cache.is_none(), "still no cache dir in stream mode");
     }
@@ -2478,6 +2634,250 @@ mod tests {
         assert!(
             load_paths(&cmds).is_empty(),
             "a stale Ready must never start playback"
+        );
+    }
+
+    // --- SMB cache mode: buffering, ready and failure (plan 10, step 5) ---
+
+    /// An SMB row. The server is always loopback here, so the background
+    /// downloader's own connect fails instantly instead of holding
+    /// `SmbCache::drop` on a DNS lookup.
+    fn smb_url(path: &str) -> SmbUrl {
+        SmbUrl {
+            server: "127.0.0.1".into(),
+            share: "Music".into(),
+            path: path.into(),
+        }
+    }
+
+    fn smb_row(url: SmbUrl) -> Track {
+        let title = url.path.clone();
+        Track {
+            id: Track::next_id(),
+            source: TrackSource::Smb { url },
+            artist: Some("A".into()),
+            title: Some(format!("S {title}")),
+            duration: None,
+            bitrate_kbps: None,
+        }
+    }
+
+    /// `(player, …)` with a real (idle) SMB window directory under `dir`.
+    fn smb_cached_player(dir: &tempfile::TempDir) -> Harness {
+        let (mut player, cmds, events, params) = fake_player();
+        player.smb_cache = Some(
+            SmbCache::new(
+                crate::smb::SmbClientCfg::new("127.0.0.1", "", ""),
+                Some(dir.path().to_path_buf()),
+            )
+            .expect("smb cache dir"),
+        );
+        (player, cmds, events, params)
+    }
+
+    #[test]
+    fn a_ready_smb_file_plays_and_seeks_like_a_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = smb_cached_player(&dir);
+        let url = smb_url("album/song.flac");
+        let path = dir.path().join("cached.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player
+            .smb_cache
+            .as_mut()
+            .expect("window")
+            .insert_ready(&url, path.clone());
+
+        player.handle(PlayerCommand::AddTracks(vec![smb_row(url)]));
+        player.handle(PlayerCommand::Play);
+        assert_eq!(
+            load_paths(&cmds),
+            std::slice::from_ref(&path),
+            "a cache hit is a plain local Load"
+        );
+        assert_eq!(player.state, PlayState::Playing);
+        assert_eq!(
+            player.take_notice(),
+            None,
+            "ready at once: no buffering notice"
+        );
+
+        // Seeking is a normal local-file seek from here on.
+        player.handle(PlayerCommand::SeekBy(5));
+        assert_eq!(
+            loads_of(&cmds).last(),
+            Some(&(path, Duration::from_secs(5)))
+        );
+    }
+
+    #[test]
+    fn an_smb_track_buffers_until_the_window_reports_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = smb_cached_player(&dir);
+        let url = smb_url("album/song.flac");
+        let row = smb_row(url.clone());
+        player.handle(PlayerCommand::AddTracks(vec![row]));
+        player.handle(PlayerCommand::AddTracks(tracks(1)));
+
+        player.handle(PlayerCommand::PlayTrack(0));
+        assert_eq!(player.state, PlayState::Playing, "playing while buffering");
+        assert_eq!(
+            player.take_notice().as_deref(),
+            Some("buffering…"),
+            "the user sees why there is no sound yet"
+        );
+        assert_eq!(player.pending_smb.as_ref(), Some(&url));
+        assert!(load_paths(&cmds).is_empty(), "nothing sent to the engine");
+        assert!(
+            player.smb_cache.is_some(),
+            "the first SMB track created the window"
+        );
+
+        // Paused while buffering: the Ready load re-asserts the pause.
+        player.handle(PlayerCommand::Pause);
+        assert_eq!(player.state, PlayState::Paused);
+
+        // The downloader finishes the file.
+        let path = dir.path().join("cached.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player.handle_smb_cache_event(SmbCacheEvent::Ready {
+            url: url.clone(),
+            path: path.clone(),
+        });
+        assert_eq!(load_paths(&cmds), [path], "Load once the file exists");
+        assert!(
+            matches!(log_of(&cmds).last(), Some(EngineCmd::Pause)),
+            "the pause survives the deferred load: {:?}",
+            log_of(&cmds)
+        );
+        assert_eq!(player.pending_smb, None, "no longer waiting");
+        assert_eq!(player.state, PlayState::Paused);
+    }
+
+    #[test]
+    fn an_smb_ready_for_another_url_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = smb_cached_player(&dir);
+        let url = smb_url("album/song.flac");
+        player.handle(PlayerCommand::AddTracks(vec![smb_row(url.clone())]));
+        player.handle(PlayerCommand::Play);
+        assert_eq!(player.pending_smb.as_ref(), Some(&url));
+
+        let other = smb_url("album/other.flac");
+        let path = dir.path().join("zzz.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player.handle_smb_cache_event(SmbCacheEvent::Ready { url: other, path });
+        assert!(
+            load_paths(&cmds).is_empty(),
+            "a prefetch finishing must not interrupt the buffering track"
+        );
+        assert_eq!(player.pending_smb.as_ref(), Some(&url));
+    }
+
+    #[test]
+    fn an_smb_failed_download_takes_the_skip_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = smb_cached_player(&dir);
+        let url = smb_url("album/song.flac");
+        let row = smb_row(url.clone());
+        let expected = format!("skipped {}: smb: cannot connect", row.display_name());
+        player.handle(PlayerCommand::AddTracks(vec![row]));
+        player.handle(PlayerCommand::AddTracks(tracks(2)));
+        player.handle(PlayerCommand::Play);
+        assert_eq!(player.pending_smb.as_ref(), Some(&url));
+
+        player.handle_smb_cache_event(SmbCacheEvent::Failed {
+            url: url.clone(),
+            error: "smb: cannot connect".into(),
+        });
+        assert_eq!(
+            player.take_notice().as_deref(),
+            Some(expected.as_str()),
+            "plan-03 error path with the reason kept"
+        );
+        assert_eq!(load_paths(&cmds).last(), Some(&PathBuf::from("/m/0.flac")));
+        assert_eq!(player.state, PlayState::Playing, "moved on to the next");
+        assert_eq!(player.pending_smb, None);
+
+        // A late `Ready` for the abandoned item changes nothing.
+        player.handle_smb_cache_event(SmbCacheEvent::Ready {
+            url,
+            path: dir.path().join("cached.flac"),
+        });
+        assert_eq!(
+            load_paths(&cmds).len(),
+            1,
+            "only the skip's load: the stale Ready adds nothing"
+        );
+    }
+
+    #[test]
+    fn stop_while_smb_buffering_makes_a_late_ready_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = smb_cached_player(&dir);
+        let url = smb_url("album/song.flac");
+        player.handle(PlayerCommand::AddTracks(vec![smb_row(url.clone())]));
+        player.handle(PlayerCommand::Play);
+        assert_eq!(player.pending_smb.as_ref(), Some(&url));
+
+        player.handle(PlayerCommand::Stop);
+        assert_eq!(player.state, PlayState::Stopped);
+        assert_eq!(player.pending_smb, None, "nothing waits after Stop");
+
+        let path = dir.path().join("cached.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player.handle_smb_cache_event(SmbCacheEvent::Ready { url, path });
+        assert!(
+            load_paths(&cmds).is_empty(),
+            "a stale Ready must never start playback"
+        );
+    }
+
+    /// Every mutation that refreshes a cache window refreshes *both* of
+    /// them (plan 10, step 5): the SMB window is re-projected from the
+    /// playlist each time, so URLs that left it drop out of the bookkeeping.
+    #[test]
+    fn every_playlist_mutation_refreshes_the_smb_window_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, ..) = fake_player();
+        player.smb_cache = Some(
+            SmbCache::new(
+                crate::smb::SmbClientCfg::new("127.0.0.1", "", ""),
+                Some(dir.path().to_path_buf()),
+            )
+            .expect("window"),
+        );
+        let url = smb_url("album/song.flac");
+        let path = dir.path().join("cached.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player
+            .smb_cache
+            .as_mut()
+            .expect("window")
+            .insert_ready(&url, path.clone());
+        assert_eq!(
+            player
+                .smb_cache
+                .as_ref()
+                .expect("window")
+                .path_if_ready(&url),
+            Some(path),
+            "ready before any mutation"
+        );
+
+        // Any mutation re-projects the window from the playlist. This one
+        // has no SMB row at all, so the URL leaves the window and the
+        // bookkeeping goes with it — the same pruning the Jellyfin window
+        // does, driven by the same call site.
+        player.handle(PlayerCommand::AddTracks(tracks(1)));
+        assert_eq!(
+            player
+                .smb_cache
+                .as_ref()
+                .expect("window")
+                .path_if_ready(&url),
+            None,
+            "the window dropped a URL that is no longer wanted"
         );
     }
 

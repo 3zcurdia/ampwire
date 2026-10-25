@@ -112,6 +112,12 @@ impl SmbFileSource {
             .map_err(|error| OpenError::from_crate(&error))?;
         Ok(SmbFileSource { file, len, pos: 0 })
     }
+
+    /// The file's length in bytes (known at open — the cache refuses
+    /// over-cap files before writing a single byte, plan 10, step 5).
+    pub fn len(&self) -> u64 {
+        self.len
+    }
 }
 
 /// Where a `Seek` lands: relative to the file's length for `End`, to the

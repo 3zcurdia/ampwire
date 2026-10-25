@@ -20,7 +20,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::jellyfin::cache::create_own_dir;
+use crate::jellyfin::cache::{DIR_PREFIX as JELLYFIN_DIR_PREFIX, create_own_dir};
 use crate::jellyfin::http_source::{HttpRangeSource, OpenError, download_fallback};
 use crate::jellyfin::{Client, ItemId};
 
@@ -809,7 +809,7 @@ fn open_remote(
                         .fallback_parent
                         .clone()
                         .unwrap_or_else(std::env::temp_dir);
-                    let dir = create_own_dir(&parent)
+                    let dir = create_own_dir(&parent, JELLYFIN_DIR_PREFIX)
                         .map_err(|_| "jellyfin: cache unavailable".to_string())?;
                     fallback_dir.insert(dir).clone()
                 }

@@ -31,9 +31,12 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const CHUNK: usize = 256 * 1024;
 /// Directories left behind by a crash are swept after this long.
 pub const STALE_AGE: Duration = Duration::from_secs(24 * 3600);
-/// Directory-name prefix this app creates — the *only* thing the sweep and
-/// the eviction will ever touch by name.
-const DIR_PREFIX: &str = "ampwire-jellyfin-";
+/// Directory-name prefix this app creates for the Jellyfin window — the
+/// *only* thing the sweep and the eviction will ever touch by name. The
+/// SMB window (plan 10, step 5) reuses [`create_own_dir`] /
+/// [`sweep_stale_dirs`] with its own [`crate::smb::cache::DIR_PREFIX`], so
+/// the security-sensitive bits exist once.
+pub const DIR_PREFIX: &str = "ampwire-jellyfin-";
 
 /// One remote track the cache should hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +114,7 @@ impl Cache {
         max_bytes: u64,
     ) -> std::io::Result<Cache> {
         let parent = dir_parent.unwrap_or_else(std::env::temp_dir);
-        let dir = create_own_dir(&parent)?;
+        let dir = create_own_dir(&parent, DIR_PREFIX)?;
 
         let (cmd_tx, cmd_rx) = channel();
         let (ev_tx, ev_rx) = channel();
@@ -200,7 +203,7 @@ impl Drop for Cache {
 /// (crash leftovers). Anything not matching our exact name pattern — other
 /// processes' live caches, unrelated dirs — is left alone. Returns how many
 /// were removed.
-pub fn sweep_stale_dirs(parent: &Path, max_age: Duration) -> usize {
+pub fn sweep_stale_dirs(parent: &Path, max_age: Duration, prefix: &str) -> usize {
     let Ok(entries) = fs::read_dir(parent) else {
         return 0;
     };
@@ -208,7 +211,7 @@ pub fn sweep_stale_dirs(parent: &Path, max_age: Duration) -> usize {
     let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if !is_our_dir_name(&name) || !entry.path().is_dir() {
+        if !is_our_dir_name(&name, prefix) || !entry.path().is_dir() {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -234,9 +237,9 @@ pub fn sweep_stale_dirs(parent: &Path, max_age: Duration) -> usize {
 /// again by us. If that removal is refused (someone else's entry in a
 /// sticky `/tmp`), creation fails and the caller reports the cache as
 /// unavailable instead of writing into a directory it does not own.
-pub(crate) fn create_own_dir(parent: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn create_own_dir(parent: &Path, prefix: &str) -> std::io::Result<PathBuf> {
     fs::create_dir_all(parent)?;
-    let dir = parent.join(format!("{DIR_PREFIX}{}", std::process::id()));
+    let dir = parent.join(format!("{prefix}{}", std::process::id()));
     match make_private_dir(&dir) {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             if fs::symlink_metadata(&dir)?.is_dir() {
@@ -277,9 +280,11 @@ pub(crate) fn create_fresh_file(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-/// `ampwire-jellyfin-<pid>` and nothing else.
-fn is_our_dir_name(name: &std::ffi::OsStr) -> bool {
-    let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(DIR_PREFIX)) else {
+/// `<prefix><pid>` and nothing else: a name that does not start with the
+/// exact prefix (or that ends in something other than digits) is never
+/// touched.
+fn is_our_dir_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(prefix)) else {
         return false;
     };
     !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
@@ -554,8 +559,9 @@ fn ext_for(item: &RemoteRef) -> String {
 }
 
 /// `512 MiB` / `14 KiB` / `900 B` — human caps for the cache-limit notices
-/// (the injected test cap is 1 KiB, so MiB alone would round to zero).
-fn size_label(bytes: u64) -> String {
+/// (the injected test cap is 1 KiB, so MiB alone would round to zero). Also
+/// used by the SMB window (plan 10, step 5).
+pub(crate) fn size_label(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{} MiB", bytes / (1024 * 1024))
     } else if bytes >= 1024 {
@@ -745,7 +751,7 @@ mod tests {
         age_dir(&stale, Duration::from_secs(25 * 3600)); // > 24 h
         age_dir(&not_a_pid, Duration::from_secs(25 * 3600)); // wrong pattern
 
-        let removed = sweep_stale_dirs(parent.path(), STALE_AGE);
+        let removed = sweep_stale_dirs(parent.path(), STALE_AGE, DIR_PREFIX);
         assert_eq!(removed, 1, "exactly the stale crash leftover");
         assert!(!stale.exists(), "crash leftover swept");
         assert!(fresh.exists(), "a live cache is never touched");
