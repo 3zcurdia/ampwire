@@ -11,6 +11,7 @@
 //! engine thread — never on the UI thread, and never inside the audio
 //! callback (plans-README rules 5 and 6).
 
+pub mod scan;
 pub mod source;
 
 use std::fmt;
@@ -232,7 +233,21 @@ impl SmbClientCfg {
     /// for callers that log the reason themselves. Never shown to the user.
     pub(crate) fn connect_raw(&self, share: &str) -> smb::Result<Client> {
         let unc = UncPath::new(&self.server)?.with_share(share)?;
-        let login = self.login_name();
+        let mut last = None;
+        for login in self.login_candidates() {
+            match self.try_connect(&unc, &login) {
+                Ok(client) => return Ok(client),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.expect("at least one login candidate"))
+    }
+
+    /// One login attempt: the URL's share, one spelling of the user, and
+    /// the guest allowance that only applies to guest/anonymous logins.
+    /// Plan 10: DFS referrals are out of scope — a DFS path must surface
+    /// as an error instead of being resolved behind our back.
+    fn try_connect(&self, unc: &UncPath, login: &str) -> smb::Result<Client> {
         // A Samba share that maps anonymous logins onto a guest account
         // answers the session setup *unsigned* (`server signing = auto`),
         // which the client rejects unless it is told to accept that. Only
@@ -245,16 +260,42 @@ impl SmbClientCfg {
             allow_unsigned_guest_access: allow_guest,
             ..Default::default()
         };
-        // Plan 10: DFS referrals are out of scope — a DFS path must surface
-        // as an error instead of being resolved behind our back.
-        let config = ClientConfig {
+        let client = Client::new(ClientConfig {
             dfs: false,
             connection,
             ..Default::default()
-        };
-        let client = Client::new(config);
-        client.share_connect(&unc, &login, self.password.clone())?;
+        });
+        client.share_connect(unc, login, self.password.clone())?;
         Ok(client)
+    }
+
+    /// Guest/anonymous logins are spelled differently across servers —
+    /// Samba's own test suite uses `/GUEST`, and plain `guest` is refused
+    /// by some builds — so an *unauthenticated* login is retried in order.
+    /// A configured account is tried once, alone: a wrong password must
+    /// never be re-sent under four other names.
+    fn login_candidates(&self) -> Vec<String> {
+        let primary = self.login_name();
+        let guestly = primary.is_empty()
+            || primary
+                .trim_start_matches('/')
+                .eq_ignore_ascii_case("guest");
+        if !guestly {
+            return vec![primary];
+        }
+        let mut candidates: Vec<String> = Vec::new();
+        for candidate in [
+            primary,
+            "/GUEST".to_string(),
+            "guest".to_string(),
+            "GUEST".to_string(),
+            String::new(),
+        ] {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        candidates
     }
 
     /// `DOMAIN\user` when a domain is configured, else the bare user name

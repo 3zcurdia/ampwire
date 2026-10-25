@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use walkdir::WalkDir;
 
@@ -22,56 +23,75 @@ pub fn is_audio(path: &Path) -> bool {
 /// macOS AppleDouble sidecars (`._name.flac`): metadata stubs that inherit
 /// the real file's extension but are never playable audio. Other hidden
 /// files still load (plan 02's "hidden files are included" stands).
-fn is_apple_double(path: &Path) -> bool {
+pub fn is_apple_double(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with("._"))
+}
+
+/// The tag fields every source fills the same way (a local file, plan 02;
+/// an `smb://` file, plan 10): artist, title, duration, and the lossy-line
+/// bitrate — the tagged one, else an estimate from size and duration.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TagFields {
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub duration: Option<Duration>,
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// Apply [`read_track`]'s mapping to any file lofty could parse: tags first,
+/// a zero duration counts as unknown, and `bytes` (when known) is what the
+/// bitrate estimate falls back to.
+pub fn tag_fields(tagged: &lofty::file::TaggedFile, bytes: Option<u64>) -> TagFields {
+    use lofty::prelude::*;
+
+    let mut fields = TagFields::default();
+
+    if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        fields.artist = clean(tag.artist().as_deref());
+        fields.title = clean(tag.title().as_deref());
+    }
+
+    let duration = tagged.properties().duration();
+    if !duration.is_zero() {
+        fields.duration = Some(duration);
+    }
+    fields.bitrate_kbps = tagged
+        .properties()
+        .audio_bitrate()
+        .filter(|b| *b > 0)
+        .or_else(|| estimate_bitrate(duration, bytes));
+    fields
+}
+
+/// Lossy-line fallback: bytes × 8 ÷ seconds, rounded to whole kbps.
+fn estimate_bitrate(duration: Duration, bytes: Option<u64>) -> Option<u32> {
+    let secs = duration.as_secs_f64();
+    if secs <= 0.0 {
+        return None;
+    }
+    let kbps = (bytes? as f64 * 8.0 / secs / 1000.0).round() as u64;
+    u32::try_from(kbps).ok().filter(|b| *b > 0)
 }
 
 /// Read tags + duration for one file. **Never fails**: an unreadable or
 /// tag-less file still yields a track (all fields `None`) — the file may
 /// still play; plan 03 handles real decode errors.
 pub fn read_track(path: &Path) -> Track {
-    use lofty::prelude::*;
-
-    let mut artist = None;
-    let mut title = None;
-    let mut duration = None;
-    let mut bitrate_kbps = None;
-
+    let mut fields = TagFields::default();
     if let Ok(tagged) = lofty::read_from_path(path) {
-        if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-            artist = clean(tag.artist().as_deref());
-            title = clean(tag.title().as_deref());
-        }
-        let d = tagged.properties().duration();
-        if !d.is_zero() {
-            duration = Some(d);
-        }
-        // Lossy line (plan 05): the tagged bitrate, else an estimate from
-        // file size and duration when both are known.
-        bitrate_kbps = tagged
-            .properties()
-            .audio_bitrate()
-            .filter(|b| *b > 0)
-            .or_else(|| {
-                let secs = duration?.as_secs_f64();
-                if secs <= 0.0 {
-                    return None;
-                }
-                let bytes = std::fs::metadata(path).ok()?.len() as f64;
-                let kbps = (bytes * 8.0 / secs / 1000.0).round() as u64;
-                u32::try_from(kbps).ok().filter(|b| *b > 0)
-            });
+        let bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
+        fields = tag_fields(&tagged, bytes);
     }
 
     Track {
         id: Track::next_id(),
         source: TrackSource::Local(path.to_path_buf()),
-        artist,
-        title,
-        duration,
-        bitrate_kbps,
+        artist: fields.artist,
+        title: fields.title,
+        duration: fields.duration,
+        bitrate_kbps: fields.bitrate_kbps,
     }
 }
 
@@ -86,8 +106,20 @@ fn clean(value: Option<&str>) -> Option<String> {
 /// Messages sent from a scan thread back to the app.
 #[derive(Debug)]
 pub enum ScanMsg {
-    Progress { found: usize },
-    Done { tracks: Vec<Track>, skipped: usize },
+    Progress {
+        found: usize,
+    },
+    Done {
+        tracks: Vec<Track>,
+        skipped: usize,
+    },
+    /// The scan could not even start — so far only an `smb://` worker
+    /// sends this, with one fixed line (`smb: cannot connect`,
+    /// `not found: smb://…`); the local scan never fails this way (plan
+    /// 10, step 3).
+    Failed {
+        reason: String,
+    },
 }
 
 /// Scan `paths` on a new thread, reporting every 50 files and a final
@@ -326,6 +358,8 @@ mod tests {
                     done = Some((tracks, skipped));
                     break;
                 }
+                // Only an `smb://` worker sends this (plan 10, step 3).
+                ScanMsg::Failed { reason } => panic!("the local scan never fails: {reason}"),
             }
         }
         let (tracks, _) = done.expect("Done");

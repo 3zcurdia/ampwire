@@ -227,6 +227,14 @@ impl Track {
     pub fn is_jellyfin(&self) -> bool {
         matches!(self.source, TrackSource::Remote { .. })
     }
+
+    /// An SMB row specifically — what the SMB rolling cache window (plan
+    /// 10, step 5) and anything else SMB-only selects. Expressed through
+    /// the other two so the relation stays visible: remote, and not the
+    /// Jellyfin half of them.
+    pub fn is_smb(&self) -> bool {
+        self.is_remote() && !self.is_jellyfin()
+    }
 }
 
 /// Everything the UI needs to render the player, in one immutable snapshot.

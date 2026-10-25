@@ -252,6 +252,36 @@ pub fn spawn_smb_scan(url: SmbUrl, client_cfg: SmbClientCfg, tx: Sender<ScanMsg>
   hidden `.foo.flac` kept, zero-byte file still yields a track, progress ticks
   at 50/100 (mirror `src/library/mod.rs:309-334`).
 
+  **Decisions taken here (2026-10-25):**
+  - *Concurrent local + SMB*: **run both, merge the `Done`s.**
+    `App::load_inputs` starts the disk scanner plus one
+    `smb::scan::spawn_smb_scan` thread per `smb://` URL over a **single**
+    `mpsc` channel (`mpsc::Sender` is `Clone`), and `App::poll_scan` keeps
+    the receiver open until `scan_pending` workers have reported. The first
+    non-empty `Done` applies the mode the load was requested with and every
+    later one appends — otherwise the second half would wipe the first — and
+    `no audio files found` is only said when *every* worker came back empty.
+    The plan's simpler alternative still holds for **re-entrancy**: a second
+    load while any worker runs is refused with `already loading`.
+  - The plan's `App::poll_smb` was not needed: both workers talk to one
+    receiver, so `poll_scan` alone drains `Progress`/`Done`/`Failed` for
+    local *and* share scans (see above).
+  - `ScanMsg` gained a third variant, `Failed { reason }`: a worker that
+    could not even start (connect refused, root not found) needs to show one
+    fixed line, which `Done { tracks: [], … }` cannot carry. The local scan
+    never sends it.
+  - *Timing on the real server* (`media/music/tree63`, 46 files / 209 MB,
+    ~48 ms RTT): one tag read costs **16 round trips / 722 KB / ≈0.77 s**,
+    so a full scan is latency-bound (~0.7 s per file), not bandwidth-bound —
+    a 256 KiB read-ahead moved it to 16 reads / 2.9 MB / 0.90 s (the reads
+    are seek-triggered, so a bigger buffer only pulls more bytes). Hence the
+    `smb://` URL is announced as `loading… <canonical>` immediately,
+    before the first 50-file progress tick.
+  - `lofty::read_from` takes a `std::fs::File`, *not* any `Read + Seek` —
+    the plan's research note was optimistic; the scan uses
+    `lofty::probe::Probe::new(reader).guess_file_type()?.read()`, which does
+    accept any reader.
+
 ### 4. Credentials + config (`src/config.rs`, `src/smb/mod.rs`)
 
 - `SmbConfig{server, share, username, password, password_file, domain, mode,

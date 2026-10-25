@@ -28,23 +28,37 @@ pub enum OpenError {
 }
 
 impl OpenError {
-    const CANNOT_OPEN: Self = OpenError::Failed("smb: cannot open file");
-    const IS_DIRECTORY: Self = OpenError::Failed("smb: is a directory");
-    const NO_ACCESS: Self = OpenError::Failed("smb: access denied");
+    pub(crate) const CANNOT_OPEN: Self = OpenError::Failed("smb: cannot open file");
+    pub(crate) const IS_DIRECTORY: Self = OpenError::Failed("smb: is a directory");
+    pub(crate) const NO_ACCESS: Self = OpenError::Failed("smb: access denied");
+    pub(crate) const CANNOT_LIST: Self = OpenError::Failed("smb: cannot list");
 
-    /// Map a crate error onto the fixed line the user sees. Matched on the
-    /// NT status *code*, never on message text.
-    fn from_crate(error: &smb::Error) -> OpenError {
+    /// Map a crate error onto the fixed line the user sees for a *file*.
+    /// Matched on the NT status *code*, never on message text.
+    pub(crate) fn from_crate(error: &smb::Error) -> OpenError {
         match error {
-            smb::Error::ReceivedErrorMessage(status, _) => OpenError::from_status(*status),
-            _ => OpenError::CANNOT_OPEN,
+            smb::Error::ReceivedErrorMessage(status, _) => {
+                Self::from_status(*status, Self::CANNOT_OPEN)
+            }
+            _ => Self::CANNOT_OPEN,
         }
     }
 
-    /// The status-code half of [`from_crate`][Self::from_crate], on its own
-    /// so tests can pin the mapping without an `ErrorResponse` (its fields
-    /// are private to the crate).
-    fn from_status(status: u32) -> OpenError {
+    /// The same mapping for a *directory* handle: anything that is not
+    /// "missing" or "denied" reads as `smb: cannot list`.
+    pub(crate) fn from_crate_list(error: &smb::Error) -> OpenError {
+        match error {
+            smb::Error::ReceivedErrorMessage(status, _) => {
+                Self::from_status(*status, Self::CANNOT_LIST)
+            }
+            _ => Self::CANNOT_LIST,
+        }
+    }
+
+    /// The status-code half of the mapping, with the line to use for
+    /// every other failure. `pub(crate)` for tests: an `ErrorResponse`'s
+    /// fields are private to the crate, so tests build the status alone.
+    pub(crate) fn from_status(status: u32, fallback: OpenError) -> OpenError {
         if status == Status::ObjectNameNotFound as u32
             || status == Status::ObjectPathNotFound as u32
         {
@@ -52,7 +66,7 @@ impl OpenError {
         } else if status == Status::AccessDenied as u32 {
             OpenError::NO_ACCESS
         } else {
-            OpenError::CANNOT_OPEN
+            fallback
         }
     }
 }
@@ -218,27 +232,34 @@ mod tests {
 
     /// Plan 10, step 6: NT status codes map to specific lines — matched on
     /// the code, never on message text — and transport errors are never
-    /// shown raw either.
+    /// shown raw either. `from_status` takes the line any *other* status
+    /// gets, so a file and a directory can word it differently.
     #[test]
     fn status_codes_map_to_specific_lines() {
+        let not_found =
+            OpenError::from_status(Status::ObjectNameNotFound as u32, OpenError::CANNOT_OPEN);
+        assert_eq!(not_found, OpenError::NotFound);
+        let path_missing =
+            OpenError::from_status(Status::ObjectPathNotFound as u32, OpenError::CANNOT_OPEN);
+        assert_eq!(path_missing, OpenError::NotFound);
         assert_eq!(
-            OpenError::from_status(Status::ObjectNameNotFound as u32),
-            OpenError::NotFound
-        );
-        assert_eq!(
-            OpenError::from_status(Status::ObjectPathNotFound as u32),
-            OpenError::NotFound
-        );
-        assert_eq!(
-            OpenError::from_status(Status::AccessDenied as u32),
+            OpenError::from_status(Status::AccessDenied as u32, OpenError::CANNOT_OPEN),
             OpenError::NO_ACCESS
         );
+        // A share of anything else keeps the caller's wording…
         assert_eq!(
-            OpenError::from_status(Status::SharingViolation as u32),
+            OpenError::from_status(Status::SharingViolation as u32, OpenError::CANNOT_OPEN),
             OpenError::CANNOT_OPEN
+        );
+        assert_eq!(
+            OpenError::from_status(Status::SharingViolation as u32, OpenError::CANNOT_LIST),
+            OpenError::CANNOT_LIST
         );
         let io = smb::Error::IoError(io::Error::other("connection reset by peer"));
         assert_eq!(OpenError::from_crate(&io), OpenError::CANNOT_OPEN);
+        assert_eq!(OpenError::from_crate_list(&io), OpenError::CANNOT_LIST);
+        // …and the lines themselves are fixed.
+        assert_eq!(OpenError::CANNOT_LIST.to_string(), "smb: cannot list");
     }
 
     // --- real-server smoke (plan 10, steps 0 and 6) -------------------------

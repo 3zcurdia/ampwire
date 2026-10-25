@@ -231,6 +231,13 @@ pub struct App {
     scan_rx: Option<std::sync::mpsc::Receiver<ScanMsg>>,
     /// What to do with the tracks when the running scan finishes.
     scan_mode: ScanMode,
+    /// Workers still to report for the running load: the local scan plus
+    /// one per `smb://` URL, all over the same channel (plan 10, step 3).
+    scan_pending: usize,
+    /// This load has already put tracks in the playlist. The first
+    /// non-empty `Done` applies the requested mode; every later worker
+    /// must append, or it would wipe the half that arrived first.
+    scan_loaded: bool,
     /// A background Jellyfin library load is in flight (plan 08, step 4).
     jf_rx: Option<std::sync::mpsc::Receiver<crate::jellyfin::JfMsg>>,
     /// The next `Page` is the first of this load → send `RemoveRemote` once
@@ -285,6 +292,8 @@ impl App {
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
+            scan_pending: 0,
+            scan_loaded: false,
             jf_rx: None,
             jf_first_page: false,
             jf_loaded: 0,
@@ -344,6 +353,8 @@ impl App {
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
+            scan_pending: 0,
+            scan_loaded: false,
             jf_rx: None,
             jf_first_page: false,
             jf_loaded: 0,
@@ -776,9 +787,12 @@ impl App {
     }
 
     /// Kick off a background load of `inputs` (plan 02, step 8; plan 10,
-    /// step 1): local paths go to the disk scanner, `smb://` URLs to the
-    /// share scanner. Mixed lists are allowed; refuses (with a notice) when
-    /// a scan is already running. Results land via [`App::poll_scan`].
+    /// step 3): local paths go to the disk scanner, `smb://` URLs to one
+    /// share-scan thread each — all over *one* channel, so a mixed command
+    /// line (`ampwire ~/Music smb://nas/More`) runs both halves at once and
+    /// [`App::poll_scan`] merges their messages. Refuses (with a notice)
+    /// when a load is already running; results land via
+    /// [`App::poll_scan`].
     pub fn load_inputs(&mut self, inputs: Vec<LoadInput>, mode: ScanMode) {
         if inputs.is_empty() {
             return;
@@ -795,19 +809,41 @@ impl App {
                 LoadInput::Smb(url) => urls.push(url),
             }
         }
-        // Plan 10, step 3 spawns `smb::scan::spawn_smb_scan` here (and
-        // decides how a mixed local+SMB load merges its results); until
-        // then only the local half is scanned.
-        if let Some(url) = urls.first() {
-            self.ui.notice = Some(format!("smb: {}", url.canonical()));
-        }
-        if paths.is_empty() {
+        if paths.is_empty() && urls.is_empty() {
             return;
         }
+
         let (tx, rx) = std::sync::mpsc::channel();
-        crate::library::spawn_scan(paths, tx);
+        let mut workers = 0usize;
+        if !paths.is_empty() {
+            crate::library::spawn_scan(paths, tx.clone());
+            workers += 1;
+        }
+        // A share scan is much slower than a disk scan (plan 10, step 3
+        // measured ≈0.7 s per file: every tag read is ~16 round trips), so
+        // the URL is announced right away instead of leaving the UI silent
+        // until the first 50-file progress tick.
+        let announced = urls.first().map(|url| url.canonical());
+        for url in urls {
+            let cfg = self.smb_client_cfg(&url);
+            crate::smb::scan::spawn_smb_scan(url, cfg, tx.clone());
+            workers += 1;
+        }
+        drop(tx);
+        if let Some(canonical) = announced {
+            self.ui.notice = Some(format!("loading… {canonical}"));
+        }
         self.scan_rx = Some(rx);
         self.scan_mode = mode;
+        self.scan_pending = workers;
+        self.scan_loaded = false;
+    }
+
+    /// How to log in for `url`: the URL's own server (always), credentials
+    /// from `[smb]` in `config.toml` — guest when none are configured
+    /// (plan 10, steps 3/4).
+    fn smb_client_cfg(&self, url: &crate::smb::SmbUrl) -> crate::smb::SmbClientCfg {
+        crate::smb::SmbClientCfg::new(&url.server, "", "")
     }
 
     /// [`load_inputs`][Self::load_inputs] for local paths only — the plan
@@ -819,34 +855,68 @@ impl App {
     }
 
     /// Drain pending scan messages. `Done` applies the tracks according to
-    /// the scan mode; an empty result leaves the playlist alone.
+    /// the scan mode; an empty result leaves the playlist alone. One load
+    /// may have several workers (the local scanner + one thread per
+    /// `smb://` URL, plan 10, step 3), so the channel stays open until the
+    /// last of them has reported.
     fn poll_scan(&mut self) {
         let Some(rx) = self.scan_rx.take() else {
             return;
         };
-        loop {
+        let keep = loop {
             match rx.try_recv() {
                 Ok(ScanMsg::Progress { found }) => {
                     self.ui.notice = Some(format!("loading… {found} files"));
                 }
                 Ok(ScanMsg::Done { tracks, skipped }) => {
                     self.finish_scan(tracks, skipped);
-                    return; // scan complete: rx stays dropped
+                    if self.scan_pending == 0 {
+                        break false; // every worker reported
+                    }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Ok(ScanMsg::Failed { reason }) => {
+                    self.finish_failure(&reason);
+                    if self.scan_pending == 0 {
+                        break false;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
             }
+        };
+        if keep {
+            self.scan_rx = Some(rx);
         }
-        self.scan_rx = Some(rx);
+    }
+
+    /// A worker that could not even start (plan 10, step 3: `smb: cannot
+    /// connect`, `not found: smb://…`): show its fixed line. The other
+    /// workers of the same load keep running.
+    fn finish_failure(&mut self, reason: &str) {
+        self.scan_pending = self.scan_pending.saturating_sub(1);
+        self.ui.notice = Some(reason.to_string());
     }
 
     fn finish_scan(&mut self, tracks: Vec<Track>, skipped: usize) {
+        self.scan_pending = self.scan_pending.saturating_sub(1);
         if tracks.is_empty() {
-            // Nothing found: leave whatever was in the playlist alone.
-            self.ui.notice = Some("no audio files found".into());
+            // Nothing found: leave whatever was in the playlist alone —
+            // and only say so once every worker of this load has reported
+            // (a mixed load may still be carrying the other half).
+            if self.scan_pending == 0 && !self.scan_loaded {
+                self.ui.notice = Some("no audio files found".into());
+            }
         } else {
             let loaded = tracks.len();
-            match self.scan_mode {
+            // The first half of a mixed load applies the mode it was
+            // requested with; every later half appends, or it would wipe
+            // the tracks that arrived first.
+            let mode = if self.scan_loaded {
+                ScanMode::Append
+            } else {
+                self.scan_mode
+            };
+            match mode {
                 ScanMode::Replace => {
                     self.player.handle(PlayerCommand::ReplaceTracks(tracks));
                     self.ui.playlist_cursor = 0;
@@ -856,6 +926,7 @@ impl App {
                     self.player.handle(PlayerCommand::AddTracks(tracks));
                 }
             }
+            self.scan_loaded = true;
             self.ui.notice = Some(format!("loaded {loaded} tracks ({skipped} skipped)"));
         }
         self.snapshot = self.player.snapshot();
@@ -1861,6 +1932,143 @@ mod tests {
             Some("already loading"),
             "the running scan wins over the notice"
         );
+    }
+
+    /// Plan 10, step 3: one `smb://` URL becomes one worker on the *same*
+    /// channel — its connect failure surfaces as the fixed line, and while
+    /// any worker runs a second load is refused.
+    #[test]
+    fn an_smb_load_reports_its_connect_failure_and_blocks_concurrent_loads() {
+        let (mut app, _dir) = test_app();
+        let LoadInput::Smb(url) =
+            crate::smb::parse_load_input("smb://127.0.0.1/Music").expect("valid url")
+        else {
+            panic!("expected an smb input");
+        };
+        app.load_inputs(vec![LoadInput::Smb(url)], ScanMode::Replace);
+        assert!(app.scan_rx.is_some(), "a worker is running");
+
+        // A second load while it runs → the usual refusal.
+        app.load_inputs(vec![LoadInput::Local("/tmp".into())], ScanMode::Append);
+        assert_eq!(app.ui.notice.as_deref(), Some("already loading"));
+
+        // 127.0.0.1:445 refuses instantly, so the failure is quick.
+        for _ in 0..200 {
+            app.tick(Duration::from_millis(1));
+            if app.scan_rx.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.scan_rx.is_none(), "the worker finished");
+        assert_eq!(app.scan_pending, 0, "nothing left to report");
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("smb: cannot connect"),
+            "a fixed line, no URL or credential in it"
+        );
+        assert_eq!(app.snapshot().tracks.len(), 24, "playlist untouched");
+    }
+
+    /// Plan 10, step 3: a mixed command line runs both halves at once over
+    /// one channel — the local scan still lands when the share refuses.
+    #[test]
+    fn a_mixed_load_lands_the_local_half_even_when_the_share_fails() {
+        let (mut app, dir) = test_app();
+        let music = dir.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("a.mp3"), b"").unwrap();
+        std::fs::write(music.join("b.flac"), b"").unwrap();
+        let LoadInput::Smb(url) =
+            crate::smb::parse_load_input("smb://127.0.0.1/More").expect("valid url")
+        else {
+            panic!("expected an smb input");
+        };
+
+        app.load_inputs(
+            vec![LoadInput::Local(music), LoadInput::Smb(url)],
+            ScanMode::Replace,
+        );
+        for _ in 0..400 {
+            app.tick(Duration::from_millis(1));
+            if app.scan_rx.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.scan_rx.is_none(), "both workers reported");
+        assert_eq!(app.scan_pending, 0);
+        assert_eq!(
+            app.snapshot().tracks.len(),
+            2,
+            "the local half of a mixed load lands"
+        );
+        // Whichever worker finished last owns the notice.
+        let notice = app.ui.notice.clone().unwrap_or_default();
+        assert!(
+            notice == "smb: cannot connect" || notice.starts_with("loaded 2 tracks"),
+            "unexpected notice: {notice}"
+        );
+    }
+
+    /// Plan 10, step 3 (the "merge the `Done`s" decision): the first
+    /// non-empty half of a load applies the mode it was requested with,
+    /// every later half appends — otherwise the second worker would wipe
+    /// the first — and `no audio files found` only shows when *nothing*
+    /// loaded.
+    #[test]
+    fn the_first_done_of_a_load_applies_the_mode_and_the_rest_append() {
+        let (mut app, _dir) = test_app();
+        let row = |name: &str| Track {
+            id: Track::next_id(),
+            source: crate::player::TrackSource::Local(std::path::PathBuf::from(format!(
+                "/x/{name}.flac"
+            ))),
+            artist: None,
+            title: None,
+            duration: None,
+            bitrate_kbps: None,
+        };
+
+        app.scan_mode = ScanMode::Replace;
+        app.scan_pending = 2;
+        app.scan_loaded = false;
+
+        app.finish_scan(vec![row("a")], 0);
+        assert_eq!(app.snapshot().tracks.len(), 1, "Replace wiped the list");
+        assert_eq!(app.scan_pending, 1, "one worker still to go");
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("loaded 1 tracks (0 skipped)")
+        );
+
+        app.finish_scan(vec![row("b")], 3);
+        assert_eq!(
+            app.snapshot().tracks.len(),
+            2,
+            "the second half appended instead of replacing"
+        );
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("loaded 1 tracks (3 skipped)")
+        );
+        assert_eq!(app.scan_pending, 0);
+
+        // An empty half after a successful one says nothing new…
+        app.scan_pending = 1;
+        app.finish_scan(Vec::new(), 0);
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("loaded 1 tracks (3 skipped)"),
+            "the empty half does not overwrite a successful notice"
+        );
+
+        // …while an entirely empty load still reports the local wording.
+        app.scan_mode = ScanMode::Replace;
+        app.scan_pending = 1;
+        app.scan_loaded = false;
+        app.finish_scan(Vec::new(), 1);
+        assert_eq!(app.ui.notice.as_deref(), Some("no audio files found"));
     }
 
     #[test]
