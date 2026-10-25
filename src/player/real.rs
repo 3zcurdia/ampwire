@@ -165,7 +165,17 @@ impl RealPlayer {
                 client: Client::new(config),
                 fallback_parent: config.cache_dir.clone(),
             });
-        let engine = Box::new(Engine::spawn(Arc::clone(&params), stream));
+        // Plan 10, step 6: in `[smb] mode = "stream"` the *engine* holds the
+        // credentials (it builds each seekable source itself, so they never
+        // reach a `Track`) and doubles its ring buffer — the same rule as
+        // the Jellyfin `StreamSetup` above. Cache mode needs no setup: the
+        // engine only ever receives a local path.
+        let smb_setup = smb
+            .filter(|config| config.mode == SmbMode::Stream)
+            .map(|config| crate::smb::SmbSetup {
+                cfg: crate::smb::SmbClientCfg::credentials(Some(config)),
+            });
+        let engine = Box::new(Engine::spawn(Arc::clone(&params), stream, smb_setup));
         let mut player = Self::with_engine(engine, params);
         if let Some(config) = config {
             player.jf_mode = Some(config.mode);
@@ -901,12 +911,17 @@ impl RealPlayer {
                 let _ = keep_paused; // the state was already set by load_track
                 false
             }
-            // Plan 10, step 6 wires `EngineCmd::LoadSmb` here; until then
-            // stop with a fixed notice instead of pretending to play.
+            // Stream mode (plan 10, step 6): the engine opens the seekable
+            // source itself — connect, probe and the `buffering…` announce
+            // all happen on the engine thread, and the credentials live in
+            // its `SmbSetup`, never in a `Track`. `start` carries the seek,
+            // which is a reload at the offset (exactly like `LoadRemote`).
             SmbMode::Stream => {
-                self.stop_playback();
-                self.notice = Some("smb: stream mode is not wired up yet".into());
-                false
+                self.engine.send(EngineCmd::LoadSmb {
+                    url: url.clone(),
+                    start,
+                });
+                true
             }
         }
     }
@@ -976,11 +991,15 @@ impl RealPlayer {
                     container: container.clone(),
                 },
             },
-            // Plan 10, steps 6–7: cache mode queues `Local(path_if_ready())`
-            // and stream mode queues `QueueSource::Smb`. Until both land,
-            // queue nothing — `refresh_queue` then sends `Unqueue`, which is
-            // exactly "no gapless pre-open", never a wrong one.
-            TrackSource::Smb { .. } => return None,
+            // Plan 10, step 7: cache mode queues only a file the window has
+            // *already* downloaded (still downloading → no queue; the normal
+            // buffering path takes over), stream mode is always queueable —
+            // SMB reads are positioned, so there is no "server without
+            // ranges" case to fall back from.
+            TrackSource::Smb { url } => match self.smb_mode() {
+                SmbMode::Cache => QueueSource::Local(self.smb_cache.as_ref()?.path_if_ready(url)?),
+                SmbMode::Stream => QueueSource::Smb(url.clone()),
+            },
         };
         let eq_bypass =
             matches!(self.jf_mode, Some(JellyfinMode::StreamPure)) && track.is_jellyfin();
@@ -2072,7 +2091,7 @@ mod tests {
             .into_iter()
             .filter_map(|(source, _)| match source {
                 QueueSource::Local(path) => Some(path),
-                QueueSource::Remote { .. } => None,
+                QueueSource::Remote { .. } | QueueSource::Smb(_) => None,
             })
             .collect()
     }
@@ -2830,6 +2849,107 @@ mod tests {
         assert!(
             load_paths(&cmds).is_empty(),
             "a stale Ready must never start playback"
+        );
+    }
+
+    /// Every `LoadSmb`, as `(url, start)` pairs — the SMB counterpart of
+    /// `remotes_of`.
+    fn smb_loads_of(cmds: &Arc<Mutex<Vec<EngineCmd>>>) -> Vec<(SmbUrl, Duration)> {
+        log_of(cmds)
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                EngineCmd::LoadSmb { url, start } => Some((url, start)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Plan 10, step 6: stream mode hands the engine the URL (and a seek as
+    /// a reload at the offset) — no cache directory, no player-side
+    /// `buffering…` (the engine announces it), and the credentials never
+    /// reach a `Track`.
+    #[test]
+    fn stream_mode_sends_load_smb_and_never_creates_a_cache() {
+        let (mut player, cmds, ..) = fake_player();
+        let config: crate::config::Config =
+            toml::from_str("[smb]\nmode = \"stream\"\n").expect("config");
+        player.smb = config.smb;
+
+        let url = smb_url("album/song.flac");
+        player.handle(PlayerCommand::AddTracks(vec![smb_row(url.clone())]));
+        player.handle(PlayerCommand::Play);
+        assert!(player.smb_cache.is_none(), "no window in stream mode");
+        assert_eq!(player.pending_smb, None, "nothing waits on a cache");
+        assert_eq!(
+            player.take_notice(),
+            None,
+            "the engine is the one that announces buffering"
+        );
+        assert_eq!(
+            smb_loads_of(&cmds),
+            [(url.clone(), Duration::ZERO)],
+            "one LoadSmb from the play"
+        );
+
+        // A seek re-opens the source at the offset — the SMB counterpart of
+        // `LoadRemote` on a Jellyfin seek.
+        player.handle(PlayerCommand::SeekBy(5));
+        let loads = smb_loads_of(&cmds);
+        assert_eq!(
+            loads.last(),
+            Some(&(url, Duration::from_secs(5))),
+            "seek = reload at the new offset: {loads:?}"
+        );
+    }
+
+    /// Plan 10, step 7: the gapless queue's view of an SMB *next* track —
+    /// nothing while the window is still downloading it (the normal
+    /// buffering path owns that moment), the local file once it is ready,
+    /// and the URL itself in stream mode, where the engine pre-opens it on
+    /// its own thread ahead of the boundary.
+    ///
+    /// (End-of-order and repeat-*wrap* queue nothing because `upcoming`
+    /// never wraps — that is the play order's rule, covered by the local
+    /// tests, and it is source-agnostic.)
+    #[test]
+    fn the_gapless_queue_waits_for_the_window_and_streams_a_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut player, cmds, ..) = smb_cached_player(&dir);
+        let url = smb_url("album/next.flac");
+        player.handle(PlayerCommand::AddTracks(tracks(1))); // 0: local, plays
+        player.handle(PlayerCommand::AddTracks(vec![smb_row(url.clone())])); // 1: next
+        player.handle(PlayerCommand::PlayTrack(0));
+        assert!(
+            queues_of(&cmds).is_empty(),
+            "nothing queued while the SMB file is still downloading"
+        );
+
+        // The window finishes it: the next queue becomes a plain local path,
+        // and the engine pre-opens it like any other file.
+        let path = dir.path().join("cached.flac");
+        std::fs::write(&path, b"pretend flac").unwrap();
+        player
+            .smb_cache
+            .as_mut()
+            .expect("window")
+            .insert_ready(&url, path.clone());
+        player.refresh_queue();
+        assert_eq!(
+            queues_of(&cmds).last().map(|(source, _)| source),
+            Some(&QueueSource::Local(path)),
+            "a downloaded file queues as a local path"
+        );
+
+        // Stream mode: the queue carries the URL, credentials included in
+        // the engine's own setup — never in the command.
+        let config: crate::config::Config =
+            toml::from_str("[smb]\nmode = \"stream\"\n").expect("config");
+        player.smb = config.smb;
+        player.refresh_queue();
+        assert_eq!(
+            queues_of(&cmds).last().map(|(source, _)| source),
+            Some(&QueueSource::Smb(url)),
+            "stream mode queues the URL itself"
         );
     }
 

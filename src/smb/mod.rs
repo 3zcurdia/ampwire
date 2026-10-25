@@ -122,6 +122,15 @@ impl SmbUrl {
         })
     }
 
+    /// The lowercased extension of the path's last segment — the decoder's
+    /// probe hint (`None` at the share root or when there is none).
+    pub(crate) fn extension(&self) -> Option<String> {
+        let name = self.path.rsplit('/').next().unwrap_or_default();
+        let ext = name.rsplit_once('.').map(|(_, ext)| ext)?;
+        let cleaned: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        (!cleaned.is_empty()).then(|| cleaned.to_ascii_lowercase())
+    }
+
     /// The one string shown in notices and used as the cache key:
     /// `smb://server/share/path`, lowercased server, and never a trailing
     /// `/` — including at the share root (`path.is_empty()`).
@@ -193,6 +202,21 @@ pub fn parse_load_input(text: &str) -> Result<LoadInput, String> {
         return Ok(LoadInput::Smb(SmbUrl::parse(trimmed)?));
     }
     Ok(LoadInput::Local(PathBuf::from(trimmed)))
+}
+
+/// Engine-owned SMB credentials (plan 10, step 6): the engine builds each
+/// [`source::SmbFileSource`] itself, so the secret travels in this setup
+/// only — never in a `Track`, never in a notice.
+#[derive(Clone)]
+pub struct SmbSetup {
+    /// Credentials with no server: the URL being opened fills that in.
+    pub cfg: SmbClientCfg,
+}
+
+impl fmt::Debug for SmbSetup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SmbSetup").field("cfg", &self.cfg).finish()
+    }
 }
 
 // --- client (spike output, plan 10 step 0 → steps 5/6) ---------------------
@@ -309,22 +333,40 @@ impl SmbClientCfg {
         candidates
     }
 
+    /// The same credentials pointed at another server: the URL being
+    /// opened always wins (plan 10's URL rule), and the secret never
+    /// leaves this struct.
+    pub(crate) fn with_server(&self, server: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            ..self.clone()
+        }
+    }
+
+    /// Credentials with no server yet: the engine fills `server` from the
+    /// URL it is about to open (plan 10's URL rule makes it mandatory), so
+    /// `SmbSetup` can carry the secret alone and never a `Track` does.
+    pub fn credentials(config: Option<&crate::config::SmbConfig>) -> Self {
+        match config {
+            Some(config) => {
+                let mut cfg = Self::new("", config.username.clone(), config.password.clone());
+                cfg.domain = config.domain.clone();
+                cfg
+            }
+            None => Self::new("", "", ""),
+        }
+    }
+
     /// The login for `url`: its server (the URL rule makes it mandatory),
     /// the account/secret/domain from a `[smb]` section — resolved by
     /// `Config::load` as `AMPWIRE_SMB_PASSWORD` > `password_file` >
     /// `password` — and guest when there is no section at all (plan 10,
     /// step 4). The URL's server always wins over any configured default.
     pub fn for_url(url: &SmbUrl, config: Option<&crate::config::SmbConfig>) -> Self {
-        let mut cfg = match config {
-            Some(config) => Self::new(
-                url.server.clone(),
-                config.username.clone(),
-                config.password.clone(),
-            ),
-            None => Self::new(url.server.clone(), "", ""),
-        };
-        cfg.domain = config.and_then(|config| config.domain.clone());
-        cfg
+        Self {
+            server: url.server.clone(),
+            ..Self::credentials(config)
+        }
     }
 
     /// `DOMAIN\user` when a domain is configured, else the bare user name

@@ -23,6 +23,8 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use crate::jellyfin::cache::{DIR_PREFIX as JELLYFIN_DIR_PREFIX, create_own_dir};
 use crate::jellyfin::http_source::{HttpRangeSource, OpenError, download_fallback};
 use crate::jellyfin::{Client, ItemId};
+use crate::smb::source::SmbFileSource;
+use crate::smb::{SmbSetup, SmbUrl};
 
 use super::dsp::{Dsp, SharedParams};
 use super::{Decoder, PlayError, StreamInfo};
@@ -55,6 +57,15 @@ pub enum EngineCmd {
         item_id: ItemId,
         /// Container name from the library page, as the probe hint.
         container: Option<String>,
+        start: Duration,
+    },
+    /// Play an `smb://` URL straight from the share (plan 10, step 6): the
+    /// engine builds the seekable [`SmbFileSource`] itself, so the
+    /// credentials (the [`SmbSetup`]) live here and never in a `Track`.
+    LoadSmb {
+        url: SmbUrl,
+        /// Start offset; `Duration::ZERO` for a plain load, `≈ position ± 5 s`
+        /// for a seek (the engine re-opens the source at that point).
         start: Duration,
     },
     /// Pre-open the track that plays after the current one (plan 09): at
@@ -92,6 +103,9 @@ pub enum QueueSource {
         item_id: ItemId,
         container: Option<String>,
     },
+    /// An `smb://` URL in `mode = "stream"`: the engine opens the seekable
+    /// [`SmbFileSource`] itself (plan 10, rule the same as above).
+    Smb(SmbUrl),
 }
 
 /// Everything the UI needs from a live stream to read the clock and draw the
@@ -176,13 +190,19 @@ impl Engine {
     /// first `Load` — spawning is safe on machines with no audio hardware.
     /// `params` are the shared volume/balance targets the callback reads
     /// (plan 05); the engine never writes them. `stream` is `Some` in the
-    /// `stream*` modes only.
-    pub fn spawn(params: Arc<SharedParams>, stream: Option<StreamSetup>) -> Engine {
+    /// Jellyfin `stream*` modes, `smb` in `[smb] mode = "stream"` (plan 10,
+    /// step 6) — both are engine-owned credentials, so the sources they
+    /// open never travel in a `Track`.
+    pub fn spawn(
+        params: Arc<SharedParams>,
+        stream: Option<StreamSetup>,
+        smb: Option<SmbSetup>,
+    ) -> Engine {
         let (cmd_tx, cmd_rx) = channel();
         let (ev_tx, ev_rx) = channel();
         let join = std::thread::Builder::new()
             .name("ampwire-engine".into())
-            .spawn(move || run(cmd_rx, ev_tx, params, stream))
+            .spawn(move || run(cmd_rx, ev_tx, params, stream, smb))
             .expect("spawn the audio engine thread");
         Engine {
             tx: cmd_tx,
@@ -455,7 +475,12 @@ fn run(
     ev_tx: Sender<EngineEvent>,
     params: Arc<SharedParams>,
     stream: Option<StreamSetup>,
+    smb: Option<SmbSetup>,
 ) {
+    // Ring policy for the whole session: any session that can stream a
+    // track gets the ≈2 s ring, so a network hiccup cannot starve the
+    // callback (plan 08, step 6; plan 10, step 6 says the same for SMB).
+    let streaming = stream.is_some() || smb.is_some();
     let mut state: Option<Playing> = None;
     let mut download: Option<PendingDownload> = None;
     // The fallback's own `ampwire-jellyfin-<pid>`, created on first use.
@@ -484,7 +509,7 @@ fn run(
                         paused: &paused,
                         params: &params,
                         devices: &mut devices,
-                        streaming: stream.is_some(),
+                        streaming,
                     };
                     match start_track(&path, start, ctx) {
                         Ok((playing, handle)) => {
@@ -516,7 +541,7 @@ fn run(
                         paused: &paused,
                         params: &params,
                         devices: &mut devices,
-                        streaming: stream.is_some(),
+                        streaming,
                     };
                     match open_remote(stream.as_ref(), &mut fallback_dir, remote, ctx, &ev_tx) {
                         Ok(Opened::Playing(opened)) => {
@@ -531,6 +556,30 @@ fn run(
                         }
                     }
                 }
+                EngineCmd::LoadSmb { url, start } => {
+                    state = None;
+                    download = None;
+                    // The connect + probe block ≈ one round trip: tell the
+                    // UI to show `buffering…` first (plan 10, step 6, the
+                    // same shape as `LoadRemote`).
+                    let _ = ev_tx.send(EngineEvent::Buffering);
+                    let ctx = StartCtx {
+                        paused: &paused,
+                        params: &params,
+                        devices: &mut devices,
+                        streaming,
+                    };
+                    match open_smb(smb.as_ref(), &url, start, ctx) {
+                        Ok((playing, handle)) => {
+                            let _ =
+                                ev_tx.send(EngineEvent::Started(playing.info().clone(), handle));
+                            state = Some(playing);
+                        }
+                        Err(reason) => {
+                            let _ = ev_tx.send(EngineEvent::Error(reason));
+                        }
+                    }
+                }
                 EngineCmd::Queue {
                     source,
                     start,
@@ -540,7 +589,8 @@ fn run(
                     // live stream; a queue while stopped is meaningless and
                     // silently dropped.
                     if let Some(playing) = &mut state {
-                        match open_queued(&source, start, eq_bypass, stream.as_ref()) {
+                        match open_queued(&source, start, eq_bypass, stream.as_ref(), smb.as_ref())
+                        {
                             Ok(Some(queued)) => playing.feeder.queue(queued),
                             // Not gapless-capable (e.g. a server without
                             // `Range`): queue nothing and let the drain take
@@ -586,7 +636,7 @@ fn run(
                 paused: &paused,
                 params: &params,
                 devices: &mut devices,
-                streaming: stream.is_some(),
+                streaming,
             };
             match result
                 .map_err(PlayError::Failed)
@@ -722,6 +772,7 @@ fn open_queued(
     start: Duration,
     eq_bypass: bool,
     stream: Option<&StreamSetup>,
+    smb: Option<&SmbSetup>,
 ) -> Result<Option<QueuedTrack>, PlayError> {
     let decoder = match source {
         QueueSource::Local(path) => Decoder::open_at(path, start)?,
@@ -735,8 +786,52 @@ fn open_queued(
                 Err(OpenError::Failed(reason)) => return Err(PlayError::Failed(reason)),
             }
         }
+        // Plan 10, step 6/7: an SMB stream is always queueable — SMB reads
+        // are positioned, so there is no "no ranges" case to fall back from.
+        QueueSource::Smb(url) => open_smb_source(smb, url, start)?,
     };
     Ok(Some(QueuedTrack { decoder, eq_bypass }))
+}
+
+/// Open an `smb://` track (plan 10, step 6): the seekable source over
+/// positioned reads, on **this** thread — the plan is explicit that the
+/// round trip blocks the engine and never the UI. Everything after the
+/// decoder (device config, ring, pre-fill) is the shared path.
+fn open_smb(
+    setup: Option<&SmbSetup>,
+    url: &SmbUrl,
+    start: Duration,
+    ctx: StartCtx<'_>,
+) -> Result<(Playing, PlaybackHandle), PlayError> {
+    let decoder = open_smb_source(setup, url, start)?;
+    finish_start(decoder, ctx)
+}
+
+/// The decode half of [`open_smb`], shared with the gapless queue (plan 10,
+/// step 7): connect, open the seekable source, probe + seek to `start`.
+///
+/// The connection errors are fixed lines (`smb: cannot connect`,
+/// `smb: not found`, …) — no server, share, path or credential travels in
+/// an `EngineEvent`.
+fn open_smb_source(
+    setup: Option<&SmbSetup>,
+    url: &SmbUrl,
+    start: Duration,
+) -> Result<Decoder, PlayError> {
+    let setup =
+        setup.ok_or_else(|| "smb: add mode = \"stream\" to [smb] in config.toml".to_string())?;
+    // The URL always wins over the configured server (plan 10's URL rule).
+    let cfg = setup.cfg.with_server(url.server.clone());
+    let unc = url
+        .unc()
+        .map_err(|_| PlayError::Failed("smb: cannot open file".to_string()))?;
+    let client = cfg.connect(&url.share).map_err(PlayError::Failed)?;
+    let source =
+        SmbFileSource::open(&client, &unc).map_err(|error| PlayError::Failed(error.to_string()))?;
+    // `client` drops here on purpose: the open handle keeps the session
+    // alive by itself (verified against a live server), so the engine never
+    // has to own a connection per track.
+    Decoder::open_source(Box::new(source), url.extension().as_deref(), start)
 }
 
 /// The output config the track's own format fits (no resampling — plan §Scope),
@@ -842,6 +937,19 @@ fn open_remote(
     }
 }
 
+/// The ring's size in frames: ≈0.5 s of the track's own format for a file,
+/// ≈2 s for a *streamed* one so a network hiccup cannot starve the callback
+/// (plan 08, step 6; plan 10, step 6 asks the same of a streamed SMB track).
+fn ring_capacity(sample_rate: u32, channels: u16, streaming: bool) -> usize {
+    let rate = sample_rate as usize;
+    let frames = if streaming {
+        rate * channels as usize * 2
+    } else {
+        rate * channels as usize / RING_SECONDS_DIVISOR
+    };
+    frames.max(MIN_CHUNK * 2)
+}
+
 /// Everything after the decoder exists: pick a device config the track's
 /// own format fits, build the ring, pre-fill it (so playback starts on
 /// sound, not silence) and `play()`. `streaming` doubles the ring (≈2 s) so
@@ -862,15 +970,9 @@ fn finish_start(
     // (plan 09, step 1): only the first track start of a session queries.
     let (config, label) = device_config(devices, &info)?;
 
-    // ≈0.5 s of the track's *own* rate and channel count: no resampling.
-    // Streamed tracks get ≈2 s (`rate * channels * 2`) so a network hiccup
-    // cannot starve the callback (plan 08, step 6).
-    let capacity = if streaming {
-        (info.sample_rate as usize * info.channels as usize * 2).max(MIN_CHUNK * 2)
-    } else {
-        (info.sample_rate as usize * info.channels as usize / RING_SECONDS_DIVISOR)
-            .max(MIN_CHUNK * 2)
-    };
+    // ≈0.5 s of the track's *own* rate and channel count: no resampling
+    // (`ring_capacity` doubles it for a streamed one).
+    let capacity = ring_capacity(info.sample_rate, info.channels, streaming);
     let (producer, mut consumer) = RingBuffer::<f32>::new(capacity);
 
     // The spectrum tap: one mono sample per played frame, dropped (never
@@ -1047,7 +1149,7 @@ mod tests {
     #[test]
     fn dropping_the_engine_shuts_the_thread_down_promptly() {
         // No device is opened until a `Load`, so this is safe anywhere.
-        let engine = Engine::spawn(Arc::new(SharedParams::new()), None);
+        let engine = Engine::spawn(Arc::new(SharedParams::new()), None, None);
         let started = std::time::Instant::now();
         drop(engine); // sends Shutdown and joins
         assert!(
@@ -1072,6 +1174,7 @@ mod tests {
                 client: server.client(KEY),
                 fallback_parent: Some(parent.path().to_path_buf()),
             }),
+            None,
         );
         engine.send(EngineCmd::LoadRemote {
             item_id: "slowfallback".into(),
@@ -1357,7 +1460,7 @@ mod tests {
 
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.wav");
-        let engine = Engine::spawn(Arc::new(SharedParams::new()), None);
+        let engine = Engine::spawn(Arc::new(SharedParams::new()), None, None);
         engine.send(EngineCmd::Load {
             path: fixture,
             start: Duration::ZERO,
@@ -1410,7 +1513,7 @@ mod tests {
         }
 
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let engine = Engine::spawn(Arc::new(SharedParams::new()), None);
+        let engine = Engine::spawn(Arc::new(SharedParams::new()), None, None);
         engine.send(EngineCmd::Load {
             path: dir.join("tone.wav"),
             start: Duration::ZERO,
@@ -1652,5 +1755,223 @@ mod tests {
             );
         }
         drop(producer);
+    }
+
+    // --- plan 10, step 6: SMB stream mode ---
+
+    /// `smb://127.0.0.1/Music/a.flac` for the tests: loopback, so a connect
+    /// fails instantly instead of waiting on a name lookup.
+    fn smb_test_url() -> SmbUrl {
+        SmbUrl {
+            server: "127.0.0.1".into(),
+            share: "Music".into(),
+            path: "a.flac".into(),
+        }
+    }
+
+    /// Drain the engine's events until `count` arrive or `timeout` passes.
+    fn events_of(engine: &Engine, count: usize, timeout: Duration) -> Vec<EngineEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut events = Vec::new();
+        while events.len() < count && std::time::Instant::now() < deadline {
+            events.extend(engine.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        events
+    }
+
+    /// The ring rule: a streamed session (Jellyfin *or* SMB) gets ≈2 s so a
+    /// network hiccup cannot starve the callback; a plain file keeps ≈0.5 s,
+    /// and a tiny format still gets the floor.
+    #[test]
+    fn streamed_sessions_get_the_two_second_ring() {
+        assert_eq!(
+            ring_capacity(44_100, 2, false),
+            44_100,
+            "0.5 s of stereo 44.1 kHz"
+        );
+        assert_eq!(
+            ring_capacity(44_100, 2, true),
+            44_100 * 4,
+            "2 s of stereo for a streamed track"
+        );
+        assert_eq!(
+            ring_capacity(1_000, 1, false),
+            MIN_CHUNK * 2,
+            "the floor for a tiny format"
+        );
+    }
+
+    /// `LoadSmb` without an engine-owned setup (the player only ever sends
+    /// it in `mode = "stream"`) still announces `buffering…` first and then
+    /// reports one fixed line — no server, share or path in it — and the
+    /// engine still shuts down promptly afterwards.
+    #[test]
+    fn load_smb_without_a_setup_announces_then_reports_one_fixed_line() {
+        let engine = Engine::spawn(Arc::new(SharedParams::new()), None, None);
+        engine.send(EngineCmd::LoadSmb {
+            url: smb_test_url(),
+            start: Duration::ZERO,
+        });
+        let events = events_of(&engine, 2, Duration::from_secs(2));
+        assert!(
+            matches!(events.first(), Some(EngineEvent::Buffering)),
+            "buffering is announced before the probe blocks: {events:?}"
+        );
+        match events.get(1) {
+            Some(EngineEvent::Error(reason)) => {
+                let shown = reason.to_string();
+                assert_eq!(shown, "smb: add mode = \"stream\" to [smb] in config.toml");
+                assert!(
+                    !shown.contains("127.0.0.1"),
+                    "no server in the line: {shown}"
+                );
+            }
+            other => panic!("expected the fixed line: {other:?}"),
+        }
+        let started = std::time::Instant::now();
+        drop(engine);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown never waits on the network"
+        );
+    }
+
+    /// The real connect happens *on the engine thread* (plan 10, step 6):
+    /// `Buffering` first, then the fixed connect line for a server that
+    /// refuses — and no audio device is ever opened.
+    #[test]
+    fn load_smb_connects_on_the_engine_thread_and_reports_a_fixed_line() {
+        let engine = Engine::spawn(
+            Arc::new(SharedParams::new()),
+            None,
+            Some(SmbSetup {
+                cfg: crate::smb::SmbClientCfg::new("127.0.0.1", "", ""),
+            }),
+        );
+        engine.send(EngineCmd::LoadSmb {
+            url: smb_test_url(),
+            start: Duration::ZERO,
+        });
+        let events = events_of(&engine, 2, Duration::from_secs(5));
+        assert!(
+            matches!(events.first(), Some(EngineEvent::Buffering)),
+            "{events:?}"
+        );
+        match events.get(1) {
+            Some(EngineEvent::Error(reason)) => {
+                assert_eq!(reason.to_string(), "smb: cannot connect")
+            }
+            other => panic!("expected the connect failure: {other:?}"),
+        }
+        drop(engine);
+    }
+
+    /// With the engine-owned setup present, an SMB queue that cannot open
+    /// (server refused) fails with the *same* fixed line — the engine then
+    /// holds it and reports it at the boundary, exactly like any other
+    /// queued track that failed to open (the skip path, plan §Decisions).
+    #[test]
+    fn an_smb_queue_that_cannot_open_fails_with_one_fixed_line() {
+        let setup = SmbSetup {
+            cfg: crate::smb::SmbClientCfg::new("127.0.0.1", "", ""),
+        };
+        let error = match open_queued(
+            &QueueSource::Smb(smb_test_url()),
+            Duration::ZERO,
+            false,
+            None,
+            Some(&setup),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("127.0.0.1 refuses, so nothing can be queued"),
+        };
+        assert_eq!(error.to_string(), "smb: cannot connect");
+    }
+
+    /// Plan 10, step 6, end to end (real server + real device): the engine
+    /// connects on its own thread, opens the seekable source, decodes it
+    /// and plays it to the last sample. Skips without `AMPWIRE_SMB_TEST_*`
+    /// (the share) or without an output device.
+    #[test]
+    fn engine_streams_an_smb_file_end_to_end() {
+        let (Ok(server), Ok(share)) = (
+            std::env::var("AMPWIRE_SMB_TEST_SERVER"),
+            std::env::var("AMPWIRE_SMB_TEST_SHARE"),
+        ) else {
+            return eprintln!("skipping: no AMPWIRE_SMB_TEST_SERVER/SHARE");
+        };
+        let path = std::env::var("AMPWIRE_SMB_TEST_PATH").unwrap_or_default();
+        if cpal::default_host().default_output_device().is_none() {
+            return eprintln!("skipping: no audio output device on this machine");
+        }
+        let target = SmbUrl {
+            server: server.clone(),
+            share: share.clone(),
+            path: path.clone(),
+        };
+        if target.extension().is_none() {
+            return eprintln!("skipping: AMPWIRE_SMB_TEST_PATH must be an audio *file*");
+        }
+
+        let engine = Engine::spawn(
+            Arc::new(SharedParams::new()),
+            None,
+            Some(SmbSetup {
+                cfg: crate::smb::SmbClientCfg::credentials(None),
+            }),
+        );
+        engine.send(EngineCmd::LoadSmb {
+            url: SmbUrl {
+                server: server.to_lowercase(),
+                share,
+                path,
+            },
+            start: Duration::ZERO,
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut started = false;
+        let mut outcome = None;
+        while outcome.is_none() && std::time::Instant::now() < deadline {
+            for event in engine.poll() {
+                match event {
+                    EngineEvent::Started(info, _handle) => {
+                        started = true;
+                        eprintln!("started over smb: {info:?}");
+                    }
+                    EngineEvent::Finished => outcome = Some("Finished".to_string()),
+                    EngineEvent::Error(reason) => outcome = Some(reason.to_string()),
+                    EngineEvent::Buffering | EngineEvent::Notice(_) | EngineEvent::Advanced(_) => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(engine);
+
+        let outcome = outcome.expect("the 0.5 s tone must finish within 20 s");
+        assert_eq!(outcome, "Finished");
+        assert!(started, "Started must arrive before Finished");
+    }
+
+    /// Queueing an SMB stream without the setup is the same fixed line
+    /// (defensive: the player only queues SMB in stream mode, where the
+    /// engine *has* the credentials).
+    #[test]
+    fn queueing_an_smb_stream_without_a_setup_is_one_fixed_line() {
+        let error = match open_queued(
+            &QueueSource::Smb(smb_test_url()),
+            Duration::ZERO,
+            false,
+            None,
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("no setup must not open a queue"),
+        };
+        assert_eq!(
+            error,
+            PlayError::Failed("smb: add mode = \"stream\" to [smb] in config.toml".into())
+        );
     }
 }

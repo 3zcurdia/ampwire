@@ -80,12 +80,45 @@ impl fmt::Display for OpenError {
     }
 }
 
+/// Where the bytes come from: positioned reads plus an explicit close.
+/// Production is an open `smb::File` ([`SmbHandle`]); tests the plan's
+/// "fake SMB backend" — bytes in memory — so the cursor rules *and* the
+/// decoder path run without a network.
+pub(crate) trait PositionedFile: Send + Sync {
+    /// Read up to `buf.len()` bytes starting at `offset` (one round trip on
+    /// the wire), returning how many arrived; `0` at end of file.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+
+    /// Release the server-side handle: the sync `smb` build only *warns*
+    /// when a handle is dropped un-closed, so the source does it itself.
+    fn close(&self);
+}
+
+/// The one line a failed read ever shows (plan 10 "Notices"): no server,
+/// path, share or credential in it.
+const READ_FAILED: &str = "smb: read failed";
+
+/// The production backend: one open handle on the share.
+struct SmbHandle(smb::File);
+
+impl PositionedFile for SmbHandle {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.0
+            .read_at(buf, offset)
+            .map_err(|_| io::Error::other(READ_FAILED))
+    }
+
+    fn close(&self) {
+        let _ = self.0.close();
+    }
+}
+
 /// A `Read + Seek` view of one file on an SMB share — symphonia's
 /// [`MediaSource`], so [`Decoder::open_source`][crate::audio::Decoder::open_source]
 /// decodes it exactly like a local file (seek, EQ, spectrum and gapless all
 /// stay unchanged).
 pub struct SmbFileSource {
-    file: smb::File,
+    file: Box<dyn PositionedFile>,
     /// Length from the open handle (`FILE_END_OF_FILE_INFORMATION`), so
     /// `byte_len` and `SeekFrom::End` never need a round trip.
     len: u64,
@@ -110,7 +143,18 @@ impl SmbFileSource {
         let len = file
             .get_len()
             .map_err(|error| OpenError::from_crate(&error))?;
-        Ok(SmbFileSource { file, len, pos: 0 })
+        Ok(SmbFileSource {
+            file: Box::new(SmbHandle(file)),
+            len,
+            pos: 0,
+        })
+    }
+
+    /// Build the same cursor rules over another backend (plan 10, step 6's
+    /// "fake SMB backend"; tests only).
+    #[cfg(test)]
+    pub(crate) fn with_backend(file: Box<dyn PositionedFile>, len: u64) -> SmbFileSource {
+        SmbFileSource { file, len, pos: 0 }
     }
 
     /// The file's length in bytes (known at open — the cache refuses
@@ -140,10 +184,7 @@ impl Read for SmbFileSource {
         // Never ask for bytes past the known length: those would be an
         // error instead of the EOF the demuxer expects.
         let want = out.len().min((self.len - self.pos) as usize);
-        let read = self
-            .file
-            .read_at(&mut out[..want], self.pos)
-            .map_err(|_| io::Error::other("smb: read failed"))?;
+        let read = self.file.read_at(&mut out[..want], self.pos)?;
         self.pos += read as u64;
         Ok(read)
     }
@@ -170,9 +211,9 @@ impl MediaSource for SmbFileSource {
 
 impl Drop for SmbFileSource {
     fn drop(&mut self) {
-        // The sync `smb` build does not close handles on drop; a leaked
-        // handle stays open on the server until the session ends.
-        let _ = self.file.close();
+        // A handle leaked on drop stays open on the server until the
+        // session ends — the backend closes it (no-op for the fake).
+        self.file.close();
     }
 }
 
@@ -183,41 +224,104 @@ mod tests {
     use super::*;
     use crate::smb::smoke::{self, session, target};
 
-    /// Plan 10, step 6: `Read`/`Seek` cursor math — forward, `End`,
-    /// backwards, exactly at EOF, and past the end (which must clamp to a
-    /// non-negative cursor so the next `read` is a clean EOF).
-    #[test]
-    fn the_cursor_walks_the_file_without_ever_going_negative() {
-        // A 10-byte "file", stepped through the same rule `Seek` uses.
-        const LEN: u64 = 10;
-        let mut pos = 0u64;
-        let mut seek = |from: SeekFrom| {
-            pos = cursor_pos(from, pos, LEN);
-            pos
-        };
+    /// The plan's "fake SMB backend": the same positioned-read contract the
+    /// wire uses, served from memory.
+    struct FakeFile(Vec<u8>);
 
-        assert_eq!(seek(SeekFrom::Start(3)), 3, "absolute");
-        assert_eq!(seek(SeekFrom::Current(4)), 7, "relative forward");
-        assert_eq!(seek(SeekFrom::Current(-20)), 0, "clamped at the start");
-        assert_eq!(seek(SeekFrom::End(-4)), 6, "End is relative to the file");
-        assert_eq!(seek(SeekFrom::End(0)), LEN, "exactly at EOF");
-        assert_eq!(seek(SeekFrom::End(-100)), 0, "before the start: clamped");
-        assert_eq!(seek(SeekFrom::Start(100)), 100, "past the end is allowed");
-        assert_eq!(seek(SeekFrom::End(10)), LEN + 10, "past the end, too");
-        // …and a read at any of those positions past the end is EOF,
-        // because `read` refuses to ask for bytes beyond `len`.
-        for past in [LEN, LEN + 10] {
-            assert!(past >= LEN, "the source treats {past} as EOF");
+    impl PositionedFile for FakeFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            let start = offset.min(self.0.len() as u64) as usize;
+            let end = start.saturating_add(buf.len()).min(self.0.len());
+            let n = end - start;
+            buf[..n].copy_from_slice(&self.0[start..end]);
+            Ok(n)
         }
+
+        fn close(&self) {}
     }
 
-    /// The `SeekFrom::End` rule symphonia relies on (`byte_len` + seek to
-    /// the footer of an M4A): it uses the *file* length, not the cursor.
+    /// The source over `bytes`, as the engine would build one.
+    fn fake_source(bytes: &[u8]) -> SmbFileSource {
+        SmbFileSource::with_backend(Box::new(FakeFile(bytes.to_vec())), bytes.len() as u64)
+    }
+
+    /// Plan 10, step 6: `Read`/`Seek` cursor math through the *real*
+    /// implementation — forward, `End`, backwards, exactly at EOF, a
+    /// partial read at the boundary, and past the end (which must be a
+    /// clean `Ok(0)`, never a negative offset or an error).
     #[test]
-    fn seek_from_end_is_relative_to_the_file_length() {
-        assert_eq!(cursor_pos(SeekFrom::End(0), 3, 10), 10);
-        assert_eq!(cursor_pos(SeekFrom::End(-1), 0, 10), 9);
-        assert_eq!(cursor_pos(SeekFrom::End(5), 0, 10), 15);
+    fn the_cursor_walks_the_file_without_ever_going_negative() {
+        let mut source = fake_source(b"0123456789");
+        assert_eq!(
+            MediaSource::byte_len(&source),
+            Some(10),
+            "the length the source reports"
+        );
+
+        let mut buf = [0u8; 4];
+        // Absolute, then forward from the cursor.
+        assert_eq!(source.seek(SeekFrom::Start(3)).unwrap(), 3);
+        source.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"3456");
+        assert_eq!(source.seek(SeekFrom::Current(3)).unwrap(), 10);
+        // `End` is relative to the *file* (symphonia seeks to an M4A's
+        // footer with it), never to the cursor.
+        assert_eq!(source.seek(SeekFrom::End(-4)).unwrap(), 6);
+        source.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"6789");
+        assert_eq!(source.seek(SeekFrom::End(0)).unwrap(), 10, "at EOF");
+        assert_eq!(source.read(&mut buf).unwrap(), 0, "EOF is Ok(0)");
+
+        // Backwards, clamped at both ends: a negative position would wrap
+        // into a huge offset on the next positioned read.
+        assert_eq!(source.seek(SeekFrom::Current(-100)).unwrap(), 0);
+        assert_eq!(source.seek(SeekFrom::End(-100)).unwrap(), 0);
+        source.read_exact(&mut buf[..2]).unwrap();
+        assert_eq!(&buf[..2], b"01", "and reads from the start again");
+
+        // Past the end: allowed as a cursor, reads as EOF, and a read that
+        // starts inside the file never asks for bytes beyond it.
+        assert_eq!(source.seek(SeekFrom::Start(100)).unwrap(), 100);
+        assert_eq!(source.read(&mut buf).unwrap(), 0, "past the end: EOF");
+        assert_eq!(source.seek(SeekFrom::Start(8)).unwrap(), 8);
+        assert_eq!(source.read(&mut buf).unwrap(), 2, "clamped to the file");
+        assert_eq!(&buf[..2], b"89");
+        assert_eq!(source.read(&mut buf).unwrap(), 0, "…and then EOF");
+    }
+
+    /// Plan 10, step 6: `Decoder::open_source` over the source for *every*
+    /// fixture format, through the fake backend — same codec, same sample
+    /// count as reading the file off disk.
+    #[test]
+    fn the_decoder_reads_every_fixture_through_the_fake_backend() {
+        let cases: [(&str, &str); 5] = [
+            ("tone.wav", "PCM"),
+            ("tone.flac", "FLAC"),
+            ("tone.mp3", "MP3"),
+            ("tone_aac.m4a", "AAC"),
+            ("tone_alac.m4a", "ALAC"),
+        ];
+        for (name, codec) in cases {
+            let bytes = std::fs::read(crate::smb::smoke::fixture(name)).expect("fixture");
+            let source = fake_source(&bytes);
+            assert_eq!(
+                MediaSource::byte_len(&source),
+                Some(bytes.len() as u64),
+                "byte_len of {name}"
+            );
+            let ext = name.rsplit('.').next().expect("extension");
+            let mut decoder =
+                crate::audio::Decoder::open_source(Box::new(source), Some(ext), Duration::ZERO)
+                    .unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+            assert_eq!(decoder.info().codec, codec, "codec of {name}");
+            let mut samples = Vec::new();
+            while decoder.read(&mut samples).expect("decodes") {}
+            assert_eq!(
+                samples.len(),
+                crate::smb::smoke::local_samples(name),
+                "{name}: samples through the source vs off disk"
+            );
+        }
     }
 
     /// Plan 10, step 6: the fixed error lines — no path, share or server.
@@ -379,6 +483,29 @@ mod tests {
         let mut again = Vec::new();
         while decoder.read(&mut again).expect("decodes back at 0") {}
         assert_eq!(again.len(), from_start.len(), "back to the start");
+    }
+
+    /// Plan 10, step 6 (real server): an open source outlives the `Client`
+    /// that opened it — the handle keeps the session alive on its own — so
+    /// the engine can drop its login object as soon as `open` returns and
+    /// never owns a connection per track.
+    #[test]
+    #[ignore = "needs a live Samba server (see module docs)"]
+    fn smb_spike_source_outlives_its_client() {
+        let Some(target) = target() else {
+            return eprintln!("smb_spike: AMPWIRE_SMB_TEST_SERVER/SHARE not set, skipped");
+        };
+        let (client, unc) = session(&target).expect("connect");
+        let file = unc.clone().with_add_path("tone.flac");
+        let source = SmbFileSource::open(&client, &file).expect("open");
+        drop(client); // the session must survive this
+
+        let mut decoder =
+            crate::audio::Decoder::open_source(Box::new(source), Some("flac"), Duration::ZERO)
+                .expect("decodes after the client is gone");
+        let mut samples = Vec::new();
+        while decoder.read(&mut samples).expect("decodes") {}
+        assert!(!samples.is_empty(), "read every sample with no client");
     }
 
     fn open_song(

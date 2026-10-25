@@ -898,6 +898,7 @@ mod tests {
                 client,
                 fallback_parent: None,
             }),
+            None,
         );
         engine.send(EngineCmd::LoadRemote {
             item_id: item.item_id.clone(),

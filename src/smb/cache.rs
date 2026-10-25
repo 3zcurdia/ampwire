@@ -486,21 +486,7 @@ fn hash_of(url: &SmbUrl) -> String {
 /// The file extension of the URL's last path segment, ASCII alphanumeric
 /// (the decoder probe's hint), falling back to `bin`.
 fn ext_for(url: &SmbUrl) -> String {
-    let name = url.path.rsplit('/').next().unwrap_or_default();
-    let ext = name
-        .rsplit_once('.')
-        .map(|(_, ext)| ext)
-        .unwrap_or_default();
-    let cleaned: String = ext
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_lowercase();
-    if cleaned.is_empty() {
-        "bin".into()
-    } else {
-        cleaned
-    }
+    url.extension().unwrap_or_else(|| "bin".into())
 }
 
 #[cfg(test)]
