@@ -41,3 +41,9 @@ jobs:
       # tests are #[ignore]d); safe on hosted runners.
       - name: test
         run: cargo test
+      - name: shellcheck install wrapper
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -s sh docs/site/install.sh

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install — Ampwire</title>
+  <meta name="description" content="Install Ampwire: curl, Homebrew, manual archives, upgrade, uninstall and troubleshooting.">
+  <link rel="canonical" href="https://3zcurdia.github.io/ampwire/install.html">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site">
+    <a class="brand" href="index.html">Ampwire</a>
+    <nav aria-label="Primary">
+      <a href="index.html">Home</a>
+      <a href="https://github.com/3zcurdia/ampwire">GitHub</a>
+      <a href="https://github.com/3zcurdia/ampwire/releases/latest">Releases</a>
+    </nav>
+  </header>
+  <main id="main">
+    <h1>Install</h1>
+
+    <h2>Quick install</h2>
+    <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh">
+curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh
+    </div>
+    <div class="code" data-copy="brew install 3zcurdia/tap/ampwire">
+brew install 3zcurdia/tap/ampwire
+    </div>
+
+    <h2>Requirements</h2>
+    <ul class="req">
+      <li>macOS (Apple Silicon or Intel) or Linux with glibc &ge; 2.35.</li>
+      <li>Linux: ALSA runtime (<code>libasound2</code>/<code>libasound2t64</code> on Debian/Ubuntu, <code>alsa-lib</code> on Fedora/Arch, <code>alsa</code> on openSUSE).</li>
+      <li>A real TTY; minimum terminal 40&times;3.</li>
+      <li>Windows is unsupported.</li>
+    </ul>
+
+    <h2>Upgrade</h2>
+    <p>Re-run the curl command, or:</p>
+    <div class="code" data-copy="brew upgrade ampwire">
+brew upgrade ampwire
+    </div>
+
+    <h2>Uninstall</h2>
+    <p>Remove the binary:</p>
+    <div class="code" data-copy="rm ~/.local/bin/ampwire">
+rm ~/.local/bin/ampwire
+    </div>
+    <p>Optionally remove the <code>source "$HOME/.local/bin/env"</code> line from your shell rc. Homebrew:</p>
+    <div class="code" data-copy="brew uninstall ampwire">
+brew uninstall ampwire
+    </div>
+    <p>Configuration remains at <code>~/.config/ampwire/config.toml</code> unless you remove it.</p>
+
+    <h2>Troubleshooting</h2>
+    <ul>
+      <li><code>command not found: ampwire</code> — run <code>source ~/.local/bin/env</code> or restart the shell.</li>
+      <li>Missing <code>libasound.so.2</code> — install the ALSA runtime (see requirements).</li>
+      <li>glibc too old — your system is below the glibc 2.35 baseline; use a newer distro or build from source.</li>
+      <li>Gatekeeper / quarantine on a browser-downloaded archive — <code>xattr -d com.apple.quarantine &lt;file&gt;</code>.</li>
+      <li><code>cannot play 96000 Hz</code> — ampwire never resamples; the device does not support that rate.</li>
+      <li>No audio device / terminal too small — see the README.</li>
+    </ul>
+
+    <h2>Manual install</h2>
+    <p>Archives for the four supported platforms are attached to each <a href="https://github.com/3zcurdia/ampwire/releases/latest">GitHub Release</a>.</p>
+    <table>
+      <thead><tr><th>Platform</th><th>Archive</th></tr></thead>
+      <tbody>
+        <tr><td>macOS Apple Silicon</td><td><code>ampwire-aarch64-apple-darwin.tar.xz</code></td></tr>
+        <tr><td>macOS Intel</td><td><code>ampwire-x86_64-apple-darwin.tar.xz</code></td></tr>
+        <tr><td>Linux arm64</td><td><code>ampwire-aarch64-unknown-linux-gnu.tar.xz</code></td></tr>
+        <tr><td>Linux x86_64</td><td><code>ampwire-x86_64-unknown-linux-gnu.tar.xz</code></td></tr>
+      </tbody>
+    </table>
+    <p>Verify with <code>shasum -a 256 -c</code> / <code>sha256sum -c</code> and <code>gh attestation verify … --repo 3zcurdia/ampwire</code>.</p>
+  </main>
+  <footer>
+    <p>MIT licensed. <a href="https://github.com/3zcurdia/ampwire">Repository</a> · <a href="https://github.com/3zcurdia/ampwire/issues">Issues</a>.</p>
+  </footer>
+  <script>
+    (function () {
+      var status = document.createElement('div');
+      status.className = 'aria-live';
+      status.setAttribute('aria-live', 'polite');
+      document.body.appendChild(status);
+      document.querySelectorAll('.code').forEach(function (block) {
+        var btn = document.createElement('button');
+        btn.className = 'copy';
+        btn.type = 'button';
+        btn.textContent = 'Copy';
+        btn.setAttribute('aria-label', 'Copy code to clipboard');
+        btn.addEventListener('click', function () {
+          var text = block.getAttribute('data-copy') || block.textContent.trim();
+          var done = function (ok) {
+            btn.textContent = ok ? 'Copied' : 'Copy failed';
+            status.textContent = ok ? 'Copied to clipboard' : 'Copy failed';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+          } else {
+            try {
+              var ta = document.createElement('textarea');
+              ta.value = text;
+              ta.style.position = 'fixed';
+              ta.style.opacity = '0';
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand('copy');
+              document.body.removeChild(ta);
+              done(true);
+            } catch (e) { done(false); }
+          }
+        });
+        block.appendChild(btn);
+      });
+    })();
+  </script>
+</body>
+</html>

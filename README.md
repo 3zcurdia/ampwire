@@ -8,7 +8,23 @@ A terminal player **inspired by Winamp 2**, implemented from scratch for the ter
 
 It borrows Winamp 2's anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look. It is *not* a port, clone or replica of Winamp: the UI, the playback engine and the library handling are all written for the terminal from scratch.
 
-## Quickstart
+## Install
+
+Prebuilt binaries for macOS (Apple Silicon / Intel) and Linux (x86_64 / arm64):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh
+```
+
+or, on macOS/Linux with Homebrew:
+
+```sh
+brew install 3zcurdia/tap/ampwire
+```
+
+See the [install guide](https://3zcurdia.github.io/ampwire/install.html) for requirements, upgrade, uninstall and troubleshooting. Runtime requirements: macOS or Linux with glibc ≥ 2.35; on Linux the ALSA runtime (`libasound2` / `libasound2t64` on Debian/Ubuntu, `alsa-lib` on Fedora/Arch, `alsa` on openSUSE). Windows is unsupported.
+
+## From source
 
 Requirements: Rust (managed via `mise`, see `mise.toml`), a real TTY, and — for audio output on Linux — the ALSA development headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch). macOS plays through CoreAudio with no extra setup.
 
@@ -19,6 +35,8 @@ cargo run              # start empty: press `l` to open a file or folder
 cargo run -- --demo    # mock playlist + default layout, ignores your config
 cargo run -- --dump 104x18 # render one frame to stdout, no TUI (for tests / preview)
 cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
+cargo run -- --version                 # print version and exit
+cargo run -- --help                    # print help and exit
 ```
 
 `--dump` never enters raw mode or the alternate screen. Useful sizes used in tests: `40x3`, `52x12`, `80x24`, `104x18`, `160x45` (see `tests/golden/`).
@@ -27,7 +45,7 @@ cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 
 | Platform | Status | Notes |
 |---|---|---|
-| **Linux** | ✅ works | Audio via ALSA — build needs the ALSA development headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch). |
+| **Linux** | ✅ works | Audio via ALSA — build needs the ALSA development headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch). Release binaries target glibc ≥ 2.35 (ubuntu-22.04 baseline) on x86_64/arm64. |
 | **macOS** | ✅ works | Audio via CoreAudio, no extra setup. |
 | **Windows** | ⚠️ **untested** | The code has never been built or run on Windows, so it may not even compile there. Treat it as unsupported for now. |
 

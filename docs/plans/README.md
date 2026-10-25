@@ -2,7 +2,9 @@
 
 Plan `01` (layout) is done. Plans `02`–`08` turn the mock UI into a real player;
 `09` (gapless) came out of the 2026-10-23 audit; `10` (native SMB shares) was
-finished on 2026-10-25.
+finished on 2026-10-25. Plan `11` is release/distribution work (GitHub
+Releases, the curl-to-sh installer and the GitHub Pages site), not player
+behavior.
 **Do them in numeric order.** Each plan lists its prerequisites and assumes
 the earlier ones are merged.
 
@@ -18,6 +20,7 @@ the earlier ones are merged.
 | [08](08-jellyfin.md) | ✅ done | Jellyfin server → playlist; temp-dir cache (3 ahead/3 behind) or HTTP streaming, optional EQ bypass | 03, 04, 05, 06 |
 | [09](09-gapless.md) | ✅ done | Gapless playback between same-format tracks; device/config cache | 03, 04, 05, 06, 08 |
 | [10](10-samba.md) | ✅ done | Native Samba: `smb://` as a file URL (scan, cache or stream, gapless) | 03, 04, 05, 06, 08, 09 |
+| [11](11-release-distribution.md) | ✅ done | GitHub Releases, curl-to-sh installer, Homebrew tap and Pages install site | — |
 
 ## Status line — read it before you touch a plan
 

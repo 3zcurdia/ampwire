@@ -64,6 +64,19 @@ fn parse_dump(args: &[String]) -> Result<Option<Dump>, String> {
     }))
 }
 
+/// Print the short help text and exit.
+fn print_help() {
+    println!(
+        "Usage: ampwire [OPTIONS] [PATH|smb://SERVER/SHARE ...]\n\
+\n\
+  --demo             run the mock player with the default layout\n\
+  --dump WxH         render one frame and exit\n\
+  --frame N          advance the mock clock N frames before --dump\n\
+  -V, --version      print the version and exit\n\
+  -h, --help         print this help and exit\n"
+    );
+}
+
 /// Render one frame into a `TestBackend` and print it as plain text. Never
 /// enters raw mode or the alternate screen.
 fn dump(dump: Dump) -> std::io::Result<()> {
@@ -109,6 +122,17 @@ fn load_inputs_from_args(args: &[String]) -> Result<Vec<smb::LoadInput>, String>
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // `--version`/`--help` must return before any session starts: no config
+    // read, no sound card, no raw mode, no TTY. (Plan 11, step 1.)
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ampwire {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
 
     match parse_dump(&args) {
         Ok(Some(dump_req)) => return dump(dump_req),
