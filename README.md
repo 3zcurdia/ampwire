@@ -279,8 +279,7 @@ src/
     widgets/         lcd_digits, marquee, spectrum, slider, eq_curve
 tests/fixtures/      0.5 s 44.1 kHz stereo tones (wav/flac/mp3/aac/alac) for decoder tests
 tests/golden/        --dump snapshots at 5 sizes
-docs/plans/          design plans (01-winamp-layout.md, 02-playlist-loading.md, …)
+.opencode/docs/features/          design plans (01-winamp-layout.md, 02-playlist-loading.md, …)
 ```
 
 Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; a Jellyfin load goes `j → jellyfin::spawn_library_load (thread) → JfMsg → App::tick → RemoveRemote (once) + AppendInOrder`, and remote playback goes `TrackSource::Remote → Cache window (downloader thread) → Load` or `→ EngineCmd::LoadRemote → HttpRangeSource`; an SMB load goes `smb:// → smb::spawn_smb_scan (thread) → ScanMsg → App::tick` for the playlist, and `TrackSource::Smb → SmbCache window (downloader thread) → Load` or `→ EngineCmd::LoadSmb → SmbFileSource`. Engine events come back over a channel polled from `App::tick` (notices land in the playlist border). `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
-

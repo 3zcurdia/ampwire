@@ -46,4 +46,4 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck -s sh docs/site/install.sh
+          shellcheck -s sh docs/install.sh

@@ -240,7 +240,7 @@ ask; the implementer instruction was to annotate instead):
    (`title: String` → tags + `display_name()`, `duration` → `Option<Duration>`)
    forced edits in the marquee, seek bar, compact title, and remaining-time
    code. Also touched: `AGENTS.md` (test count + boundaries, plans-README rule
-   10) and `docs/plans/README.md` (index status row), plus this status header.
+   10) and `.opencode/docs/features/README.md` (index status row), plus this status header.
 2. **`App::new_session()` added.** Plan step 8 says "in non-demo mode build the
    app with `MockPlayer::empty()`", but existing tests construct non-demo apps
    (`App::new(…, false)` / `with_config_path(…, false, …)`) and depend on the

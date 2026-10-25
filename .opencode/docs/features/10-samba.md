@@ -369,7 +369,7 @@ pub struct SmbSetup { pub cfg: SmbClientCfg } // credentials, engine-owned
 - `AGENTS.md`: boundaries line (`smb/` module), thread list, `TrackSource`
   + `QueueSource` + `EngineCmd` additions, `0600`/`0700` note extended to
   `ampwire-smb-<pid>`.
-- `docs/plans/README.md`: add plan 10 row; flip **Status** to ✅ done with date
+- `.opencode/docs/features/README.md`: add plan 10 row; flip **Status** to ✅ done with date
   + commit in the same commit that finishes it (plans-README rule).
 - Final gate (plans-README): `cargo fmt --check`, `cargo clippy
   --all-targets -- -D warnings`, `cargo test` green; goldens unchanged

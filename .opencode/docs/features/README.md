@@ -20,7 +20,6 @@ the earlier ones are merged.
 | [08](08-jellyfin.md) | ✅ done | Jellyfin server → playlist; temp-dir cache (3 ahead/3 behind) or HTTP streaming, optional EQ bypass | 03, 04, 05, 06 |
 | [09](09-gapless.md) | ✅ done | Gapless playback between same-format tracks; device/config cache | 03, 04, 05, 06, 08 |
 | [10](10-samba.md) | ✅ done | Native Samba: `smb://` as a file URL (scan, cache or stream, gapless) | 03, 04, 05, 06, 08, 09 |
-| [11](11-release-distribution.md) | ✅ done | GitHub Releases, curl-to-sh installer, Homebrew tap and Pages install site | — |
 
 ## Status line — read it before you touch a plan
 
@@ -48,7 +47,7 @@ in sync.
 
 1. **Read first**: the plan's own `**Status:**` line (if it says ✅ done or 🟨
    in progress, **stop** — the effort is already claimed), then `AGENTS.md`,
-   `docs/plans/01-winamp-layout.md` §1, and the
+   `.opencode/docs/features/01-winamp-layout.md` §1, and the
    source files named in the plan's "Files" section. Do not guess APIs: for each
    new crate run `cargo add <crate>`, then read its docs on docs.rs for the
    version Cargo resolved. ratatui/crossterm/symphonia/cpal APIs differ between

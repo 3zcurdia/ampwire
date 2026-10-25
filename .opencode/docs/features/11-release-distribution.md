@@ -58,7 +58,7 @@ Useful facts from the code:
 | Canonical command | Pages wrapper: `https://3zcurdia.github.io/ampwire/install.sh` | Short, shareable, and stable even when the release asset name changes. It delegates to the cargo-dist installer. |
 | Fallback command | `https://github.com/3zcurdia/ampwire/releases/latest/download/ampwire-installer.sh` | Works if Pages is unavailable; generated and checksum-aware. |
 | Homebrew | Tap `3zcurdia/homebrew-tap`, `publish-jobs = ["homebrew"]`, secret `HOMEBREW_TAP_TOKEN` | The only way `brew install …/ampwire` works. If the tap cannot be created, remove `homebrew` from `installers` rather than shipping a dead formula. |
-| Site location | Static HTML/CSS/JS in `docs/site/`, deployed as a Pages **artifact** | Keeps internal `docs/plans/` out of the published site and avoids adding a Node/Jekyll build. |
+| Site location | Static HTML/CSS/JS in `docs/`, deployed as a Pages **artifact** | Keeps internal `.opencode/docs/features/` out of the published site and avoids adding a Node/Jekyll build. |
 | Site URL | `https://3zcurdia.github.io/ampwire/` | GitHub Pages default. A custom domain (`ampwire.dev`, etc.) is an optional follow-up. |
 | Linux baseline | glibc ≥ 2.35 (`ubuntu-22.04` userland) and ALSA runtime (`libasound2`) | Matches the current build runners. Keep native runners for v1; see the follow-up about 2027 runner retirement. |
 | macOS signing | Not in v1 | Curl/Homebrew installs avoid quarantine. Document the browser-download caveat; revisit only if users hit Gatekeeper. |
@@ -74,10 +74,10 @@ Useful facts from the code:
 - `.github/workflows/ci.yml` — add a shellcheck step for the install wrapper.
 - `src/main.rs` — early `--version` / `--help` handling.
 - `tests/cli.rs` — non-TTY tests for both flags.
-- `docs/site/index.html`, `docs/site/install.html`, `docs/site/style.css`,
-  `docs/site/install.sh`, `docs/site/404.html`, `docs/site/.nojekyll`.
-- `scripts/preview-site.sh` — stage images and serve `docs/site` locally.
-- `README.md`, `AGENTS.md`, `docs/plans/README.md` — install docs, architecture
+- `docs/index.html`, `docs/install.html`, `docs/style.css`,
+  `docs/install.sh`, `docs/404.html`, `docs/.nojekyll`.
+- `scripts/preview-site.sh` — stage images and serve `docs` locally.
+- `README.md`, `AGENTS.md`, `.opencode/docs/features/README.md` — install docs, architecture
   and plan index.
 - `CHANGELOG.md` — release notes (recommended).
 - `docs/RELEASING.md` — the human release checklist.
@@ -94,7 +94,7 @@ Useful facts from the code:
    -f build_type=workflow`; this 409s if Pages is already enabled.)
 4. Decide the final URL. Default is
    `https://3zcurdia.github.io/ampwire/`. If a custom domain is chosen, add
-   `docs/site/CNAME` and the DNS records; update the install URL in the same
+   `docs/CNAME` and the DNS records; update the install URL in the same
    commit. Do not hardcode a custom domain until it resolves over HTTPS.
 5. Set the repository homepage after the first deploy:
 
@@ -282,7 +282,7 @@ GitHub prerelease and, with the default `publish-prereleases = false`, it does
 **not** overwrite the Homebrew formula. Fix any pipeline issues, delete the
 broken tag/release if needed, then repeat with `0.1.0` / `v0.1.0`.
 
-### 4. Write the short installer wrapper (`docs/site/install.sh`)
+### 4. Write the short installer wrapper (`docs/install.sh`)
 
 This is deliberately a thin wrapper around the cargo-dist installer; do not
 re-implement architecture detection or archive extraction.
@@ -342,12 +342,12 @@ Algorithm:
 Test:
 
 ```sh
-sh -n docs/site/install.sh
-shellcheck -s sh docs/site/install.sh
+sh -n docs/install.sh
+shellcheck -s sh docs/install.sh
 curl -fsSL http://localhost:8000/install.sh | sh -n
 ```
 
-Add `shellcheck -s sh docs/site/install.sh` to `.github/workflows/ci.yml` (the
+Add `shellcheck -s sh docs/install.sh` to `.github/workflows/ci.yml` (the
 Ubuntu runner has shellcheck; install it in the job if the image drops it).
 Also demonstrate the pinned form on the site, noting that the variable must be
 set on **`sh`**, not on `curl`:
@@ -357,7 +357,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install
   | AMPWIRE_VERSION=0.1.0 sh
 ```
 
-### 5. Build the website in `docs/site/`
+### 5. Build the website in `docs/`
 
 Static files only; no Node, Jekyll, external fonts, CDNs, analytics or cookies.
 Reuse the existing screenshots from `images/` (staged at deploy time; see step 6).
@@ -365,7 +365,7 @@ Reuse the existing screenshots from `images/` (staged at deploy time; see step 6
 Suggested structure:
 
 ```text
-docs/site/
+docs/
   index.html        hero, install commands, features, screenshots, next steps
   install.html      full guide: requirements, verify, upgrade, uninstall, troubleshooting
   style.css         dark retro/terminal look, responsive, prefers-reduced-motion
@@ -427,12 +427,12 @@ Local preview:
 scripts/preview-site.sh   # stages site + images in a temp dir, serves :8000
 ```
 
-The script should copy `docs/site` and `images/*.png` into a `mktemp` directory
+The script should copy `docs` and `images/*.png` into a `mktemp` directory
 (referencing `assets/images/…` from the HTML), serve it with
 `python3 -m http.server`, and clean up on exit. Do not write staged images into
 the working tree.
 
-### 6. Deploy Pages from `docs/site`
+### 6. Deploy Pages from `docs`
 
 Add `.github/workflows/pages.yml`:
 
@@ -443,7 +443,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "docs/site/**"
+      - "docs/**"
       - "images/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -467,12 +467,12 @@ jobs:
       - uses: actions/checkout@v6
       - name: Stage screenshots
         run: |
-          mkdir -p docs/site/assets/images
-          cp images/*.png docs/site/assets/images/
+          mkdir -p docs/assets/images
+          cp images/*.png docs/assets/images/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/site
+          path: docs
       - id: deployment
         uses: actions/deploy-pages@v4
 ```
@@ -484,7 +484,7 @@ curl -fsSI https://3zcurdia.github.io/ampwire/ | head
 curl -fsSL https://3zcurdia.github.io/ampwire/install.sh | sh -n
 ```
 
-This deploys an artifact from `docs/site`; it does **not** use GitHub's legacy
+This deploys an artifact from `docs`; it does **not** use GitHub's legacy
 "deploy from branch /docs" source. If legacy mode is required instead, move the
 site files to the `docs/` root and add a `_config.yml` with `exclude: [plans]`
 so the internal plans are not published.
@@ -513,7 +513,7 @@ README:
 AGENTS.md:
 
 - Record the distribution architecture: cargo-dist config, generated release
-  workflow, `docs/site` + Pages workflow, the `install.sh` wrapper.
+  workflow, `docs` + Pages workflow, the `install.sh` wrapper.
 - Add `--version`/`--help` to the entrypoint description and the release command
   (`dist plan`, `dist generate --mode ci --check`, `dist build
   --artifacts=global`) to the commands section.

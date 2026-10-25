@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-cp -R "$root/docs/site/." "$tmp/"
+cp -R "$root/docs/." "$tmp/"
 mkdir -p "$tmp/assets/images"
 cp "$root"/images/*.png "$tmp/assets/images/"
 
