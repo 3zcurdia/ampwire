@@ -1,5 +1,9 @@
 # Ampwire
 
+|![horizontal](images/horizontal.png)|![vertical](images/vertical.png)|
+|-|-|
+
+
 A terminal player **inspired by Winamp 2**, implemented from scratch for the terminal — with modern hi-fi playback.
 
 It borrows Winamp 2's anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look. It is *not* a port, clone or replica of Winamp: the UI, the playback engine and the library handling are all written for the terminal from scratch.
