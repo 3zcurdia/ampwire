@@ -141,6 +141,21 @@ pub enum TrackSource {
         item_id: crate::jellyfin::ItemId,
         container: Option<String>,
     },
+    /// One `smb://` URL (plan 10): canonical server/share/path, no
+    /// credentials — those live in `[smb]` config and reach the client
+    /// setup directly.
+    Smb {
+        url: crate::smb::SmbUrl,
+    },
+}
+
+/// The file-name stem of `path`, `?` when there is none (root, a trailing
+/// slash, a name without a stem). Shared by the local and the `smb://`
+/// branch of [`Track::display_name`], which read a path the same way.
+fn path_stem(path: &std::path::Path) -> &str {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("?")
 }
 
 /// One playlist entry.
@@ -170,32 +185,46 @@ impl Track {
         match (&self.artist, &self.title) {
             (Some(artist), Some(title)) => format!("{artist} - {title}"),
             _ => match &self.source {
-                TrackSource::Local(path) => path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("?")
-                    .to_string(),
+                TrackSource::Local(path) => path_stem(path).to_string(),
                 TrackSource::Remote { .. } => self.title.clone().unwrap_or_else(|| "?".into()),
+                // Same rule as a local file: the last segment of the path
+                // (the share root has no file name → `?`).
+                TrackSource::Smb { url } => path_stem(std::path::Path::new(&url.path)).to_string(),
             },
         }
     }
 
     /// Sort order: `artist - title` (lowercased) when both tags exist,
     /// otherwise the full path as a lowercased string. A remote row has no
-    /// path, so it sorts on the title (the server's `Name`).
+    /// path, so it sorts on the title (the server's `Name`); an SMB row
+    /// sorts on its canonical URL.
     pub fn sort_key(&self) -> String {
         match (&self.artist, &self.title) {
             (Some(artist), Some(title)) => format!("{artist} - {title}").to_lowercase(),
             _ => match &self.source {
                 TrackSource::Local(path) => path.to_string_lossy().to_lowercase(),
                 TrackSource::Remote { .. } => self.title.clone().unwrap_or_default().to_lowercase(),
+                TrackSource::Smb { url } => url.canonical().to_lowercase(),
             },
         }
     }
 
-    /// A Jellyfin server item (vs. a local file). Drives the cache window,
-    /// the `RemoveRemote` reload rule and the `stream_pure` EQ bypass.
+    /// Not a local file — Jellyfin *or* SMB (plan 10). Drives the
+    /// remote-only cache windows (one per source) and the "no path in the
+    /// row" rules.
     pub fn is_remote(&self) -> bool {
+        matches!(
+            self.source,
+            TrackSource::Remote { .. } | TrackSource::Smb { .. }
+        )
+    }
+
+    /// A Jellyfin item specifically: the rules that are Jellyfin's alone —
+    /// the `j` reload rule ([`RemoveRemote`][PlayerCommand::RemoveRemote]),
+    /// the Jellyfin download window and `stream_pure`'s EQ bypass — key off
+    /// this, never off [`is_remote`][Self::is_remote] (SMB tracks must not
+    /// be dropped, downloaded or EQ-bypassed by a Jellyfin action).
+    pub fn is_jellyfin(&self) -> bool {
         matches!(self.source, TrackSource::Remote { .. })
     }
 }
@@ -324,6 +353,88 @@ mod tests {
     #[test]
     fn ids_are_unique() {
         assert_ne!(Track::next_id(), Track::next_id());
+    }
+
+    // --- plan 10, step 2: `TrackSource::Smb` ---
+
+    /// An SMB row, built straight from its URL (no parser involved).
+    fn smb(path: &str, artist: Option<&str>, title: Option<&str>) -> Track {
+        Track {
+            id: Track::next_id(),
+            source: TrackSource::Smb {
+                url: crate::smb::SmbUrl {
+                    server: "NAS".into(),
+                    share: "Music".into(),
+                    path: path.into(),
+                },
+            },
+            artist: artist.map(str::to_string),
+            title: title.map(str::to_string),
+            duration: None,
+            bitrate_kbps: None,
+        }
+    }
+
+    /// A Jellyfin row (the other remote kind), for the predicate contrast.
+    fn jellyfin(id: &str) -> Track {
+        Track {
+            id: Track::next_id(),
+            source: TrackSource::Remote {
+                item_id: id.into(),
+                container: None,
+            },
+            artist: None,
+            title: Some(format!("title-{id}")),
+            duration: None,
+            bitrate_kbps: None,
+        }
+    }
+
+    /// Plan 10, step 2: an SMB row reads like a local one — tags first,
+    /// then the file-name stem of the URL path (`?` at the share root) —
+    /// and sorts on the canonical URL, lowercased.
+    #[test]
+    fn smb_rows_display_and_sort_like_local_files() {
+        // Tags first, exactly like any other row.
+        assert_eq!(
+            smb("Album/01.flac", Some("Aphex"), Some("Xtal")).display_name(),
+            "Aphex - Xtal"
+        );
+        // …then the stem of the path (title-only and artist-only too).
+        assert_eq!(
+            smb("Album/01 intro.flac", None, Some("Xtal")).display_name(),
+            "01 intro"
+        );
+        assert_eq!(
+            smb("Album/01 intro.flac", Some("Aphex"), None).display_name(),
+            "01 intro"
+        );
+        // The share root is a directory, not a file: `?`.
+        assert_eq!(smb("", None, None).display_name(), "?");
+
+        // Sorting: canonical URL, lowercased (the path keeps its case
+        // until the sort folds it, and the server is folded first).
+        assert_eq!(
+            smb("Album/01 Intro.flac", None, None).sort_key(),
+            "smb://nas/music/album/01 intro.flac"
+        );
+        assert_eq!(smb("", None, None).sort_key(), "smb://nas/music");
+    }
+
+    /// Plan 10, step 2: `is_remote()` covers both non-local sources (the
+    /// remote-only UI rules), while the three Jellyfin-specific rules stay
+    /// Jellyfin-only.
+    #[test]
+    fn smb_tracks_are_remote_but_not_jellyfin() {
+        let share = smb("a.flac", None, None);
+        assert!(share.is_remote(), "SMB is not a local file");
+        assert!(!share.is_jellyfin(), "…but it is not a Jellyfin item");
+
+        let server = jellyfin("abc");
+        assert!(server.is_remote() && server.is_jellyfin());
+
+        let disk = local("/m/a.flac", None, None);
+        assert!(!disk.is_remote() && !disk.is_jellyfin());
     }
 
     // --- format line (plan 05, step 3 + 7) ---

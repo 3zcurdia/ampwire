@@ -292,15 +292,17 @@ impl RealPlayer {
                 return;
             }
             PlayerCommand::RemoveRemote => {
-                // Reload rule (plan 08): drop the old remote batch; stop if
-                // one of them was playing (mirrors `RemoveTrack`).
+                // Reload rule (plan 08): drop the old *Jellyfin* batch;
+                // stop if one of them was playing (mirrors `RemoveTrack`).
+                // SMB tracks are remote too but stay: they were not loaded
+                // by `j` (plan 10, step 2).
                 let removed: Vec<bool> = self
                     .playlist
                     .tracks()
                     .iter()
-                    .map(Track::is_remote)
+                    .map(Track::is_jellyfin)
                     .collect();
-                let was_current = self.playlist.remove_where(|track| track.is_remote());
+                let was_current = self.playlist.remove_where(|track| track.is_jellyfin());
                 self.order
                     .removed(&removed, self.playlist.current(), &mut self.rng);
                 self.update_cache_window();
@@ -401,14 +403,15 @@ impl RealPlayer {
     }
 
     /// Whether `stream_pure` has the EQ bypassed *right now*: the mode is
-    /// `stream_pure` and the current track is a Jellyfin item.
+    /// `stream_pure` and the current track is a Jellyfin item (an SMB track
+    /// is remote but never bypassed — plan 10, step 2).
     fn eq_bypassed(&self) -> bool {
         matches!(self.jf_mode, Some(JellyfinMode::StreamPure))
             && self
                 .playlist
                 .current()
                 .and_then(|index| self.playlist.tracks().get(index))
-                .is_some_and(Track::is_remote)
+                .is_some_and(Track::is_jellyfin)
     }
 
     /// The EQ really shaping the samples right now — what the bit-perfect
@@ -741,10 +744,15 @@ impl RealPlayer {
         self.handle = None;
         self.pending_start = Some(start);
         self.pending_remote = None;
-        // `stream_pure` (plan §6): while a remote track plays, the EQ is
-        // bypassed on the audio side; the very next local load restores it.
+        // `stream_pure` (plan §6): while a *Jellyfin* remote track plays,
+        // the EQ is bypassed on the audio side; the very next load restores
+        // it. SMB tracks are remote too, but never bypassed (plan 10).
         let bypass = matches!(self.jf_mode, Some(JellyfinMode::StreamPure))
-            && self.playlist.tracks().get(i).is_some_and(Track::is_remote);
+            && self
+                .playlist
+                .tracks()
+                .get(i)
+                .is_some_and(Track::is_jellyfin);
         self.params.set_eq_bypass(bypass);
         let engine_load = match source {
             TrackSource::Local(path) => {
@@ -754,6 +762,7 @@ impl RealPlayer {
             TrackSource::Remote { item_id, container } => {
                 self.start_remote(&item_id, container.as_deref(), start, keep_paused)
             }
+            TrackSource::Smb { url } => self.start_smb(&url, start, keep_paused),
         };
         if engine_load {
             if keep_paused {
@@ -814,6 +823,22 @@ impl RealPlayer {
         }
     }
 
+    /// Start an SMB track (plan 10, steps 5–6): cache mode plays the local
+    /// file once the rolling window has downloaded it (else `buffering…`
+    /// and wait), stream mode hands the engine an `LoadSmb` command. Until
+    /// both land this stops with a fixed notice instead of pretending to
+    /// play — same shape as `start_remote` with no cache dir.
+    fn start_smb(
+        &mut self,
+        url: &crate::smb::SmbUrl,
+        _start: Duration,
+        _keep_paused: bool,
+    ) -> bool {
+        self.stop_playback();
+        self.notice = Some(format!("smb: {}", url.canonical()));
+        false
+    }
+
     /// Keep the engine's gapless queue in step with the play order (plan
     /// 09, step 5): the next track of `PlayOrder::upcoming(1)` is
     /// pre-opened right after every `Started` and every boundary crossing,
@@ -863,8 +888,14 @@ impl RealPlayer {
                     container: container.clone(),
                 },
             },
+            // Plan 10, steps 6–7: cache mode queues `Local(path_if_ready())`
+            // and stream mode queues `QueueSource::Smb`. Until both land,
+            // queue nothing — `refresh_queue` then sends `Unqueue`, which is
+            // exactly "no gapless pre-open", never a wrong one.
+            TrackSource::Smb { .. } => return None,
         };
-        let eq_bypass = matches!(self.jf_mode, Some(JellyfinMode::StreamPure)) && track.is_remote();
+        let eq_bypass =
+            matches!(self.jf_mode, Some(JellyfinMode::StreamPure)) && track.is_jellyfin();
         Some((source, eq_bypass))
     }
 

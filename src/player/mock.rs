@@ -261,8 +261,10 @@ impl MockPlayer {
             }
             PlayerCommand::RemoveRemote => {
                 // The mock playlist is all-local, but keep the semantics
-                // identical so app tests can observe the command (plan 08).
-                if self.playlist.remove_where(|track| track.is_remote()) {
+                // identical so app tests can observe the command (plan 08):
+                // only Jellyfin rows go (SMB rows are remote, not Jellyfin —
+                // plan 10, step 2).
+                if self.playlist.remove_where(|track| track.is_jellyfin()) {
                     self.state = PlayState::Stopped;
                     self.position = Duration::ZERO;
                 }

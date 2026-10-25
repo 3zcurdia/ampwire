@@ -124,10 +124,11 @@ impl SmbUrl {
     /// `smb://server/share/path`, lowercased server, and never a trailing
     /// `/` — including at the share root (`path.is_empty()`).
     pub fn canonical(&self) -> String {
+        let server = self.server.to_lowercase();
         if self.path.is_empty() {
-            format!("smb://{}/{}", self.server, self.share)
+            format!("smb://{server}/{}", self.share)
         } else {
-            format!("smb://{}/{}/{}", self.server, self.share, self.path)
+            format!("smb://{server}/{}/{}", self.share, self.path)
         }
     }
 }

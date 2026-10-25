@@ -50,6 +50,7 @@ impl RemoteRef {
                 item_id: item_id.clone(),
                 container: container.clone(),
             }),
+            TrackSource::Smb { .. } => None,
             TrackSource::Local(_) => None,
         }
     }
@@ -299,7 +300,9 @@ pub fn compute_window(
     let mut wanted: Vec<usize> = Vec::new();
 
     let mut take = |index: usize, wanted: &mut Vec<usize>| {
-        if seen.insert(index) && tracks.get(index).is_some_and(Track::is_remote) {
+        // Only *Jellyfin* tracks are downloadable: an SMB row in the same
+        // playlist has its own window (plan 10, step 2).
+        if seen.insert(index) && tracks.get(index).is_some_and(Track::is_jellyfin) {
             wanted.push(index);
         }
     };

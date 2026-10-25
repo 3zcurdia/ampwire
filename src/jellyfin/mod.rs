@@ -727,7 +727,7 @@ mod tests {
         fn remote_item_id(&self) -> Option<&str> {
             match &self.source {
                 TrackSource::Remote { item_id, .. } => Some(item_id.as_str()),
-                TrackSource::Local(_) => None,
+                TrackSource::Local(_) | TrackSource::Smb { .. } => None,
             }
         }
     }
