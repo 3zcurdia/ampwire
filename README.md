@@ -4,8 +4,6 @@ A terminal player **inspired by Winamp 2**, implemented from scratch for the ter
 
 It borrows Winamp 2's anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look. It is *not* a port, clone or replica of Winamp: the UI, the playback engine and the library handling are all written for the terminal from scratch.
 
-> Status: Phase 7 — **native SMB shares.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track — **gapless** between same-format tracks (plan 09), ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume (`+`/`-`/`↑↓`) and balance (`[`/`]`) shape what you hear and are remembered across restarts; at 100 % / centered the samples stay bit-perfect. The format line reads `FLAC 24/96 stereo` / `MP3 320kbps 44.1kHz stereo`. With a `[jellyfin]` section in the config, `j` fetches your **whole server library** into the playlist (progressively, while the UI stays responsive) and plays it — downloaded to a rolling temp-dir cache, or streamed over HTTP `Range` requests (`stream_pure` bypasses the EQ for that path). An **`smb://server/share/path`** URL (plan 10) is accepted everywhere a path is — CLI arguments and the `l` / `a` prompts, mixed with local paths on one command line — the share scans in the background like a folder, and its tracks play from a rolling temp-dir cache or straight off the share (`[smb] mode`), with the same seek, EQ, gapless and format line as a local file. `--demo` / `--dump` keep the mock player.
-
 ## Quickstart
 
 Requirements: Rust (managed via `mise`, see `mise.toml`), a real TTY, and — for audio output on Linux — the ALSA development headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch). macOS plays through CoreAudio with no extra setup.
@@ -150,7 +148,7 @@ cache_ahead = 3            # cache mode: remote tracks to prefetch ahead (0–10
 cache_behind = 3           # cache mode: …and to keep behind the current one
 # cache_dir = "/var/tmp"   # optional: parent of ampwire-jellyfin-<pid> (default: system temp dir)
 
-[smb]                      # optional: `smb://…` URLs anywhere a path works (plan 10)
+[smb]                      # optional: `smb://…` URLs anywhere a path works
 username = "luis"          # default "guest"; the URL always carries the server and share
 # password = "…"           # …or password_file, or AMPWIRE_SMB_PASSWORD (in that precedence)
 # password_file = "smb.pass"  # relative = next to config.toml; never written back
@@ -256,6 +254,3 @@ docs/plans/          design plans (01-winamp-layout.md, 02-playlist-loading.md, 
 
 Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; a Jellyfin load goes `j → jellyfin::spawn_library_load (thread) → JfMsg → App::tick → RemoveRemote (once) + AppendInOrder`, and remote playback goes `TrackSource::Remote → Cache window (downloader thread) → Load` or `→ EngineCmd::LoadRemote → HttpRangeSource`; an SMB load goes `smb:// → smb::spawn_smb_scan (thread) → ScanMsg → App::tick` for the playlist, and `TrackSource::Smb → SmbCache window (downloader thread) → Load` or `→ EngineCmd::LoadSmb → SmbFileSource`. Engine events come back over a channel polled from `App::tick` (notices land in the playlist border). `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
 
-## Roadmap
-
-Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05), 10-band equalizer + preamp that really shapes the sound (plan 06), EQ presets screen with live preview (plan 07), Jellyfin server → playlist with cache / stream / stream_pure modes (plan 08), gapless playback between same-format tracks + device/config cache (plan 09), native SMB shares as `smb://` URLs with a rolling cache window or positioned-read streaming (plan 10). Still out of scope: mouse, media keys / MPRIS / Now Playing.
