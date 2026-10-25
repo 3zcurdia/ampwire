@@ -1,6 +1,11 @@
 # Plan 10 — Native Samba: pass `smb://` anywhere a file path works
 
-**Status:** 🟨 in progress — opencode agent, since 2026-10-24.
+**Status:** ✅ done — 2026-10-25, 96da753. 457 tests pass (443 run, 14
+`#[ignore]`d: a visual dump, the two audio-device smokes, the real-server
+Jellyfin smoke and **ten real-Samba smokes**, all ten green here against
+`smb://hyperion.local` — including one end-to-end engine→device playback of
+a share file), goldens unchanged (the mock player is untouched), `cargo
+fmt --check` + `cargo clippy --all-targets -- -D warnings` green.
 
 Goal: `smb://server/share/path` works as a **file URL** — everywhere a local
 path works today, with no kernel mount:
@@ -176,7 +181,10 @@ What the spike produced (kept as the base for the later steps):
   decode. The five `tests/fixtures/*` files were uploaded to
   `//hyperion.local/shared/ampwire_spike/` with:
   `smbclient //hyperion.local/shared -N -c 'cd ampwire_spike; put tests/fixtures/tone.flac tone.flac; …'`
-  (that share is writable for guests; `datastore` is read-only).
+  (that share is writable for guests; `datastore` is read-only). They are
+  left there so the smokes stay runnable — remove them with
+  `smbclient //hyperion.local/shared -N -c 'cd ampwire_spike; del tone.flac; del tone.mp3; del tone.wav; del tone_aac.m4a; del tone_alac.m4a; rmdir ampwire_spike'`
+  when the plan is archived.
 - Numbers worth keeping: symphonia's `MediaSourceStream` read-ahead caps at
   **64 KiB** per read, so stream mode on this link tops out at ≈1.3 MiB/s —
   still ~2.3× the heaviest 24/96 FLAC (~0.6 MiB/s) — which is why
@@ -366,3 +374,103 @@ pub struct SmbSetup { pub cfg: SmbClientCfg } // credentials, engine-owned
 - Final gate (plans-README): `cargo fmt --check`, `cargo clippy
   --all-targets -- -D warnings`, `cargo test` green; goldens unchanged
   (mock player untouched).
+
+---
+
+## Deviations (annotated when the plan finished, 2026-10-25)
+
+All eight steps shipped; these are the places where the code diverges from —
+or extends — the literal text above. Decisions the owner was asked about are
+marked **(decided)**; everything else was taken to keep the plan's
+observable behaviour intact.
+
+1. **`[smb] server` / `share` do not exist (decided).** The config block
+   lists both as "default when the URL gives only share/path", but the URL
+   rule rejects an empty server or share, so they could never apply. The
+   owner chose strict URLs: `SmbConfig` carries `username`, `password`,
+   `password_file`, `domain`, `mode`, `cache_ahead/behind` and `cache_dir`
+   only, and the server always comes from the URL.
+2. **`SmbConfig::is_complete()` was dropped** — with `server`/`share` gone
+   there is nothing left for it to check. The plan's missing-section
+   behaviour survives as a *failure* hint instead: a connect that fails
+   while `config.smb.is_none()` reports `smb: add [smb] credentials to
+   config.toml` (otherwise the plain `smb: cannot connect`), so a working
+   guest share never has to configure anything.
+3. **`ScanMsg` gained a third variant, `Failed { reason }`.** The plan says
+   the walk "reuses `library::ScanMsg`" with `Progress`/`Done`, but a worker
+   that cannot even start (connect refused, root missing) needs to show one
+   fixed line, which `Done { tracks: [], … }` can only phrase as "no audio
+   files found". The local scan never sends it.
+4. **No `App::poll_smb` — one channel for both scanners.** Step 3 leaves the
+   concurrent-load design to the implementation ("run both threads, merge
+   `Done`s, or refuse with `already loading` — decide here, document here"):
+   `App::load_inputs` spawns the disk scanner *and* one `spawn_smb_scan`
+   thread per URL over a **single** `mpsc` channel, `App::poll_scan` keeps
+   the receiver until `scan_pending` reaches 0, the first non-empty `Done`
+   applies the load's mode and every later one appends (so a mixed
+   `ampwire ~/Music smb://nas/More` never loses a half), and *re-entrancy*
+   keeps the plan's simpler rule: a second load while any worker runs is
+   `already loading`. (Recorded in step 3 above too.)
+5. **`loading… <canonical>` is announced when the SMB load starts.** Step 3's
+   `Progress{found}` only fires every 50 files; at the measured tag-read
+   cost (≈0.7 s/file, see below) the UI would sit silent for half a minute
+   before the first notice. The URL is announced immediately and the
+   progress ticks overwrite it from there.
+6. **`lofty::read_from` takes a `std::fs::File`, not any `Read + Seek`.**
+   The research note was optimistic; the scan reads tags with
+   `lofty::probe::Probe::new(reader).guess_file_type()?.read()`, which does
+   accept any reader (over a 64 KiB `BufReader`). (Recorded in step 3.)
+7. **Guest logins retry spellings** (`""` → `/GUEST` → `guest` → `GUEST`).
+   The plan only says `username` defaults to `guest`, but Samba spells its
+   guest account differently per build — the `smb` crate's own tests use
+   `/GUEST`, and the real server used here accepts both at different times.
+   A *configured* account is never retried (one password, one attempt).
+8. **`RealPlayer::new` grew a second argument** (`jellyfin, smb`) and the
+   SMB cache directory is created **lazily on the first SMB track** instead
+   of in `new()`. Step 5 says "`cache` mode creates the window" at startup;
+   lazily means a session that never opens a share never creates a
+   directory. The stale-dir sweep still runs at startup in *every* mode, as
+   step 4 asks.
+9. **The plan-08 temp-dir helpers were parameterized, not copied.** Step 5
+   says "copy the `jellyfin/cache.rs` wire protocol"; the wire protocol and
+   the window logic were copied (with SMB identity), but `create_own_dir`,
+   `create_fresh_file`, `sweep_stale_dirs` and `size_label` now take the
+   directory *prefix* as an argument, so the audit-S4 logic (fresh `0700`
+   dir, never adopt an existing entry, `create_new` for `.part`) exists
+   once for both windows. SMB's prefix is `ampwire-smb-`.
+10. **`is_remote()` was split three ways.** The plan asks `is_remote()` to
+    become true for SMB so it drives "the cache window + any remote-only UI
+    rule" — but three of the rules it drove are Jellyfin's alone (the `j` /
+    `RemoveRemote` reload, `compute_window`, `stream_pure`'s EQ bypass).
+    Those moved to `is_jellyfin()`, `is_smb()` (`is_remote && !is_jellyfin`)
+    selects the SMB window, and `is_remote()` still covers Jellyfin + SMB.
+    Without this, pressing `j` would delete SMB rows and the Jellyfin
+    window would count SMB tracks it cannot download.
+11. **`SmbFileSource` reads through a `PositionedFile` trait** (production =
+    `smb::File`, tests = bytes in memory). That is step 6's "fake SMB
+    backend", and it means the two cursor-math tests drive the *real*
+    `Read`/`Seek` implementation instead of a copy of its arithmetic, and
+    the wav/flac/mp3/m4a decoder test needs no network. A live smoke pins
+    the other half: an open source outlives the `Client` that opened it.
+12. **Steps 6 and 7 were committed together** (`2eeff57`) — both landed
+    green and the engine/player files hold both halves; every other step has
+    its own commit.
+13. **`canonical()` never ends in `/`.** Step 1's "no trailing slash except
+    root" is read as: `path.is_empty()` → `smb://server/share`, which is
+    also the form the Quickstart documents as input, so
+    `parse(canonical(u)) == u` always holds (a key property for the cache
+    key). Percent-decoding happens per component *before* validation, so
+    `%2E%2E` is rejected as `..` too; `:` / `@` / `[` / `]` in the
+    authority are rejected as ports, credentials and IPv6 literals (the
+    plan lists credentials; the others follow from "server is host/IPv4").
+14. **README's status headline moved to "Phase 7 — native SMB shares"**,
+    following the existing convention (Phase 6 appeared when Jellyfin did).
+15. **Known gap kept open, as agreed while doing step 0**: only *guest*
+    login was verified against the real server — no user/password account
+    was available. The code path is the same `share_connect` call, but a
+    real-account smoke has not been run.
+16. **Not attempted (out of scope, unchanged):** SMB1, DFS (`dfs: false`, so
+    a DFS path errors instead of resolving), Kerberos/SSO, symlink following
+    (the walk skips reparse points), server-side transcoding, resampling,
+    and a parallel scan — one worker thread per URL, as the plan specifies,
+    even though tag reading is latency-bound.
