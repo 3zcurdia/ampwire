@@ -1892,8 +1892,10 @@ mod tests {
     /// Plan 10, step 6, end to end (real server + real device): the engine
     /// connects on its own thread, opens the seekable source, decodes it
     /// and plays it to the last sample. Skips without `AMPWIRE_SMB_TEST_*`
-    /// (the share) or without an output device.
+    /// (the share) or without an output device — and, like every other
+    /// device test, `#[ignore]`d so plain `cargo test` stays silent.
     #[test]
+    #[ignore = "streams an SMB file through the real output device"]
     fn engine_streams_an_smb_file_end_to_end() {
         let (Ok(server), Ok(share)) = (
             std::env::var("AMPWIRE_SMB_TEST_SERVER"),

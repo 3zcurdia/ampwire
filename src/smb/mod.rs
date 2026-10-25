@@ -485,14 +485,18 @@ pub(crate) mod smoke {
             let cfg = SmbClientCfg::new(&target.server, &user, &target.password);
             match cfg.connect_raw(&target.share) {
                 Ok(client) => {
-                    let shown = if user.is_empty() {
-                        "<anonymous>"
-                    } else {
-                        user.as_str()
-                    };
+                    // `connect_raw` retries the guest spellings itself, so
+                    // the requested user is not necessarily the one that
+                    // landed — the message only records that a login did.
                     eprintln!(
-                        "smb_spike: connected to //{}/{} as {shown}",
-                        target.server, target.share
+                        "smb_spike: connected to //{}/{} (as `{}`)",
+                        target.server,
+                        target.share,
+                        if user.is_empty() {
+                            "<anonymous>"
+                        } else {
+                            &user
+                        }
                     );
                     return Some((client, unc.clone()));
                 }

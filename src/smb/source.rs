@@ -497,7 +497,16 @@ mod tests {
         };
         let (client, unc) = session(&target).expect("connect");
         let file = unc.clone().with_add_path("tone.flac");
-        let source = SmbFileSource::open(&client, &file).expect("open");
+        let source = match SmbFileSource::open(&client, &file) {
+            Ok(source) => source,
+            Err(OpenError::NotFound) => {
+                return eprintln!(
+                    "smb_spike: no tone.flac under this path; point AMPWIRE_SMB_TEST_PATH at \
+                     the uploaded `tests/fixtures` files"
+                );
+            }
+            Err(error) => panic!("open: {error}"),
+        };
         drop(client); // the session must survive this
 
         let mut decoder =

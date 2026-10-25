@@ -4,7 +4,7 @@ A terminal player **inspired by Winamp 2**, implemented from scratch for the ter
 
 It borrows Winamp 2's anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look. It is *not* a port, clone or replica of Winamp: the UI, the playback engine and the library handling are all written for the terminal from scratch.
 
-> Status: Phase 6 — **Jellyfin.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track — **gapless** between same-format tracks (plan 09), ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume (`+`/`-`/`↑↓`) and balance (`[`/`]`) shape what you hear and are remembered across restarts; at 100 % / centered the samples stay bit-perfect. The format line reads `FLAC 24/96 stereo` / `MP3 320kbps 44.1kHz stereo`. With a `[jellyfin]` section in the config, `j` fetches your **whole server library** into the playlist (progressively, while the UI stays responsive) and plays it — downloaded to a rolling temp-dir cache, or streamed over HTTP `Range` requests (`stream_pure` bypasses the EQ for that path). `--demo` / `--dump` keep the mock player.
+> Status: Phase 7 — **native SMB shares.** Launch `ampwire ~/Music` (or press `l`) to load lossless/MP3 files with tags and actually hear them: play/pause/stop/next/prev, auto-advance at the end of a track — **gapless** between same-format tracks (plan 09), ordered or shuffled play order (`s`), repeat (`r`), and unreadable files skipped with a notice. The LCD clock, seek bar (`←`/`→`, ±5 s) and the 32-band FFT spectrum follow the audio that is really playing — pausing freezes them, stopping zeroes them. Volume (`+`/`-`/`↑↓`) and balance (`[`/`]`) shape what you hear and are remembered across restarts; at 100 % / centered the samples stay bit-perfect. The format line reads `FLAC 24/96 stereo` / `MP3 320kbps 44.1kHz stereo`. With a `[jellyfin]` section in the config, `j` fetches your **whole server library** into the playlist (progressively, while the UI stays responsive) and plays it — downloaded to a rolling temp-dir cache, or streamed over HTTP `Range` requests (`stream_pure` bypasses the EQ for that path). An **`smb://server/share/path`** URL (plan 10) is accepted everywhere a path is — CLI arguments and the `l` / `a` prompts, mixed with local paths on one command line — the share scans in the background like a folder, and its tracks play from a rolling temp-dir cache or straight off the share (`[smb] mode`), with the same seek, EQ, gapless and format line as a local file. `--demo` / `--dump` keep the mock player.
 
 ## Quickstart
 
@@ -12,6 +12,7 @@ Requirements: Rust (managed via `mise`, see `mise.toml`), a real TTY, and — fo
 
 ```sh
 cargo run -- ~/Music   # load a real playlist (files or folders) and start playing
+cargo run -- smb://nas/Music   # an SMB share URL works anywhere a path does (no mount)
 cargo run              # start empty: press `l` to open a file or folder
 cargo run -- --demo    # mock playlist + default layout, ignores your config
 cargo run -- --dump 104x18 # render one frame to stdout, no TUI (for tests / preview)
@@ -28,7 +29,7 @@ cargo run -- --dump 104x18 --frame 10  # advance mock clock N frames before dump
 | **macOS** | ✅ works | Audio via CoreAudio, no extra setup. |
 | **Windows** | ⚠️ **untested** | The code has never been built or run on Windows, so it may not even compile there. Treat it as unsupported for now. |
 
-Only Linux and macOS are supported today. Windows is **not tested** — the project has never been built or run there, so it may not even compile, and the audio path is unverified. If you try it, expect to have to fix: the cpal/WASAPI output device (the device + `supported_output_configs()` cache and the exact-rate matching are written for the ALSA/CoreAudio backends), the device names in error notices, and the playback rule itself — Windows shared-mode devices usually expose only a couple of sample rates (44.1/48 kHz), and ampwire never resamples, so anything else is reported as unplayable. The POSIX-specific bits (config file mode `0600`, Jellyfin cache dir mode `0700`) are `cfg(unix)`-guarded, so they compile everywhere but are a no-op off unix.
+Only Linux and macOS are supported today. Windows is **not tested** — the project has never been built or run there, so it may not even compile, and the audio path is unverified. If you try it, expect to have to fix: the cpal/WASAPI output device (the device + `supported_output_configs()` cache and the exact-rate matching are written for the ALSA/CoreAudio backends), the device names in error notices, and the playback rule itself — Windows shared-mode devices usually expose only a couple of sample rates (44.1/48 kHz), and ampwire never resamples, so anything else is reported as unplayable. The POSIX-specific bits (config file mode `0600`, Jellyfin and SMB cache dir mode `0700`) are `cfg(unix)`-guarded, so they compile everywhere but are a no-op off unix.
 
 ## Playback
 
@@ -45,6 +46,10 @@ Only Linux and macOS are supported today. Windows is **not tested** — the proj
   - **`stream`** — the original file streams over HTTP `Range` requests (seekable, nothing stored). **The EQ works while streaming**: it is local DSP on the decoded samples, it doesn't care where the bytes came from. The engine's ring buffer doubles to ≈2 s to survive network hiccups.
   - **`stream_pure`** — the same streaming, but the **EQ is bypassed** while a Jellyfin track plays (`stream pure: eq bypassed`, once per session), so the only thing between the server's bytes and the speakers is the decoder (plus volume/balance if you moved them). The EQ panel is untouched and applies again on local tracks.
   - A read stall in `stream*` can block Stop/Next for up to the 15 s read timeout — **use cache mode on slow links**. Never transcoding: ampwire always asks for the original file (`static=true`) and decodes locally.
+- SMB (plan 10): `smb://server/share/path` — a **native SMB2/3 client** (pure Rust, no `libsmbclient`, no kernel mount) — is accepted as a load anywhere a path is: `ampwire ~/Music smb://nas/More-Music`, or the same URL typed into `l` / `a`. A directory URL scans recursively into the playlist (tags read over the wire, progress every 50 files); a single-file URL loads that one track; a non-audio URL is `skipped`, and a missing one reports `not found: smb://…`. Credentials come from `[smb]` only — never from the URL — and the share plays in one of two `mode`s:
+  - **`cache` (default)** — originals are downloaded into a rolling `ampwire-smb-<pid>` window of **3 tracks ahead and 3 behind** in *play* order (shuffle respected) and played from disk: seek, EQ and the spectrum all work unchanged. Each file lands as `<hash>.part` and is renamed only when complete (a `.part` is never decoded).
+  - **`stream`** — the original file is read through positioned SMB reads (seekable, nothing stored, EQ works), with the engine's ring doubled to ≈2 s. Gapless pre-opens the next track too: the cached file in `cache` mode, the URL itself in `stream` mode.
+  - SMB1, DFS, Kerberos and symlinks are out of scope; the original bytes are always decoded locally (never transcoded, never resampled).
 
 ## Layout
 
@@ -145,6 +150,16 @@ cache_ahead = 3            # cache mode: remote tracks to prefetch ahead (0–10
 cache_behind = 3           # cache mode: …and to keep behind the current one
 # cache_dir = "/var/tmp"   # optional: parent of ampwire-jellyfin-<pid> (default: system temp dir)
 
+[smb]                      # optional: `smb://…` URLs anywhere a path works (plan 10)
+username = "luis"          # default "guest"; the URL always carries the server and share
+# password = "…"           # …or password_file, or AMPWIRE_SMB_PASSWORD (in that precedence)
+# password_file = "smb.pass"  # relative = next to config.toml; never written back
+# domain = "WORKGROUP"     # optional NTLM domain
+mode = "cache"             # "cache" (download to a rolling window) | "stream" (positioned SMB reads)
+cache_ahead = 3            # cache mode: SMB tracks to prefetch ahead (0–10)
+cache_behind = 3           # cache mode: …and to keep behind the current one
+# cache_dir = "/var/tmp"   # optional: parent of ampwire-smb-<pid> (default: system temp dir)
+
 [keys]
 next = ["n"]
 ```
@@ -153,8 +168,9 @@ next = ["n"]
 - Saves use `toml_edit` (comments and formatting survive), written atomically via temp-file + rename.
 - Volume/balance/EQ changes are saved 500 ms after the last keypress (and on quit); layout hotkeys save immediately.
 - If the on-disk config failed to parse, the session is read-only: layout hotkeys still work in memory but nothing is written back (`config invalid — not saving`).
-- `Config::save` never touches `[jellyfin]` (the key is yours), and the section is never printed — its `Debug` output shows `api_key: "<redacted>"`, and the key only ever travels as the `Authorization` header. **Recommend `chmod 600 config.toml`** — the file holds your API key; saves keep the file's permissions. To keep the key out of the auto-saved file entirely, use `api_key_file` or `AMPWIRE_JELLYFIN_API_KEY` (neither is ever written back). A config parse error is reported as `line N, column M: <message>` — never the offending line itself. An unknown `mode` falls back to `cache` with a notice instead of failing the config.
+- `Config::save` never touches `[jellyfin]` or `[smb]` (those secrets are yours), and neither section is printed — their `Debug` output shows `api_key: "<redacted>"` and `password: "<redacted>"`, the key only ever travels as the `Authorization` header, and the SMB password only to the login call. **Recommend `chmod 600 config.toml`** — the file holds your API key and share password; saves keep the file's permissions. To keep a secret out of the auto-saved file entirely, use `api_key_file` / `password_file` or `AMPWIRE_JELLYFIN_API_KEY` / `AMPWIRE_SMB_PASSWORD` (none is ever written back). A config parse error is reported as `line N, column M: <message>` — never the offending line itself. An unknown `mode` (either section) falls back to `cache` with a notice instead of failing the config.
 - Jellyfin cache location & cleanup: `cache` mode downloads into `ampwire-jellyfin-<pid>/` (mode `0700`) under the system temp dir — or under `cache_dir` if you set it. The directory is always freshly created by Ampwire (anything already at that name — a leftover or a planted symlink — is removed first, never reused). In `stream*` modes the same directory is created only if a server ignores `Range` and a track has to be downloaded; that download runs in the background (Stop/Next/quit never wait for it). On exit the directory is deleted; leftovers older than 24 h from crashed runs are swept at the next startup in every mode, and the OS also cleans its temp dir. Server item ids are validated (letters, digits, `-`, `_`), so a server cannot steer a file name. Downloads land in `<item>.part` and are renamed only when complete — a `.part` file is never decoded. The window holds at most `1 + cache_ahead + cache_behind` remote files (each capped at 512 MiB).
+- SMB cache location & cleanup: `cache` mode downloads into `ampwire-smb-<pid>/` (mode `0700`) under the system temp dir — or under `cache_dir` — with the same freshly-created, never-reused, never-followed-symlink rules, the same `<hash>.part` → rename, the same 512 MiB per-file cap and the same 24 h startup sweep (its own prefix, so it never touches the Jellyfin window). The directory is created on the **first SMB track**, so a session that never opens a share never creates one. Files are named after a hash of the canonical URL, never after server/share text. With no `[smb]` section at all, every URL connects as **guest** — and a failed connect then points you at `smb: add [smb] credentials to config.toml`.
 
 ## Theming
 
@@ -183,6 +199,7 @@ Notes:
 - `crossterm` is imported as `ratatui::crossterm` — no direct dependency.
 - `Cargo.lock` is committed (binary crate).
 - Audio on Linux builds against ALSA (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS needs nothing. **Windows is untested** — the suite has never been run there and the WASAPI path is unverified, so treat Windows as unsupported (see [Platform support](#platform-support)). `cargo test` never opens a sound card — the end-to-end device test is `#[ignore]`d: `cargo test -- --ignored` (it plays an audible tone). Plain `cargo test` also stays off the network (its "HTTP server" is a `TcpListener` on `127.0.0.1:0`).
+- The SMB path has its own `#[ignore]`d real-server smokes (they need a live Samba share, so plain `cargo test` never touches the network): walk + tags, positioned reads and `Seek(End)`, a 30 s streaming read, decoding the fixtures through the source, downloading a file into the cache window, and one end-to-end engine→device playback. Point them at a share with `AMPWIRE_SMB_TEST_SERVER=… AMPWIRE_SMB_TEST_SHARE=… AMPWIRE_SMB_TEST_PATH=…` (a directory for the walk tests, a file for the playback one) and run `cargo test smb_spike -- --ignored --nocapture`.
 - The Jellyfin path has its own scripted "manual" test against a **real** server — it downloads a cache window, streams + decodes over `Range`, and plays one remote track through the engine (audible for a moment): `AMWIRE_JELLYFIN_URL=… AMWIRE_JELLYFIN_API_KEY=… cargo test -- --ignored jellyfin_real_server`.
 - Silent playback on a device? `cargo run --example devices` lists every output device with the channel counts and sample rates it advertises — ampwire plays a track only at an *exact* match on the default device (no resampling, no fallback), so a `no playable tracks: <device>: cannot play 96000 Hz 2ch` notice means the file's rate isn't in that list.
 
@@ -208,6 +225,11 @@ src/
     cache.rs         rolling temp-dir window: downloader thread, evict, compute_window, sweep
     http_source.rs   seekable HTTP Range MediaSource (+ whole-file fallback for non-range servers)
     test_server.rs   #[cfg(test)] mock Jellyfin: real HTTP + Range over tests/fixtures/tone.flac
+  smb/
+    mod.rs           smb:// URL parse + LoadInput, SmbClientCfg (redacted Debug), SmbSetup
+    scan.rs          share walk on a worker thread: ShareFs trait (crate | in-memory fake), tags via library::tag_fields
+    cache.rs         rolling window for `mode = "cache"`: downloader thread, <hash>.part → rename, evict, sweep
+    source.rs        SmbFileSource: positioned reads → Read + Seek + MediaSource (+ fixed OpenError lines)
   player/
     mod.rs           PlayerSnapshot view model + PlayerCommand + Track + FormatInfo
     eq_presets.rs    10 named EQ presets (preamp + 10 gains) + find_matching
@@ -232,8 +254,8 @@ tests/golden/        --dump snapshots at 5 sizes
 docs/plans/          design plans (01-winamp-layout.md, 02-playlist-loading.md, …)
 ```
 
-Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; a Jellyfin load goes `j → jellyfin::spawn_library_load (thread) → JfMsg → App::tick → RemoveRemote (once) + AppendInOrder`, and remote playback goes `TrackSource::Remote → Cache window (downloader thread) → Load` or `→ EngineCmd::LoadRemote → HttpRangeSource`. Engine events come back over a channel polled from `App::tick` (notices land in the playlist border). `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
+Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; a Jellyfin load goes `j → jellyfin::spawn_library_load (thread) → JfMsg → App::tick → RemoveRemote (once) + AppendInOrder`, and remote playback goes `TrackSource::Remote → Cache window (downloader thread) → Load` or `→ EngineCmd::LoadRemote → HttpRangeSource`; an SMB load goes `smb:// → smb::spawn_smb_scan (thread) → ScanMsg → App::tick` for the playlist, and `TrackSource::Smb → SmbCache window (downloader thread) → Load` or `→ EngineCmd::LoadSmb → SmbFileSource`. Engine events come back over a channel polled from `App::tick` (notices land in the playlist border). `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
 
 ## Roadmap
 
-Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05), 10-band equalizer + preamp that really shapes the sound (plan 06), EQ presets screen with live preview (plan 07), Jellyfin server → playlist with cache / stream / stream_pure modes (plan 08), gapless playback between same-format tracks + device/config cache (plan 09). Still out of scope: mouse, media keys / MPRIS / Now Playing.
+Done: playlist loading + editing (plan 02), real playback with ordered/shuffle play order (plan 03), live clock/seeking/FFT spectrum synced to the audio (plan 04), volume/balance DSP + per-codec format line (plan 05), 10-band equalizer + preamp that really shapes the sound (plan 06), EQ presets screen with live preview (plan 07), Jellyfin server → playlist with cache / stream / stream_pure modes (plan 08), gapless playback between same-format tracks + device/config cache (plan 09), native SMB shares as `smb://` URLs with a rolling cache window or positioned-read streaming (plan 10). Still out of scope: mouse, media keys / MPRIS / Now Playing.
