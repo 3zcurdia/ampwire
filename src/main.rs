@@ -94,6 +94,19 @@ fn dump(dump: Dump) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Positional args → load inputs: everything that does not start with
+/// `--`, each parsed as a local path or an `smb://` URL. Mixing the two on
+/// one command line is allowed (plan 10, "Where URLs are accepted"); a
+/// malformed `smb://` is a usage error, reported by `main` as
+/// `ampwire: …` + exit 2 (the same path as a bad `--dump`).
+fn load_inputs_from_args(args: &[String]) -> Result<Vec<smb::LoadInput>, String> {
+    args.iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with("--"))
+        .map(|arg| smb::parse_load_input(arg))
+        .collect()
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -108,14 +121,17 @@ fn main() -> std::io::Result<()> {
 
     let demo = args.iter().any(|arg| arg == "--demo");
 
-    // Positional args are load paths (`ampwire ~/Music`), but only outside
-    // `--dump` (which returns above) — every arg not starting with `--`.
-    let paths: Vec<std::path::PathBuf> = args
-        .iter()
-        .skip(1)
-        .filter(|a| !a.starts_with("--"))
-        .map(std::path::PathBuf::from)
-        .collect();
+    // Positional args are load inputs (`ampwire ~/Music smb://nas/More`),
+    // but only outside `--dump` (which returns above) — every arg not
+    // starting with `--`. A malformed `smb://` is a fatal CLI error, same
+    // as a bad `--dump` (plan 10, step 1).
+    let inputs: Vec<smb::LoadInput> = match load_inputs_from_args(&args) {
+        Ok(inputs) => inputs,
+        Err(msg) => {
+            eprintln!("ampwire: {msg}");
+            std::process::exit(2);
+        }
+    };
 
     let loaded = Config::load();
     let mut config = loaded.config;
@@ -148,10 +164,10 @@ fn main() -> std::io::Result<()> {
     if demo {
         app.ui.notice = Some("demo mode: mock player, default layout".into());
     }
-    // CLI paths behave like Open: replace the playlist and start at track 1.
+    // CLI args behave like Open: replace the playlist and start at track 1.
     // `--demo` keeps the fake playlist untouched.
-    if !demo && !paths.is_empty() {
-        app.load_paths(paths, ScanMode::Replace);
+    if !demo && !inputs.is_empty() {
+        app.load_inputs(inputs, ScanMode::Replace);
     }
 
     ratatui::run(|terminal| app.run(terminal))
@@ -186,5 +202,64 @@ fn resolve_theme(config: &Config) -> Theme {
             App::apply_theme_overrides(&mut theme, config);
             theme
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::smb::{LoadInput, SmbUrl};
+
+    /// `["ampwire", …]` → the args a real invocation would have.
+    fn args(list: &[&str]) -> Vec<String> {
+        std::iter::once("ampwire")
+            .chain(list.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Plan 10, step 1: local and `smb://` positionals may be mixed on one
+    /// command line, and flags are never inputs.
+    #[test]
+    fn cli_args_route_local_and_smb_inputs_mixed() {
+        let parsed = load_inputs_from_args(&args(&[
+            "~/Music",
+            "--demo",
+            "smb://nas/More-Music",
+            "./local album",
+        ]))
+        .expect("all valid");
+        assert_eq!(
+            parsed,
+            vec![
+                LoadInput::Local(std::path::PathBuf::from("~/Music")),
+                LoadInput::Smb(SmbUrl {
+                    server: "nas".into(),
+                    share: "More-Music".into(),
+                    path: String::new(),
+                }),
+                LoadInput::Local(std::path::PathBuf::from("./local album")),
+            ]
+        );
+        assert!(
+            load_inputs_from_args(&args(&[]))
+                .expect("no args")
+                .is_empty()
+        );
+    }
+
+    /// A malformed `smb://` stops the run with the fixed line — the same
+    /// shape as a bad `--dump`.
+    #[test]
+    fn a_malformed_smb_url_is_a_usage_error() {
+        let error = load_inputs_from_args(&args(&["smb://nas"])).expect_err("no share");
+        assert!(
+            error.starts_with("smb: "),
+            "the CLI message is the parse error: {error}"
+        );
+        // …and the local args before it never mask it.
+        let error = load_inputs_from_args(&args(&["/music", "smb://luis:pw@nas/x"]))
+            .expect_err("credentials are rejected");
+        assert!(!error.contains("pw"), "no password echoed: {error}");
     }
 }

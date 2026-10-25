@@ -14,6 +14,7 @@ use crate::library::ScanMsg;
 use crate::player::mock::MockPlayer;
 use crate::player::real::RealPlayer;
 use crate::player::{PlayerCommand, PlayerSnapshot, Track};
+use crate::smb::LoadInput;
 use crate::ui;
 use crate::ui::layout::{LayoutPrefs, Panel, PlaylistSide, Visibility, compute_layout};
 use crate::ui::theme::omarchy::OmarchyWatch;
@@ -700,24 +701,33 @@ impl App {
         self.ui.playlist_scroll = 0;
     }
 
-    /// A submitted `l` / `a` prompt: expand `~`, check the path exists,
-    /// then kick off the scan (replace or append).
+    /// A submitted `l` / `a` prompt (plan 02, step 7 + plan 10, step 1):
+    /// text carrying an `smb://` scheme goes straight to the loader — no
+    /// `~` expansion and no `exists()` gate, because a share is not a path
+    /// here. Everything else (including a URL that does not *parse*) takes
+    /// the local route: expand `~`, the path must exist, then scan
+    /// replace/append — which is why a broken URL still reports
+    /// `not found: smb://…`.
     fn submit_prompt(&mut self, prompt: Prompt) {
         match prompt.kind {
             // Enter in Find keeps the filter and just closed the prompt.
             PromptKind::Find => {}
             PromptKind::Open | PromptKind::Add => {
-                let path = expand_tilde(&prompt.text);
-                if !path.exists() {
-                    self.ui.notice = Some(format!("not found: {}", path.display()));
-                    return;
-                }
                 let mode = if prompt.kind == PromptKind::Open {
                     ScanMode::Replace
                 } else {
                     ScanMode::Append
                 };
-                self.load_paths(vec![path], mode);
+                if let Ok(LoadInput::Smb(url)) = crate::smb::parse_load_input(&prompt.text) {
+                    self.load_inputs(vec![LoadInput::Smb(url)], mode);
+                    return;
+                }
+                let path = expand_tilde(&prompt.text);
+                if !path.exists() {
+                    self.ui.notice = Some(format!("not found: {}", path.display()));
+                    return;
+                }
+                self.load_inputs(vec![LoadInput::Local(path)], mode);
             }
         }
     }
@@ -765,20 +775,47 @@ impl App {
         }
     }
 
-    /// Kick off a background scan of `paths` (plan 02, step 8). Refuses when
-    /// one is already running; the results land via [`App::poll_scan`].
-    pub fn load_paths(&mut self, paths: Vec<std::path::PathBuf>, mode: ScanMode) {
-        if paths.is_empty() {
+    /// Kick off a background load of `inputs` (plan 02, step 8; plan 10,
+    /// step 1): local paths go to the disk scanner, `smb://` URLs to the
+    /// share scanner. Mixed lists are allowed; refuses (with a notice) when
+    /// a scan is already running. Results land via [`App::poll_scan`].
+    pub fn load_inputs(&mut self, inputs: Vec<LoadInput>, mode: ScanMode) {
+        if inputs.is_empty() {
             return;
         }
         if self.scan_rx.is_some() {
             self.ui.notice = Some("already loading".into());
             return;
         }
+        let mut paths = Vec::new();
+        let mut urls = Vec::new();
+        for input in inputs {
+            match input {
+                LoadInput::Local(path) => paths.push(path),
+                LoadInput::Smb(url) => urls.push(url),
+            }
+        }
+        // Plan 10, step 3 spawns `smb::scan::spawn_smb_scan` here (and
+        // decides how a mixed local+SMB load merges its results); until
+        // then only the local half is scanned.
+        if let Some(url) = urls.first() {
+            self.ui.notice = Some(format!("smb: {}", url.canonical()));
+        }
+        if paths.is_empty() {
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         crate::library::spawn_scan(paths, tx);
         self.scan_rx = Some(rx);
         self.scan_mode = mode;
+    }
+
+    /// [`load_inputs`][Self::load_inputs] for local paths only — the plan
+    /// 02 callers and their tests. The CLI builds `Vec<LoadInput>` itself
+    /// (plan 10, step 1), so nothing outside the tests uses this.
+    #[cfg(test)]
+    pub fn load_paths(&mut self, paths: Vec<std::path::PathBuf>, mode: ScanMode) {
+        self.load_inputs(paths.into_iter().map(LoadInput::Local).collect(), mode)
     }
 
     /// Drain pending scan messages. `Done` applies the tracks according to
@@ -1751,6 +1788,79 @@ mod tests {
             "notice reports the path that failed"
         );
         assert_eq!(app.snapshot().tracks.len(), 24, "playlist untouched");
+    }
+
+    /// Plan 10, step 1: a URL that does not parse falls through to the
+    /// local path branch, so the user sees the usual `not found: …`.
+    #[test]
+    fn enter_on_a_malformed_smb_url_notices_not_found() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::Add);
+        for c in "smb://nas".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.ui.prompt.is_none());
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("not found: smb://nas"),
+            "an unparseable URL takes the local route"
+        );
+        assert_eq!(app.snapshot().tracks.len(), 24, "playlist untouched");
+    }
+
+    /// Plan 10, step 1: a *valid* `smb://` never reaches `expand_tilde` or
+    /// `exists()` — there is no local file to find — so the notice is
+    /// anything but `not found: …`.
+    #[test]
+    fn a_valid_smb_url_skips_the_exists_gate() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::Open);
+        for c in "smb://nas/Music".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.ui.prompt.is_none());
+        assert_ne!(
+            app.ui.notice.as_deref(),
+            Some("not found: smb://nas/Music"),
+            "a URL is never checked with Path::exists"
+        );
+        assert_eq!(app.snapshot().tracks.len(), 24, "playlist untouched");
+    }
+
+    /// Plan 10, step 1: a mixed `Vec<LoadInput>` keeps the local half (the
+    /// SMB half is scanned by step 3) and refuses a second load while a
+    /// scan runs, exactly like two local paths.
+    #[test]
+    fn mixed_loads_take_the_local_half_and_still_refuse_concurrently() {
+        let (mut app, dir) = test_app();
+        let music = dir.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("a.mp3"), b"").unwrap();
+
+        let url = match crate::smb::parse_load_input("smb://nas/More").expect("url") {
+            LoadInput::Smb(url) => url,
+            LoadInput::Local(_) => panic!("parsed as a path"),
+        };
+        app.load_inputs(
+            vec![
+                LoadInput::Local(music.clone()),
+                LoadInput::Smb(url),
+                LoadInput::Local(music),
+            ],
+            ScanMode::Replace,
+        );
+        // The scan is running → a second load is refused with the usual line.
+        app.load_inputs(
+            vec![LoadInput::Local(dir.path().to_path_buf())],
+            ScanMode::Append,
+        );
+        assert_eq!(
+            app.ui.notice.as_deref(),
+            Some("already loading"),
+            "the running scan wins over the notice"
+        );
     }
 
     #[test]

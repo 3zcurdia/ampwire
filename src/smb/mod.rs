@@ -14,9 +14,175 @@
 pub mod source;
 
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use smb::{Client, ClientConfig, ConnectionConfig, UncPath};
+
+// --- URL form (plan 10, "URL form" row and step 1) -------------------------
+
+/// `smb: URL must look like smb://server/share/path`
+const SMB_FORM: &str = "smb: URL must look like smb://server/share/path";
+/// `smb: credentials are not allowed in the URL (set [smb] in config.toml)`
+const SMB_CREDENTIALS: &str =
+    "smb: credentials are not allowed in the URL (set [smb] in config.toml)";
+/// `smb: `..` is not allowed in the path`
+const SMB_DOTS: &str = "smb: `..` is not allowed in the path";
+/// `smb: only a host name or IPv4 address works (no port, no user:pass)`
+const SMB_AUTHORITY: &str = "smb: only a host name or IPv4 address works (no port, no user:pass)";
+/// `smb: invalid character in the URL`
+const SMB_CHARS: &str = "smb: invalid character in the URL";
+/// `smb: invalid percent-encoding in the URL`
+const SMB_PERCENT: &str = "smb: invalid percent-encoding in the URL";
+
+/// A parsed `smb://server/share/path`: the identity of one remote file or
+/// directory, kept as split fields (never the raw string) so equality,
+/// [`canonical`][Self::canonical] and the cache key are exact.
+///
+/// Credentials never appear here — they come from `[smb]` in `config.toml`
+/// (plan 10 "URL form" and "Auth" rows).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SmbUrl {
+    /// Lowercased at parse time (a host name is case-insensitive; the share
+    /// and path keep their case).
+    pub server: String,
+    /// One share name, never empty.
+    pub share: String,
+    /// `""` = the share root, else `a/b/track.flac` — no leading or
+    /// trailing `/`, no `.` or `..` segments.
+    pub path: String,
+}
+
+impl SmbUrl {
+    /// Parse a whole `smb://…` URL: case-insensitive scheme, mandatory
+    /// share, percent-decoding, and no `..`, no credentials, no port.
+    pub fn parse(text: &str) -> Result<SmbUrl, String> {
+        let trimmed = text.trim();
+        // `smb:` (any case) marks the scheme; the first four bytes are the
+        // ASCII `smb:`, so slicing at 4 is always on a char boundary.
+        let head = trimmed.get(..4).ok_or_else(|| SMB_FORM.to_string())?;
+        if !head.eq_ignore_ascii_case("smb:") {
+            return Err(SMB_FORM.to_string());
+        }
+        let rest = &trimmed[4..];
+        let rest = rest
+            .strip_prefix("//")
+            .ok_or_else(|| SMB_FORM.to_string())?;
+
+        // authority = up to the first `/`; the rest is `share[/path…]`.
+        let (authority, tail) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+        let server = percent_decode(authority)?;
+        if server.is_empty() {
+            return Err(SMB_FORM.to_string());
+        }
+        if server.contains('@') {
+            return Err(SMB_CREDENTIALS.to_string());
+        }
+        if server.contains([':', '[', ']']) {
+            return Err(SMB_AUTHORITY.to_string());
+        }
+        if server.contains(['/', '\\']) {
+            return Err(SMB_CHARS.to_string());
+        }
+
+        let (share_raw, path_raw) = match tail.find('/') {
+            Some(i) => (&tail[..i], &tail[i + 1..]),
+            None => (tail, ""),
+        };
+        let share = percent_decode(share_raw)?;
+        // The share is exactly one path component.
+        if share.is_empty() || share.contains(['/', '\\']) {
+            return Err(SMB_FORM.to_string());
+        }
+
+        let path_raw = percent_decode(path_raw)?;
+        let mut segments: Vec<&str> = Vec::new();
+        for segment in path_raw.split('/') {
+            match segment {
+                // Empty segments (`a//b`, a trailing `/`) and `.` are
+                // dropped; `..` is a traversal attempt, never normalized.
+                "" | "." => continue,
+                ".." => return Err(SMB_DOTS.to_string()),
+                segment if segment.contains(['\\', '?', '#']) => {
+                    return Err(SMB_CHARS.to_string());
+                }
+                segment => segments.push(segment),
+            }
+        }
+
+        Ok(SmbUrl {
+            server: server.to_lowercase(),
+            share,
+            path: segments.join("/"),
+        })
+    }
+
+    /// The one string shown in notices and used as the cache key:
+    /// `smb://server/share/path`, lowercased server, and never a trailing
+    /// `/` — including at the share root (`path.is_empty()`).
+    pub fn canonical(&self) -> String {
+        if self.path.is_empty() {
+            format!("smb://{}/{}", self.server, self.share)
+        } else {
+            format!("smb://{}/{}/{}", self.server, self.share, self.path)
+        }
+    }
+}
+
+/// `%20` → space, byte by byte (so `+` stays a plus: this is a path, not a
+/// form body). A truncated or non-hex escape, or bytes that are not UTF-8
+/// after decoding, is an error — never a silently mangled name.
+fn percent_decode(text: &str) -> Result<String, String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .ok_or_else(|| SMB_PERCENT.to_string())?;
+            let hex = std::str::from_utf8(hex).map_err(|_| SMB_PERCENT.to_string())?;
+            out.push(u8::from_str_radix(hex, 16).map_err(|_| SMB_PERCENT.to_string())?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| SMB_PERCENT.to_string())
+}
+
+/// True when `text` carries an `smb:` scheme (any case) — the line between
+/// a local path and a URL.
+fn has_smb_scheme(text: &str) -> bool {
+    text.get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("smb:"))
+}
+
+/// What one CLI arg / prompt line asked to load (plan 10, "Where URLs are
+/// accepted"): a local path, or a parsed `smb://` URL. Mixed lists are
+/// allowed on one command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadInput {
+    Local(PathBuf),
+    Smb(SmbUrl),
+}
+
+/// Route one raw argument: `smb://…` goes through [`SmbUrl::parse`] (its
+/// errors explain what is wrong with the URL), anything else stays a local
+/// path — `~` expansion and the `exists()` gate belong to the caller.
+pub fn parse_load_input(text: &str) -> Result<LoadInput, String> {
+    let trimmed = text.trim();
+    if has_smb_scheme(trimmed) {
+        return Ok(LoadInput::Smb(SmbUrl::parse(trimmed)?));
+    }
+    Ok(LoadInput::Local(PathBuf::from(trimmed)))
+}
+
+// --- client (spike output, plan 10 step 0 → steps 5/6) ---------------------
 
 /// How long a connect/login attempt may take before it gives up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -400,6 +566,171 @@ mod tests {
         }
         let shown = cfg.connect("nowhere").err().expect("must fail");
         assert_eq!(shown, "smb: cannot connect");
+    }
+
+    // --- plan 10, step 1: `smb://` parse + `LoadInput` ----------------------
+
+    /// The accepted forms, split into fields, canonicalized, and round
+    /// back through the parser unchanged (canonical is a key, so
+    /// `parse(canonical(u)) == u`).
+    #[test]
+    fn smb_urls_split_canonicalize_and_round_trip() {
+        // (input, server, share, path, canonical)
+        let cases: [(&str, &str, &str, &str, &str); 9] = [
+            ("smb://nas/Music", "nas", "Music", "", "smb://nas/Music"),
+            (
+                "smb://nas/Music/",
+                "nas",
+                "Music",
+                "",
+                "smb://nas/Music", // trailing slash at the root: dropped
+            ),
+            (
+                "smb://nas/datastore/media/music/tree63/Amazing Grace.mp3",
+                "nas",
+                "datastore",
+                "media/music/tree63/Amazing Grace.mp3",
+                "smb://nas/datastore/media/music/tree63/Amazing Grace.mp3",
+            ),
+            // Scheme and server are case-insensitive; the path is not.
+            (
+                "  SMB://NAS/Music/Album One  ",
+                "nas",
+                "Music",
+                "Album One",
+                "smb://nas/Music/Album One",
+            ),
+            // Percent-decoding, in every component.
+            (
+                "smb://nas/My%20Music/10%20-%20Song%20.flac",
+                "nas",
+                "My Music",
+                "10 - Song .flac",
+                "smb://nas/My Music/10 - Song .flac",
+            ),
+            // `.` and empty segments normalize away…
+            (
+                "smb://nas/Music/./a//b/",
+                "nas",
+                "Music",
+                "a/b",
+                "smb://nas/Music/a/b",
+            ),
+            // …but `..` never does: `%2e%2e` is still `..` (below).
+            (
+                "smb://192.168.1.10/share/x",
+                "192.168.1.10",
+                "share",
+                "x",
+                "smb://192.168.1.10/share/x",
+            ),
+            (
+                "smb://NAS/share/deep/dir",
+                "nas",
+                "share",
+                "deep/dir",
+                "smb://nas/share/deep/dir",
+            ),
+            (
+                "smb://nas/share/FILE.FLAC",
+                "nas",
+                "share",
+                "FILE.FLAC",
+                "smb://nas/share/FILE.FLAC", // path keeps its case
+            ),
+        ];
+        for (text, server, share, path, canonical) in cases {
+            let url = SmbUrl::parse(text).unwrap_or_else(|e| panic!("{text:?} must parse: {e}"));
+            assert_eq!(
+                (url.server.as_str(), url.share.as_str(), url.path.as_str()),
+                (server, share, path),
+                "fields of {text:?}"
+            );
+            assert_eq!(url.canonical(), canonical, "canonical of {text:?}");
+            let again = SmbUrl::parse(&url.canonical())
+                .unwrap_or_else(|e| panic!("canonical must re-parse: {e}"));
+            assert_eq!(again, url, "canonical round trip of {text:?}");
+        }
+    }
+
+    /// Everything the plan lists as rejected, each with its fixed message.
+    #[test]
+    fn smb_urls_reject_credentials_dots_and_odd_authorities() {
+        // (input, expected message)
+        let cases: [(&str, &str); 10] = [
+            ("smb://nas", SMB_FORM),
+            ("smb://nas/", SMB_FORM),
+            ("smb:///Music", SMB_FORM),
+            ("smb:/nas/Music", SMB_FORM),
+            ("smb://nas/Music/..", SMB_DOTS),
+            ("smb://nas/Music/a/../b", SMB_DOTS),
+            ("smb://nas/Music/%2E%2E/b", SMB_DOTS),
+            ("smb://luis:secret@nas/Music", SMB_CREDENTIALS),
+            ("smb://nas:445/Music", SMB_AUTHORITY),
+            ("smb://nas/Music/a?b=1", SMB_CHARS),
+        ];
+        for (text, expected) in cases {
+            let error = match SmbUrl::parse(text) {
+                Err(error) => error,
+                Ok(url) => panic!("{text:?} must be rejected, got {url:?}"),
+            };
+            assert_eq!(error, expected, "for {text:?}");
+            assert!(
+                !error.contains("secret") && !error.contains("luis"),
+                "the message must not echo the URL: {error}"
+            );
+        }
+        // Percent-encoding errors have their own line.
+        let error = SmbUrl::parse("smb://nas/Music/%zz").expect_err("bad escape");
+        assert_eq!(error, SMB_PERCENT);
+        // …and a truncated one.
+        let error = SmbUrl::parse("smb://nas/Music/%a").expect_err("short escape");
+        assert_eq!(error, SMB_PERCENT);
+    }
+
+    /// `LoadInput` routing: an `smb:` scheme anywhere (any case) goes to
+    /// the URL parser, everything else stays a local path untouched.
+    #[test]
+    fn load_input_routes_by_scheme_not_by_guessing() {
+        assert_eq!(
+            parse_load_input("smb://nas/Music").expect("smb"),
+            LoadInput::Smb(SmbUrl {
+                server: "nas".into(),
+                share: "Music".into(),
+                path: String::new(),
+            })
+        );
+        assert_eq!(
+            parse_load_input("  SMB://NAS/Music/x.flac  ").expect("smb, any case"),
+            LoadInput::Smb(SmbUrl {
+                server: "nas".into(),
+                share: "Music".into(),
+                path: "x.flac".into(),
+            })
+        );
+        // Local paths — including ones that merely *contain* `smb`.
+        for text in ["/music/a.flac", "./music", "~/Music", "music/smb://nas", ""] {
+            let parsed = parse_load_input(text).expect("local");
+            assert_eq!(
+                parsed,
+                LoadInput::Local(PathBuf::from(text)),
+                "for {text:?}"
+            );
+        }
+        // A URL with the scheme but a broken shape is an error, not a path.
+        assert!(parse_load_input("smb://nas").is_err());
+    }
+
+    /// `smb://` never goes through `~` expansion or `exists()`: the parse
+    /// result *is* the input (the caller checks the path only for locals).
+    #[test]
+    fn a_valid_url_is_not_treated_as_a_path() {
+        let LoadInput::Smb(url) = parse_load_input("smb://nas/Music").expect("smb") else {
+            panic!("expected an smb input");
+        };
+        assert_eq!(url.canonical(), "smb://nas/Music");
+        // No field ever carries a credential-shaped fragment.
+        assert!(!format!("{url:?}").contains('@'));
     }
 
     // --- plan 10, step 0: the spike against a real Samba server -------------
