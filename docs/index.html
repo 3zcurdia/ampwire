@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ampwire — Winamp 2's anatomy, a modern hi-fi player in your terminal</title>
-  <meta name="description" content="Ampwire is a terminal music player inspired by Winamp 2, with local lossless playback, Jellyfin streaming and native SMB shares.">
+  <title>Ampwire — a terminal player inspired by Winamp 2</title>
+  <meta name="description" content="A terminal player inspired by Winamp 2, implemented from scratch for the terminal — with modern hi-fi playback.">
   <link rel="canonical" href="https://3zcurdia.github.io/ampwire/">
   <meta property="og:title" content="Ampwire">
-  <meta property="og:description" content="A terminal player inspired by Winamp 2, with modern hi-fi playback.">
+  <meta property="og:description" content="A terminal player inspired by Winamp 2, implemented from scratch for the terminal — with modern hi-fi playback.">
   <meta property="og:url" content="https://3zcurdia.github.io/ampwire/">
   <meta property="og:type" content="website">
   <meta name="twitter:card" content="summary_large_image">
@@ -27,13 +27,15 @@
     <section class="hero">
       <div>
         <h1>Ampwire</h1>
-        <p>Winamp 2's anatomy, a modern hi-fi player in your terminal.</p>
+        <p>A terminal player <strong>inspired by Winamp 2</strong>, implemented from scratch for the terminal — with modern hi-fi playback.</p>
+        <p>It borrows Winamp 2's anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look. It is <em>not</em> a port, clone or replica of Winamp: the UI, the playback engine and the library handling are all written for the terminal from scratch.</p>
         <p>Local lossless files, Jellyfin server streaming, native SMB shares — no kernel mount, no libsmbclient. Keyboard-driven Ratatui TUI.</p>
       </div>
-      <img src="assets/images/horizontal.png" alt="Ampwire main window" width="1200" height="600">
+      <img src="assets/images/neon.png" alt="Ampwire main window" width="1200" height="600">
     </section>
 
     <h2>Install</h2>
+    <p>Prebuilt binaries for macOS (Apple Silicon / Intel) and Linux (x86_64 / arm64):</p>
     <div class="install-box">
       <p>macOS / Linux (curl):</p>
       <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh">
@@ -70,6 +72,16 @@ ampwire ~/Music
 ampwire smb://nas/Music
     </div>
     <p><code>j</code> loads a Jellyfin library (if configured), <code>q</code> quits. <code>ampwire --demo</code> runs a no-audio tour. <code>ampwire --help</code> for options.</p>
+
+    <h2>Playback</h2>
+    <ul>
+      <li>Formats: WAV/PCM, FLAC, MP3, M4A (AAC or ALAC) — decoded with Symphonia and played through cpal <strong>at the track's own sample rate and channel count</strong> (no resampling; lossless sources show <code>bit-perfect</code>).</li>
+      <li>Play order: ordered (default) or full-permutation shuffle (<code>s</code> — every track plays once per round), repeat (<code>r</code>). Tracks auto-advance.</li>
+      <li>Gapless between same-format tracks: the engine pre-opens the next track and swaps decoders inside the running stream at EOF.</li>
+      <li>Jellyfin: with <code>[jellyfin]</code> configured, <code>j</code> loads every audio track on the server; <code>cache</code>, <code>stream</code> or <code>stream_pure</code> modes.</li>
+      <li>SMB: <code>smb://server/share/path</code> — a native SMB2/3 client (pure Rust, no <code>libsmbclient</code>, no kernel mount); <code>cache</code> or <code>stream</code> mode.</li>
+      <li>Volume, balance, <code>swap_channels</code> and a 10-band equalizer + preamp, all live in <code>config.toml</code>.</li>
+    </ul>
 
     <h2>Verify the download</h2>
     <p>Checksums ship with every release:</p>
