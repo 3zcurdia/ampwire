@@ -4,7 +4,7 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.33.0"
 ci = "github"
-installers = ["shell", "homebrew"]
+installers = ["shell"]
 targets = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
@@ -15,8 +15,6 @@ install-path = "~/.local/bin"
 install-success-msg = "ampwire installed. Run ampwire --version to verify."
 hosting = "github"
 install-updater = false
-tap = "3zcurdia/homebrew-tap"
-publish-jobs = ["homebrew"]
 github-attestations = true
 pr-run-mode = "plan"
 

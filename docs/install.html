@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Install — Ampwire</title>
-  <meta name="description" content="Install Ampwire: curl, Homebrew, manual archives, upgrade, uninstall and troubleshooting.">
+  <meta name="description" content="Install Ampwire: curl, manual archives, upgrade, uninstall and troubleshooting.">
   <link rel="canonical" href="https://3zcurdia.github.io/ampwire/install.html">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -25,9 +25,6 @@
     <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh">
 curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh
     </div>
-    <div class="code" data-copy="brew install 3zcurdia/tap/ampwire">
-brew install 3zcurdia/tap/ampwire
-    </div>
 
     <h2>Requirements</h2>
     <ul class="req">
@@ -38,9 +35,9 @@ brew install 3zcurdia/tap/ampwire
     </ul>
 
     <h2>Upgrade</h2>
-    <p>Re-run the curl command, or:</p>
-    <div class="code" data-copy="brew upgrade ampwire">
-brew upgrade ampwire
+    <p>Re-run the curl command:</p>
+    <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh">
+curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh
     </div>
 
     <h2>Uninstall</h2>
@@ -48,10 +45,7 @@ brew upgrade ampwire
     <div class="code" data-copy="rm ~/.local/bin/ampwire">
 rm ~/.local/bin/ampwire
     </div>
-    <p>Optionally remove the <code>source "$HOME/.local/bin/env"</code> line from your shell rc. Homebrew:</p>
-    <div class="code" data-copy="brew uninstall ampwire">
-brew uninstall ampwire
-    </div>
+    <p>Optionally remove the <code>source "$HOME/.local/bin/env"</code> line from your shell rc.</p>
     <p>Configuration remains at <code>~/.config/ampwire/config.toml</code> unless you remove it.</p>
 
     <h2>Troubleshooting</h2>

@@ -6,10 +6,7 @@ can run it; no contributor laptop is required beyond tagging.
 ## Preconditions
 
 1. CI is green on `main` (`.github/workflows/ci.yml`).
-2. The Homebrew tap `3zcurdia/homebrew-tap` exists with a README.
-3. The repository secret `HOMEBREW_TAP_TOKEN` is set (fine-grained token,
-   Contents: Read and write on the tap only).
-4. GitHub Pages is enabled with source **GitHub Actions**.
+2. GitHub Pages is enabled with source **GitHub Actions**.
 
 ## Release
 
@@ -23,11 +20,10 @@ can run it; no contributor laptop is required beyond tagging.
    git push origin vX.Y.Z
    ```
 5. Watch the **Release** workflow: plan → four local builds → global → host →
-   publish-homebrew-formula → announce.
+   announce.
 6. Verify the release page: 4 archives + 4 `.sha256` + installer + formula +
    `sha256.sum` + attestations. Verify checksums and attestations (see below).
-7. Verify the tap: `brew install 3zcurdia/tap/ampwire`, then `ampwire --version`.
-8. Run the install smoke tests in step 8 of plan 11.
+7. Run the install smoke tests in step 8 of plan 11.
 
 ## Verification commands
 
@@ -56,8 +52,7 @@ git push origin v0.1.0-rc.1
 ```
 
 The tag version must match the package version. The prerelease is marked as a
-GitHub prerelease and, with the default `publish-prereleases = false`, it does
-**not** overwrite the Homebrew formula. Fix any pipeline issues, delete the
+GitHub prerelease. Fix any pipeline issues, delete the
 broken tag/release if needed, then repeat with `0.1.0` / `v0.1.0`.
 
 ## Local gates before tagging

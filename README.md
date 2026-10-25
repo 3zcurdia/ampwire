@@ -16,12 +16,6 @@ Prebuilt binaries for macOS (Apple Silicon / Intel) and Linux (x86_64 / arm64):
 curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh
 ```
 
-or, on macOS/Linux with Homebrew:
-
-```sh
-brew install 3zcurdia/tap/ampwire
-```
-
 See the [install guide](https://3zcurdia.github.io/ampwire/install.html) for requirements, upgrade, uninstall and troubleshooting. Runtime requirements: macOS or Linux with glibc ≥ 2.35; on Linux the ALSA runtime (`libasound2` / `libasound2t64` on Debian/Ubuntu, `alsa-lib` on Fedora/Arch, `alsa` on openSUSE). Windows is unsupported.
 
 ## From source

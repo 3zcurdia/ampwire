@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--version` / `--help` (and `-V` / `-h`) CLI flags.
 - Release distribution: cargo-dist configuration, generated release workflow,
   GitHub Pages site and install wrapper.
-- Homebrew tap publishing job.
+- Shell installer only.
 
 ## [0.1.0] - unreleased
 ### Added
