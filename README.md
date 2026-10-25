@@ -176,6 +176,14 @@ next = ["n"]
 
 ## Theming
 
+|![omarchy](images/omarchy-compatible.png)|![omarchy-green](images/omarchy-green.png)|
+|-|-|
+
+
+|![vertical](images/vertical.png)|![green](images/vertical-green.png)|![lumon](images/vertical-lumon.png)|
+|-|-|-|
+
+
 Widgets use semantic roles (`bg`, `fg`, `primary`, `glow`, `accent`, `muted`, `warn` + spectrum gradient), never raw colors. Presets:
 
 - `omarchy` (default): auto-follow the active Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`, fallback `~/.config/omarchy/current/theme`), re-checked once per second. Missing/unreadable → silent fallback to `neon`. `AMPWIRE_OMARCHY_DIR` overrides the path for tests.
