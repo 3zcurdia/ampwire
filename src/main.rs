@@ -13,6 +13,7 @@ mod jellyfin;
 mod keymap;
 mod library;
 mod player;
+mod smb;
 mod ui;
 
 use app::{App, FRAME, ScanMode};

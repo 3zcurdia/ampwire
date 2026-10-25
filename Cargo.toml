@@ -24,6 +24,7 @@ unicode-width = "0.2"
 walkdir = "2.5.0"
 ureq = "3.5.0"
 serde_json = "1.0.154"
+smb = { version = "0.12.1", default-features = false, features = ["multi_threaded", "sign", "encrypt"] }
 
 [dev-dependencies]
 tempfile = "3"
