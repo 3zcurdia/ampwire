@@ -511,6 +511,7 @@ impl RealPlayer {
             }
             PlayerCommand::PlayTrack(_) => {}
             PlayerCommand::SeekBy(delta) => self.seek_by(delta),
+            PlayerCommand::SeekTo(target) => self.seek_to(target),
             PlayerCommand::ToggleShuffle => {
                 self.shuffle = !self.shuffle;
                 self.rebuild_order();
@@ -551,13 +552,20 @@ impl RealPlayer {
     /// `←`/`→` (∓5 s): reload the same track at a new offset. Seeking past
     /// the end stops one second early so it can never skip the track.
     fn seek_by(&mut self, delta: i64) {
+        let target = (self.position().as_secs_f64() + delta as f64).max(0.0);
+        self.seek_to(Duration::from_secs_f64(target));
+    }
+
+    /// Absolute seek (MPRIS `SetPosition` / `ampwire --ctl seek-to`). The
+    /// same one-second end clamp as `seek_by`; pausing is preserved.
+    fn seek_to(&mut self, target: Duration) {
         if !matches!(self.state, PlayState::Playing | PlayState::Paused) {
             return; // stopped: nothing to seek
         }
         let Some(i) = self.playlist.current() else {
             return;
         };
-        let mut target = (self.position().as_secs_f64() + delta as f64).max(0.0);
+        let mut target = target.as_secs_f64().max(0.0);
         if let Some(duration) = self.playlist.tracks().get(i).and_then(|t| t.duration) {
             target = target.min((duration.as_secs_f64() - 1.0).max(0.0));
         }

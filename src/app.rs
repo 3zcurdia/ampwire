@@ -13,7 +13,8 @@ use crate::keymap::Keymap;
 use crate::library::ScanMsg;
 use crate::player::mock::MockPlayer;
 use crate::player::real::RealPlayer;
-use crate::player::{PlayerCommand, PlayerSnapshot, Track};
+use crate::player::{PlayState, PlayerCommand, PlayerSnapshot, Track};
+use crate::remote::{RemoteCommand, SharedView, View, write_view};
 use crate::smb::LoadInput;
 use crate::ui;
 use crate::ui::layout::{LayoutPrefs, Panel, PlaylistSide, Visibility, compute_layout};
@@ -21,8 +22,19 @@ use crate::ui::theme::omarchy::OmarchyWatch;
 use crate::ui::theme::{Role, Theme};
 use ratatui::layout::Rect;
 
-/// Target frame budget (~30 fps). Spectrum and clock advance every frame.
+/// Target frame budget while audio is playing (~30 fps). Spectrum and clock
+/// advance every frame.
 pub const FRAME: Duration = Duration::from_millis(33);
+/// Paused: the only animation left is the 500 ms LCD blink.
+const PAUSED_FRAME: Duration = Duration::from_millis(500);
+/// Stopped or covered by an overlay: nothing animates. One frame a second is
+/// enough for the Omarchy poll, the config debounce and a fresh snapshot.
+const IDLE_FRAME: Duration = Duration::from_secs(1);
+/// A background load is running: show progress without a full 30 fps.
+const SCAN_FRAME: Duration = Duration::from_millis(200);
+/// Wake at least this often even when no frame is due, so a control/MPRIS
+/// command is applied within ~100 ms instead of waiting for the next frame.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Marquee scroll step cadence.
 const MARQUEE: Duration = Duration::from_millis(200);
 /// LCD blink cadence (only while paused).
@@ -245,6 +257,21 @@ pub struct App {
     jf_first_page: bool,
     /// Tracks actually appended by the running load (for the `Done` notice).
     jf_loaded: usize,
+    /// Shared view + remote-command receiver, wired by `main` when MPRIS or
+    /// the control socket is available. `None` in tests and `--dump`.
+    remote: Option<RemoteState>,
+    /// Redraw for a reason outside the frame cadence (input, a remote
+    /// command, a scan page, a theme change).
+    dirty: bool,
+    /// Previous `frame_interval`, so a state change reschedules the deadline
+    /// without making every input event push the animation clock forward.
+    last_interval: Duration,
+}
+
+/// The receiver half of the shared remote plumbing.
+struct RemoteState {
+    rx: std::sync::mpsc::Receiver<RemoteCommand>,
+    view: SharedView,
 }
 
 /// Fixed EQ state for `--dump` and the golden tests (plan §2.3 shape).
@@ -297,6 +324,9 @@ impl App {
             jf_rx: None,
             jf_first_page: false,
             jf_loaded: 0,
+            remote: None,
+            dirty: true,
+            last_interval: FRAME,
         }
     }
 
@@ -358,6 +388,9 @@ impl App {
             jf_rx: None,
             jf_first_page: false,
             jf_loaded: 0,
+            remote: None,
+            dirty: true,
+            last_interval: FRAME,
         }
     }
 
@@ -434,41 +467,171 @@ impl App {
         compute_layout(area, &self.layout_prefs(), &self.ui.vis)
     }
 
-    /// Run the event loop (plan §7, revised).
+    /// Run the event loop.
     ///
-    /// The frame deadline is tracked separately from the tick so an idle app
-    /// blocks in `poll` instead of spinning (the old code let the poll timeout
-    /// fall to 0 and burned a core). Each cadence — spectrum/clock (every
-    /// frame), marquee, blink, Omarchy — has its own deadline.
+    /// The actual frame rate follows the player state: 30 fps while audio is
+    /// playing (spectrum/clock), 2 fps while paused (LCD blink), 1 fps while
+    /// stopped or covered by an overlay, and 5 fps during a background load.
+    /// The loop still wakes every [`POLL_INTERVAL`] to drain control/MPRIS
+    /// commands, but only draws when a frame is due or something changed —
+    /// an idle Ampwire no longer redraws 30 times a second.
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         loop {
-            let size = terminal.size()?;
-            self.sync_to_area(Rect::new(0, 0, size.width, size.height));
-            terminal.draw(|frame| ui::render(frame, self))?;
+            let now = Instant::now();
+            let due = now >= self.next_frame;
+            if self.dirty || due {
+                let size = terminal.size()?;
+                self.sync_to_area(Rect::new(0, 0, size.width, size.height));
+                terminal.draw(|frame| ui::render(frame, self))?;
+                self.dirty = false;
+                if due {
+                    self.next_frame = advance_deadline(self.next_frame, now, self.frame_interval());
+                }
+            }
 
             let now = Instant::now();
-            self.next_frame = advance_deadline(self.next_frame, now);
-            if event::poll(self.next_frame.saturating_duration_since(now))? {
+            let timeout = self
+                .next_frame
+                .saturating_duration_since(now)
+                .min(POLL_INTERVAL);
+            if event::poll(timeout)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_key(key);
+                        self.dirty = true;
                     }
                     // Resize: next draw recomputes the layout from frame.area().
+                    Event::Resize(_, _) => self.dirty = true,
                     _ => {}
                 }
             }
 
-            // Advance by the real elapsed time every frame (30 fps), so the
-            // clock and spectrum stay smooth.
+            // Advance by the real elapsed time; cadence accumulators keep the
+            // clock, marquee, blink and Omarchy poll independent of the draw
+            // rate.
             let after_poll = Instant::now();
             self.tick(after_poll - self.last_tick);
             self.last_tick = after_poll;
 
+            // A play/pause/stop transition (or a scan starting/finishing)
+            // changes the right frame budget; reschedule without making every
+            // input event push the animation clock forward.
+            let interval = self.frame_interval();
+            if interval != self.last_interval {
+                self.last_interval = interval;
+                self.next_frame = after_poll + interval;
+            }
+
             if self.should_quit {
                 self.flush_config(); // a prompt's Ctrl+C lands here, not in dispatch
+                self.mark_stopped();
                 return Ok(());
             }
         }
+    }
+
+    /// The frame budget for the current state. Overlays hide the animated
+    /// player, so they use the idle cadence even while music plays.
+    fn frame_interval(&self) -> Duration {
+        if self.ui.show_help || self.ui.prompt.is_some() || self.ui.presets.is_some() {
+            return IDLE_FRAME;
+        }
+        match self.snapshot.state {
+            PlayState::Playing => FRAME,
+            PlayState::Paused => PAUSED_FRAME,
+            PlayState::Stopped => {
+                if self.scan_rx.is_some() || self.jf_rx.is_some() {
+                    SCAN_FRAME
+                } else {
+                    IDLE_FRAME
+                }
+            }
+        }
+    }
+
+    /// Wire the shared view and the remote-command receiver (control socket
+    /// and/or MPRIS). Called once from `main`, before the first frame.
+    pub fn set_remote(&mut self, rx: std::sync::mpsc::Receiver<RemoteCommand>, view: SharedView) {
+        self.remote = Some(RemoteState { rx, view });
+        self.publish_view();
+    }
+
+    /// Replace the shared view with the current snapshot.
+    fn publish_view(&self) {
+        if let Some(remote) = &self.remote {
+            write_view(
+                &remote.view,
+                View::from_snapshot(&self.snapshot, self.ui.notice.as_deref()),
+            );
+        }
+    }
+
+    /// Mark the shared view as stopped on the way out, so a racing
+    /// `--status` does not claim a session that is already gone.
+    fn mark_stopped(&self) {
+        if let Some(remote) = &self.remote {
+            write_view(&remote.view, View::not_running());
+        }
+    }
+
+    /// Drain every command the services queued since the last tick. The
+    /// channel is unbounded and the services never block; only this method
+    /// touches the player.
+    fn drain_remote(&mut self) {
+        let mut commands = Vec::new();
+        if let Some(remote) = &self.remote {
+            while let Ok(command) = remote.rx.try_recv() {
+                commands.push(command);
+            }
+        }
+        for command in commands {
+            self.dirty = true;
+            self.apply_remote(command);
+        }
+    }
+
+    fn apply_remote(&mut self, command: RemoteCommand) {
+        // Remote commands are not keypresses: the help overlay must not
+        // swallow a media key (dispatch's keyboard-only guard closes it).
+        let help = self.ui.show_help;
+        self.ui.show_help = false;
+        match command {
+            RemoteCommand::Play => self.dispatch(Action::Play),
+            RemoteCommand::Pause => self.dispatch(Action::Pause),
+            RemoteCommand::TogglePlayPause => self.dispatch(Action::PlayPause),
+            RemoteCommand::Stop => self.dispatch(Action::Stop),
+            RemoteCommand::Next => self.dispatch(Action::Next),
+            RemoteCommand::Prev => self.dispatch(Action::Prev),
+            RemoteCommand::ToggleShuffle => self.dispatch(Action::ToggleShuffle),
+            RemoteCommand::ToggleRepeat => self.dispatch(Action::ToggleRepeat),
+            RemoteCommand::SetVolume(volume) => self.set_volume_to(volume),
+            RemoteCommand::SeekBy { delta_ms } => {
+                let target = if delta_ms >= 0 {
+                    self.snapshot
+                        .position
+                        .saturating_add(Duration::from_millis(delta_ms as u64))
+                } else {
+                    self.snapshot
+                        .position
+                        .saturating_sub(Duration::from_millis(delta_ms.unsigned_abs()))
+                };
+                self.player.handle(PlayerCommand::SeekTo(target));
+                self.snapshot = self.player.snapshot();
+            }
+            RemoteCommand::SeekTo {
+                track_id,
+                position_ms,
+            } => {
+                if self.snapshot.current_track().map(|track| track.id) == Some(track_id) {
+                    self.player
+                        .handle(PlayerCommand::SeekTo(Duration::from_millis(position_ms)));
+                    self.snapshot = self.player.snapshot();
+                }
+            }
+            RemoteCommand::Load(inputs) => self.load_inputs(inputs, ScanMode::Replace),
+            RemoteCommand::Quit => self.dispatch(Action::Quit),
+        }
+        self.ui.show_help = help;
     }
 
     /// Bring focus and playlist scroll in line with what the layout draws at
@@ -749,21 +912,26 @@ impl App {
     /// Advance the mock clock/spectrum by `dt`, and fire the slower cadences
     /// (marquee, blink, Omarchy) when their accumulators fill up.
     pub fn tick(&mut self, dt: Duration) {
+        self.drain_remote();
         self.player.tick(dt);
         self.snapshot = self.player.snapshot();
         // Surface whatever the real player queued this tick (engine errors,
         // shuffle/repeat feedback) in the playlist's notice slot.
         if let Some(notice) = self.player.take_notice() {
             self.ui.notice = Some(notice);
+            self.dirty = true;
         }
         self.poll_scan();
         self.poll_jellyfin();
 
-        // Marquee: one step every 200 ms.
-        self.marquee_acc += dt;
-        while self.marquee_acc >= MARQUEE {
-            self.marquee_acc -= MARQUEE;
-            self.ui.marquee_offset = self.ui.marquee_offset.wrapping_add(1);
+        // Marquee: one step every 200 ms, but only while audio is playing.
+        // A paused/stopped title can stand still — it is not worth a redraw.
+        if self.snapshot.state == PlayState::Playing {
+            self.marquee_acc += dt;
+            while self.marquee_acc >= MARQUEE {
+                self.marquee_acc -= MARQUEE;
+                self.ui.marquee_offset = self.ui.marquee_offset.wrapping_add(1);
+            }
         }
         // LCD blink: toggle every 500 ms (render only shows it while paused).
         self.blink_acc += dt;
@@ -787,6 +955,7 @@ impl App {
             self.config_dirty_since = None;
             self.save_config();
         }
+        self.publish_view();
     }
 
     /// Kick off a background load of `inputs` (plan 02, step 8; plan 10,
@@ -869,15 +1038,18 @@ impl App {
             match rx.try_recv() {
                 Ok(ScanMsg::Progress { found }) => {
                     self.ui.notice = Some(format!("loading… {found} files"));
+                    self.dirty = true;
                 }
                 Ok(ScanMsg::Done { tracks, skipped }) => {
                     self.finish_scan(tracks, skipped);
+                    self.dirty = true;
                     if self.scan_pending == 0 {
                         break false; // every worker reported
                     }
                 }
                 Ok(ScanMsg::Failed { reason }) => {
                     self.finish_failure(&reason);
+                    self.dirty = true;
                     if self.scan_pending == 0 {
                         break false;
                     }
@@ -1025,9 +1197,10 @@ impl App {
         if !finished {
             self.jf_rx = Some(rx);
         }
-        if changed {
+        if changed || finished {
             self.snapshot = self.player.snapshot();
             self.clamp_cursor();
+            self.dirty = true;
         }
     }
 
@@ -1055,6 +1228,9 @@ impl App {
                 }
             }
         }
+        // The poll runs once a second; a redraw then is the idle cadence
+        // anyway, and it makes a real theme change visible immediately.
+        self.dirty = true;
     }
 
     /// Apply per-role overrides from `[theme.colors]` on top of a preset.
@@ -1260,13 +1436,24 @@ impl App {
         // points inside the visible list ("always clamp after the change").
         self.snapshot = self.player.snapshot();
         self.clamp_cursor();
+        self.dirty = true;
     }
 
     fn change_volume(&mut self, delta: i32) {
         let volume = (self.snapshot.volume as i32 + delta).clamp(0, 100) as u8;
+        self.set_volume_to(volume);
+    }
+
+    /// Absolute volume, used by the keys' relative steps and by MPRIS/ctl.
+    /// Updates the snapshot immediately so several remote commands in one
+    /// tick do not all start from the same stale value.
+    fn set_volume_to(&mut self, volume: u8) {
+        let volume = volume.min(100);
         self.player.handle(PlayerCommand::SetVolume(volume));
         self.config.audio.volume = volume;
         self.config_dirty_since = Some(Instant::now());
+        self.snapshot.volume = volume;
+        self.dirty = true;
     }
 
     fn change_balance(&mut self, delta: i32) {
@@ -1373,13 +1560,13 @@ impl App {
 /// When the next periodic frame is due. Only a deadline that has passed
 /// moves forward, so redraws woken early by input don't push the animation
 /// clock into the future (holding a key used to freeze the spectrum). A draw
-/// more than a frame late resyncs instead of catching up in a burst.
-fn advance_deadline(deadline: Instant, now: Instant) -> Instant {
+/// more than one interval late resyncs instead of catching up in a burst.
+fn advance_deadline(deadline: Instant, now: Instant, interval: Duration) -> Instant {
     if now < deadline {
         return deadline;
     }
-    let next = deadline + FRAME;
-    if next < now { now + FRAME } else { next }
+    let next = deadline + interval;
+    if next < now { now + interval } else { next }
 }
 
 fn panel_for(scope: Scope) -> Panel {
@@ -1668,14 +1855,104 @@ mod tests {
         // Woken by input before the deadline: it stays put, however often.
         let mut deadline = start + FRAME;
         for ms in [1, 2, 3, 10, 20] {
-            deadline = advance_deadline(deadline, start + Duration::from_millis(ms));
+            deadline = advance_deadline(deadline, start + Duration::from_millis(ms), FRAME);
         }
         assert_eq!(deadline, start + FRAME);
         // Deadline reached: the next frame is one frame later.
-        assert_eq!(advance_deadline(deadline, deadline), deadline + FRAME);
-        // Far behind (slow draw): resync to one frame from now.
+        assert_eq!(
+            advance_deadline(deadline, deadline, FRAME),
+            deadline + FRAME
+        );
+        // Far behind (slow draw): resync to one interval from now.
         let late = deadline + FRAME * 5;
-        assert_eq!(advance_deadline(deadline, late), late + FRAME);
+        assert_eq!(advance_deadline(deadline, late, FRAME), late + FRAME);
+    }
+
+    fn remote_app() -> (
+        App,
+        tempfile::TempDir,
+        std::sync::mpsc::Sender<RemoteCommand>,
+    ) {
+        let (mut app, dir) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.set_remote(rx, crate::remote::new_view());
+        (app, dir, tx)
+    }
+
+    #[test]
+    fn remote_volume_updates_snapshot_and_config() {
+        let (mut app, _dir, tx) = remote_app();
+        tx.send(RemoteCommand::SetVolume(42)).unwrap();
+        app.tick(Duration::ZERO);
+        assert_eq!(app.snapshot().volume, 42);
+        assert_eq!(app.config.audio.volume, 42);
+        assert!(app.config_dirty_since.is_some(), "debounced save armed");
+    }
+
+    #[test]
+    fn remote_absolute_seek_respects_the_track_id() {
+        let (mut app, _dir, tx) = remote_app();
+        let track_id = app.snapshot().current_track().unwrap().id;
+        tx.send(RemoteCommand::SeekTo {
+            track_id,
+            position_ms: 42_000,
+        })
+        .unwrap();
+        app.tick(Duration::ZERO);
+        assert_eq!(app.snapshot().position, Duration::from_secs(42));
+
+        let before = app.snapshot().position;
+        tx.send(RemoteCommand::SeekTo {
+            track_id: track_id + 9999,
+            position_ms: 1_000,
+        })
+        .unwrap();
+        app.tick(Duration::ZERO);
+        assert_eq!(app.snapshot().position, before, "stale track id ignored");
+    }
+
+    #[test]
+    fn remote_commands_work_while_help_is_open() {
+        let (mut app, _dir, tx) = remote_app();
+        app.dispatch(Action::Help);
+        assert!(app.ui.show_help);
+        tx.send(RemoteCommand::SetVolume(17)).unwrap();
+        app.tick(Duration::ZERO);
+        assert_eq!(app.snapshot().volume, 17);
+        assert!(app.ui.show_help, "a media key must not close the overlay");
+    }
+
+    #[test]
+    fn remote_quit_quits() {
+        let (mut app, _dir, tx) = remote_app();
+        tx.send(RemoteCommand::Quit).unwrap();
+        app.tick(Duration::ZERO);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn frame_interval_follows_the_player_state() {
+        let (mut app, _dir) = test_app();
+        // The mock starts playing: full 30 fps for the spectrum.
+        assert_eq!(app.frame_interval(), FRAME);
+        app.dispatch(Action::Pause);
+        assert_eq!(app.frame_interval(), PAUSED_FRAME);
+        app.dispatch(Action::Stop);
+        assert_eq!(app.frame_interval(), IDLE_FRAME);
+        app.dispatch(Action::Play);
+        assert_eq!(app.frame_interval(), FRAME);
+        // An overlay hides the animated player: idle even while playing.
+        app.dispatch(Action::Help);
+        assert_eq!(app.frame_interval(), IDLE_FRAME);
+    }
+
+    #[test]
+    fn paused_marquee_does_not_advance() {
+        let (mut app, _dir) = test_app();
+        app.dispatch(Action::Pause);
+        let before = app.ui.marquee_offset;
+        app.tick(Duration::from_millis(600));
+        assert_eq!(app.ui.marquee_offset, before);
     }
 
     #[test]

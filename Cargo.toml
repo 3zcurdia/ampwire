@@ -26,6 +26,10 @@ ureq = "3.5.0"
 serde_json = "1.0.154"
 smb = { version = "0.12.1", default-features = false, features = ["multi_threaded", "sign", "encrypt"] }
 
+# MPRIS (Linux only): the session bus, media keys and Omarchy's media widget.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5.19"
+
 [dev-dependencies]
 tempfile = "3"
 

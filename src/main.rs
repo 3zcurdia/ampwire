@@ -9,10 +9,15 @@ mod action;
 mod app;
 mod audio;
 mod config;
+#[cfg(unix)]
+mod control;
 mod jellyfin;
 mod keymap;
 mod library;
+#[cfg(target_os = "linux")]
+mod mpris;
 mod player;
+mod remote;
 mod smb;
 mod ui;
 
@@ -72,6 +77,12 @@ fn print_help() {
   --demo             run the mock player with the default layout\n\
   --dump WxH         render one frame and exit\n\
   --frame N          advance the mock clock N frames before --dump\n\
+  --status [--json]  print the running session's state, then exit\n\
+  --ctl <command>    control the running session:\n\
+                       play | pause | toggle | stop | next | prev\n\
+                       seek <seconds> | seek-to <seconds>\n\
+                       volume <0-100> | shuffle | repeat\n\
+                       load <path|smb://…> | quit\n\
   -V, --version      print the version and exit\n\
   -h, --help         print this help and exit\n"
     );
@@ -120,6 +131,25 @@ fn load_inputs_from_args(args: &[String]) -> Result<Vec<smb::LoadInput>, String>
         .collect()
 }
 
+/// Handle the non-session control flags before any config, audio or TUI
+/// starts. Returns the process exit code when one of them was requested.
+#[cfg(unix)]
+fn remote_cli(args: &[String]) -> Option<i32> {
+    let status = args.iter().any(|arg| arg == "--status");
+    let ctl = args.iter().position(|arg| arg == "--ctl");
+    match (status, ctl) {
+        (true, Some(_)) => {
+            eprintln!("ampwire: --status and --ctl are exclusive");
+            Some(2)
+        }
+        (true, None) => Some(control::client_status(
+            args.iter().any(|arg| arg == "--json"),
+        )),
+        (false, Some(index)) => Some(control::client_ctl(&args[index + 1..])),
+        (false, None) => None,
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -132,6 +162,21 @@ fn main() -> std::io::Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
         return Ok(());
+    }
+
+    // Status/control talk to an already-running session and must not read
+    // config, open the sound card or need a TTY.
+    #[cfg(unix)]
+    if let Some(code) = remote_cli(&args) {
+        use std::io::Write as _;
+        // `process::exit` skips destructors; flush piped stdout explicitly.
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+    #[cfg(not(unix))]
+    if args.iter().any(|a| a == "--status" || a == "--ctl") {
+        eprintln!("ampwire: status/control is not supported on this platform");
+        std::process::exit(1);
     }
 
     match parse_dump(&args) {
@@ -156,6 +201,37 @@ fn main() -> std::io::Result<()> {
             std::process::exit(2);
         }
     };
+
+    // One shared view and one command channel for the control socket and
+    // MPRIS. Bind the control socket before `Config::load`/`RealPlayer::new`
+    // so a second launch forwards its paths and exits without touching the
+    // sound card.
+    let shared_view = remote::new_view();
+    // The process exists from here on; a status client racing startup should
+    // see a stopped-but-running session, not "not running".
+    remote::write_view(
+        &shared_view,
+        remote::View {
+            running: true,
+            ..remote::View::default()
+        },
+    );
+    let (remote_tx, remote_rx) = std::sync::mpsc::channel();
+    let mut remote_started = false;
+
+    #[cfg(unix)]
+    let _control_server =
+        match control::start(shared_view.clone(), remote_tx.clone(), &inputs, !demo) {
+            control::Start::Server(server) => {
+                remote_started = true;
+                Some(server)
+            }
+            control::Start::AlreadyRunning => {
+                eprintln!("ampwire: already running");
+                return Ok(());
+            }
+            control::Start::Off => None,
+        };
 
     let loaded = Config::load();
     let mut config = loaded.config;
@@ -188,6 +264,24 @@ fn main() -> std::io::Result<()> {
     if demo {
         app.ui.notice = Some("demo mode: mock player, default layout".into());
     }
+
+    // Linux media keys/Omarchy's media widget need MPRIS; a missing session
+    // bus just disables it (the UI and control socket keep working).
+    #[cfg(target_os = "linux")]
+    let _mpris = if demo {
+        None
+    } else {
+        let handle = mpris::start(shared_view.clone(), remote_tx.clone());
+        if handle.is_some() {
+            remote_started = true;
+        }
+        handle
+    };
+
+    if remote_started {
+        app.set_remote(remote_rx, shared_view.clone());
+    }
+
     // CLI args behave like Open: replace the playlist and start at track 1.
     // `--demo` keeps the fake playlist untouched.
     if !demo && !inputs.is_empty() {

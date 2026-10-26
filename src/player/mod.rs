@@ -276,6 +276,9 @@ pub enum PlayerCommand {
     Prev,
     PlayTrack(usize),
     SeekBy(i64),
+    /// Absolute seek (MPRIS `SetPosition`, the control socket): reload the
+    /// current track at `target`, keeping the paused state.
+    SeekTo(Duration),
     /// Absolute volume, 0–=100.
     SetVolume(u8),
     /// Absolute balance, −100..=100.

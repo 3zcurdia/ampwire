@@ -379,6 +379,12 @@ impl MockPlayer {
                     self.position = Duration::from_secs(target);
                 }
             }
+            PlayerCommand::SeekTo(target) => {
+                if let Some(track) = self.current_track() {
+                    let track_len = track.duration.unwrap_or(UNKNOWN_DURATION);
+                    self.position = target.min(track_len);
+                }
+            }
             PlayerCommand::ToggleShuffle => self.shuffle = !self.shuffle,
             PlayerCommand::ToggleRepeat => self.repeat = !self.repeat,
             // Handled by `handle`.

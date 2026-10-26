@@ -55,6 +55,46 @@ cargo run -- --help                    # print help and exit
 
 Only Linux and macOS are supported today. Windows is **not tested** — the project has never been built or run there, so it may not even compile, and the audio path is unverified. If you try it, expect to have to fix: the cpal/WASAPI output device (the device + `supported_output_configs()` cache and the exact-rate matching are written for the ALSA/CoreAudio backends), the device names in error notices, and the playback rule itself — Windows shared-mode devices usually expose only a couple of sample rates (44.1/48 kHz), and ampwire never resamples, so anything else is reported as unplayable. The POSIX-specific bits (config file mode `0600`, Jellyfin and SMB cache dir mode `0700`) are `cfg(unix)`-guarded, so they compile everywhere but are a no-op off unix.
 
+## Desktop integration (Linux)
+
+While a session is running, Ampwire publishes the standard MPRIS2 service
+`org.mpris.MediaPlayer2.ampwire`. Omarchy's media widget, the lock screen,
+hardware media keys and `playerctl` see it as a normal player:
+
+```sh
+playerctl --player=ampwire status
+playerctl --player=ampwire metadata
+```
+
+The same session also has a small owner-only control socket. It is meant for
+bar widgets and scripts that need the exact format/bit-perfect state, or want
+to drive the player without starting a second copy:
+
+```sh
+ampwire --status
+ampwire --status --json
+ampwire --ctl toggle
+ampwire --ctl next
+ampwire --ctl seek -10
+ampwire --ctl volume 80
+ampwire --ctl load ~/Music
+```
+
+`--status --json` reports the format (`sample_rate`, `bit_depth`, `channels`),
+`format.bit_perfect` and `format.bit_perfect_scope`. The scope is `"app"`:
+Ampwire's own volume/balance/EQ stage is bypassed, but the OS mixer (PipeWire,
+CoreAudio, Bluetooth) can still resample — the flag does not claim a
+bit-perfect path all the way to the DAC.
+
+A second `ampwire PATH` forwards its paths to the running session and exits;
+launching `ampwire` with no paths just reports that a session is already up.
+The socket lives in `$XDG_RUNTIME_DIR/ampwire/control.sock` (or
+`~/.cache/ampwire/control.sock` when `XDG_RUNTIME_DIR` is unset), is mode
+`0600`, and can be moved with `AMPWIRE_CONTROL_SOCKET=…` or disabled with
+`AMPWIRE_NO_CONTROL=1`. Both commands exit non-zero when no session is
+running (the JSON form still prints `{"running": false, …}`). MPRIS is Linux-only (the `zbus` dependency is
+Linux-only); `--status` and `--ctl` work on macOS too.
+
 ## Playback
 
 - Formats: WAV/PCM, FLAC, MP3, M4A (AAC or ALAC) — decoded with Symphonia and played through cpal **at the track's own sample rate and channel count** (no resampling; lossless sources show `bit-perfect`).
@@ -228,6 +268,7 @@ cargo test
 Notes:
 
 - Run the TUI only in a real TTY; output under pipes/CI is garbage.
+- The draw loop follows playback: ~30 fps while playing (spectrum/clock), 2 fps paused (LCD blink), 1 fps stopped or under an overlay, 5 fps during a background load. It still wakes every 100 ms to drain control/MPRIS commands, but an idle session no longer redraws 30 times a second.
 - `crossterm` is imported as `ratatui::crossterm` — no direct dependency.
 - `Cargo.lock` is committed (binary crate).
 - Audio on Linux builds against ALSA (`libasound2-dev` on Debian/Ubuntu, `alsa-lib` on Arch); macOS needs nothing. **Windows is untested** — the suite has never been run there and the WASAPI path is unverified, so treat Windows as unsupported (see [Platform support](#platform-support)). `cargo test` never opens a sound card — the end-to-end device test is `#[ignore]`d: `cargo test -- --ignored` (it plays an audible tone). Plain `cargo test` also stays off the network (its "HTTP server" is a `TcpListener` on `127.0.0.1:0`).
@@ -240,10 +281,13 @@ Notes:
 ```text
 src/
   main.rs            --demo / --dump / CLI load paths, theme resolution, ratatui::run
-  app.rs             App: UiState + snapshot, event loop (~30fps), tick, dispatch, prompts, scans, Backend{Mock,Real}
+  app.rs             App: UiState + snapshot, state-driven frame loop (30 fps playing / idle-throttled), tick, dispatch, prompts, scans, remote commands, Backend{Mock,Real}
   action.rs          Action enum (every remappable command)
   keymap.rs          defaults, spec parsing, (scope, key) → Action
   config.rs          load/save config.toml, XDG paths
+  remote.rs          shared status View + RemoteCommand (control/MPRIS seam)
+  control.rs         Unix control socket: --status/--ctl + single-instance guard
+  mpris.rs           Linux MPRIS2 service (zbus; media keys, Omarchy media widget)
   audio/
     mod.rs           3-thread overview: UI thread · engine thread · cpal callback
     decoder.rs       symphonia → interleaved f32 (unit-tested on tests/fixtures/)
@@ -286,4 +330,4 @@ tests/golden/        --dump snapshots at 5 sizes
 .opencode/docs/features/          design plans (01-winamp-layout.md, 02-playlist-loading.md, …)
 ```
 
-Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; a Jellyfin load goes `j → jellyfin::spawn_library_load (thread) → JfMsg → App::tick → RemoveRemote (once) + AppendInOrder`, and remote playback goes `TrackSource::Remote → Cache window (downloader thread) → Load` or `→ EngineCmd::LoadRemote → HttpRangeSource`; an SMB load goes `smb:// → smb::spawn_smb_scan (thread) → ScanMsg → App::tick` for the playlist, and `TrackSource::Smb → SmbCache window (downloader thread) → Load` or `→ EngineCmd::LoadSmb → SmbFileSource`. Engine events come back over a channel polled from `App::tick` (notices land in the playlist border). `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
+Data flow: `Key → keymap::resolve(focus) → App::dispatch(Action) → app::Backend → PlayerCommand → MockPlayer | RealPlayer → (engine thread → rtrb ring buffer → cpal callback)`. Loads go `path → library::spawn_scan (thread) → ScanMsg → App::tick → PlayerCommand`; a Jellyfin load goes `j → jellyfin::spawn_library_load (thread) → JfMsg → App::tick → RemoveRemote (once) + AppendInOrder`, and remote playback goes `TrackSource::Remote → Cache window (downloader thread) → Load` or `→ EngineCmd::LoadRemote → HttpRangeSource`; an SMB load goes `smb:// → smb::spawn_smb_scan (thread) → ScanMsg → App::tick` for the playlist, and `TrackSource::Smb → SmbCache window (downloader thread) → Load` or `→ EngineCmd::LoadSmb → SmbFileSource`. Engine events come back over a channel polled from `App::tick` (notices land in the playlist border). The control socket and MPRIS are read-only over a shared `remote::View`; their commands arrive on one channel drained at the top of `App::tick`, so neither service can touch the audio engine or block a frame. `ui` only reads `&PlayerSnapshot`, `&UiState`, `&Theme`. Widgets are stateless borrowed structs implementing `Widget`.
