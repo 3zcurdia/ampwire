@@ -449,6 +449,8 @@ table th { background: var(--panel); color: var(--accent); font-family: var(--mo
   main { padding: 3rem 1rem 4.5rem; }
   .section { margin-top: 4rem; padding-top: 3rem; }
   .grid, .grid.three, .gallery { grid-template-columns: minmax(0, 1fr); }
+  .hero-topline { flex-direction: column-reverse; gap: 0.55rem; }
+  .hero-tagline { margin: 0; text-align: left; }
   .hero-facts { grid-template-columns: 1fr; }
   .hero-facts > div { border-right: 0; border-bottom: 1px solid var(--border); }
   .hero-facts > div:nth-last-child(-n + 2) { border-bottom: 1px solid var(--border); }
