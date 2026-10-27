@@ -88,12 +88,12 @@
         <article class="card">
           <p class="card-tag">exact rate</p>
           <h3>No resampling</h3>
-          <p>The output stream opens at the track's own sample rate and channel count. If the default device cannot play that exact format, the track is reported as unplayable instead of quietly converted to fit.</p>
+          <p>The output stream opens at the track's own sample rate and channel count. If the default device cannot play that exact format, the track is reported as unplayable instead of quietly converted to fit. On Linux the default device is usually PipeWire or Pulse, which can still resample downstream of Ampwire.</p>
         </article>
         <article class="card">
           <p class="card-tag">opt-in DSP</p>
           <h3>Nothing applied silently</h3>
-          <p>At volume 100, centered balance, no channel swap and a flat or off EQ, the decoded samples pass through untouched &mdash; lossless playback is marked <code>bit-perfect</code>. Volume, balance and the 10-band EQ are opt-in processing, never automatic.</p>
+          <p>At volume 100, centered balance, no channel swap and a flat or off EQ, the decoded samples pass through untouched &mdash; lossless playback is marked <code>bit-perfect</code> (not for 32-bit integer or 64-bit float sources, which <code>f32</code> rounds). Volume, balance and the 10-band EQ are opt-in processing, never automatic.</p>
         </article>
         <article class="card">
           <p class="card-tag">same-stream swap</p>

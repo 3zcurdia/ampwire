@@ -13,8 +13,8 @@ It borrows Winamp 2's anatomy — player, equalizer, playlist — rendered as a 
 Ampwire is built for hi-fi listening: the goal is to **reproduce the source as it is**, never to transcode it into something more convenient — from a UI that looks like Winamp 2 at the turn of the millennium.
 
 - **No transcoding.** Nothing is re-encoded to another resolution or bitrate. Jellyfin is always asked for the original file (`static=true`) and an SMB share is read for its original bytes; both are decoded locally, like a file on disk.
-- **No resampling.** The output stream opens at the track's own sample rate and channel count. If the default device cannot play that exact format, the track is reported, not converted (`<device>: cannot play 96000 Hz 2ch`) — no resampling to fit and no fallback device.
-- **No normalization, dithering or loudness matching.** With volume at 100, balance centered, no channel swap and an EQ that is flat or off, the decoded samples pass through untouched: lossless playback is marked `bit-perfect`. Volume, balance and the 10-band EQ are opt-in processing, never applied silently.
+- **No resampling.** The output stream opens at the track's own sample rate and channel count. If the default device cannot play that exact format, the track is reported, not converted (`<device>: cannot play 96000 Hz 2ch`) — no resampling to fit and no fallback device. That is Ampwire's own behaviour: on macOS CoreAudio is switched to the track's rate, but on Linux the default ALSA device is usually PipeWire/Pulse/`dmix`, which accept any rate and may resample on the way to the DAC (`--status --json` reports this as `bit_perfect_scope: "app"`).
+- **No normalization, dithering or loudness matching.** With volume at 100, balance centered, no channel swap and an EQ that is flat or off, the decoded samples pass through untouched: lossless playback is marked `bit-perfect` (sources `f32` cannot hold exactly — 32-bit integer PCM or FLAC, 64-bit float — are rounded when decoded and never get the marker). Volume, balance and the 10-band EQ are opt-in processing, never applied silently.
 - **Gapless** between tracks that share a sample rate and channel count: the next decoder is pre-opened and swapped into the running stream at EOF — same ring, same DSP state, no silence, no click, no device reopen.
 - **One local decode path** for FLAC, WAV/PCM, ALAC/AAC (M4A) and MP3, via Symphonia and cpal, whether the bytes came from disk, Jellyfin or SMB.
 
@@ -88,7 +88,9 @@ ampwire --ctl load ~/Music
 `format.bit_perfect` and `format.bit_perfect_scope`. The scope is `"app"`:
 Ampwire's own volume/balance/EQ stage is bypassed, but the OS mixer (PipeWire,
 CoreAudio, Bluetooth) can still resample — the flag does not claim a
-bit-perfect path all the way to the DAC.
+bit-perfect path all the way to the DAC. Samples are decoded to `f32` and
+opened as `f32` on the device (exact for up to 24 bits); there is no native
+integer output path, so a raw `hw:` Linux device that lacks float is refused.
 
 A second `ampwire PATH` forwards its paths to the running session and exits;
 launching `ampwire` with no paths just reports that a session is already up.

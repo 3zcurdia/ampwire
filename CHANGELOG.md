@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The `bit-perfect` marker no longer shows for sources that `f32` cannot hold
+  exactly (32-bit integer PCM/FLAC, 64-bit float PCM); the docs now say that on
+  Linux a PipeWire/Pulse/`dmix` default device can still resample after Ampwire.
+
 ## [0.1.0] - 2026-10-27
 
 First public release: a Winamp-2-inspired terminal player (player, equalizer,

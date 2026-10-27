@@ -12,7 +12,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use symphonia::core::codecs::audio::well_known::{
-    CODEC_ID_ALAC, CODEC_ID_FLAC, CODEC_ID_PCM_F64BE, CODEC_ID_PCM_S32LE,
+    CODEC_ID_ALAC, CODEC_ID_FLAC, CODEC_ID_PCM_F32LE, CODEC_ID_PCM_F64BE, CODEC_ID_PCM_F64LE,
+    CODEC_ID_PCM_S32LE,
 };
 use symphonia::core::codecs::{
     CodecParameters, audio::AudioCodecId, audio::AudioDecoder, audio::AudioDecoderOptions,
@@ -69,6 +70,10 @@ pub struct StreamInfo {
     pub codec: String,
     /// FLAC, ALAC or linear PCM (A-law/µ-law and ADPCM count as lossy).
     pub lossless: bool,
+    /// Every decoded sample survives the `f32` pipeline exactly: up to 24
+    /// significant bits, or 32-bit float. 32-bit integer and 64-bit float
+    /// sources are rounded to `f32`, so they can never be `bit-perfect`.
+    pub f32_exact: bool,
     pub sample_rate: u32,
     pub channels: u16,
     /// `codec_params.bits_per_sample`, when the codec reports one.
@@ -172,6 +177,10 @@ impl Decoder {
         let info = StreamInfo {
             codec: codec_label(params.codec),
             lossless: is_lossless(params.codec),
+            f32_exact: is_f32_exact(
+                params.codec,
+                params.bits_per_sample.and_then(|b| u8::try_from(b).ok()),
+            ),
             sample_rate: params.sample_rate.expect("checked above"),
             channels: channels as u16,
             bit_depth: params.bits_per_sample.and_then(|b| u8::try_from(b).ok()),
@@ -310,6 +319,20 @@ fn is_linear_pcm(id: AudioCodecId) -> bool {
     (CODEC_ID_PCM_S32LE..=CODEC_ID_PCM_F64BE).contains(&id)
 }
 
+/// Whether decoding to `f32` (24-bit mantissa) loses nothing. 32-bit float
+/// PCM is `f32` already; 64-bit float and any integer source deeper than 24
+/// bits (32-bit PCM or FLAC) get rounded. An unreported depth (ALAC) is
+/// taken as exact: ALAC tops out at 32 bits but files that deep are rare.
+fn is_f32_exact(id: AudioCodecId, bit_depth: Option<u8>) -> bool {
+    if (CODEC_ID_PCM_F32LE..CODEC_ID_PCM_F64LE).contains(&id) {
+        return true;
+    }
+    if (CODEC_ID_PCM_F64LE..=CODEC_ID_PCM_F64BE).contains(&id) {
+        return false;
+    }
+    bit_depth.is_none_or(|bits| bits <= 24)
+}
+
 fn is_lossless(id: AudioCodecId) -> bool {
     id == CODEC_ID_FLAC || id == CODEC_ID_ALAC || is_linear_pcm(id)
 }
@@ -402,6 +425,22 @@ mod tests {
                 slack * 100.0
             );
         }
+    }
+
+    #[test]
+    fn f32_exactness_follows_depth_and_sample_type() {
+        use symphonia::core::codecs::audio::well_known::{
+            CODEC_ID_PCM_F32LE, CODEC_ID_PCM_F64LE, CODEC_ID_PCM_S16LE, CODEC_ID_PCM_S24LE,
+            CODEC_ID_PCM_S32LE,
+        };
+        assert!(is_f32_exact(CODEC_ID_PCM_S16LE, Some(16)));
+        assert!(is_f32_exact(CODEC_ID_PCM_S24LE, Some(24)));
+        assert!(is_f32_exact(CODEC_ID_FLAC, Some(24)));
+        assert!(is_f32_exact(CODEC_ID_ALAC, None), "unreported depth");
+        assert!(is_f32_exact(CODEC_ID_PCM_F32LE, Some(32)), "already f32");
+        assert!(!is_f32_exact(CODEC_ID_PCM_S32LE, Some(32)));
+        assert!(!is_f32_exact(CODEC_ID_FLAC, Some(32)));
+        assert!(!is_f32_exact(CODEC_ID_PCM_F64LE, Some(64)));
     }
 
     #[test]

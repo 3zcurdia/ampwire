@@ -62,6 +62,9 @@ pub struct RealPlayer {
     /// EQ on *and* not flat (plan 06): any non-zero preamp/band shapes the
     /// samples, so the bit-perfect marker must go.
     eq_active: bool,
+    /// The current source survives the `f32` pipeline exactly
+    /// ([`StreamInfo::f32_exact`]); false rules out the `bit-perfect` marker.
+    source_exact: bool,
     /// Volume/balance/EQ targets shared with the audio callback (lock-free).
     params: Arc<SharedParams>,
     /// From [`EngineEvent::Started`]; blank while stopped.
@@ -211,6 +214,7 @@ impl RealPlayer {
             balance: 0,
             swap_channels: false,
             eq_active: false,
+            source_exact: true,
             params,
             format: FormatInfo::blank(),
             handle: None,
@@ -252,6 +256,7 @@ impl RealPlayer {
             // but the device no longer receives the decoded layout — so it
             // counts as processing too.
             format.bit_perfect = format.lossless
+                && self.source_exact
                 && self.volume == 100
                 && self.balance == 0
                 && !self.swap_channels
@@ -697,6 +702,7 @@ impl RealPlayer {
             i.and_then(|i| self.playlist.tracks().get(i))
                 .and_then(|t| t.bitrate_kbps)
         };
+        self.source_exact = info.f32_exact;
         self.format = FormatInfo {
             codec: info.codec.clone(),
             // The marker itself is computed in `snapshot()` from the live
@@ -1363,6 +1369,7 @@ mod tests {
         StreamInfo {
             codec: "FLAC".into(),
             lossless: true,
+            f32_exact: true,
             sample_rate: 44_100,
             channels: 2,
             bit_depth: Some(16),
@@ -1913,6 +1920,21 @@ mod tests {
             player.snapshot().format.bit_perfect,
             "back to 100 / 0: bit-perfect again"
         );
+    }
+
+    #[test]
+    fn a_source_f32_cannot_hold_is_lossless_but_not_bit_perfect() {
+        let (mut player, _cmds, events, _params) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        let mut deep = fake_started();
+        deep.codec = "PCM".into();
+        deep.bit_depth = Some(32);
+        deep.f32_exact = false;
+        queue(&events, EngineEvent::Started(deep, fake_handle(0)));
+        player.tick(Duration::ZERO);
+        let format = player.snapshot().format;
+        assert!(format.lossless, "still a lossless codec");
+        assert!(!format.bit_perfect, "rounded to f32 on the way in");
     }
 
     #[test]
