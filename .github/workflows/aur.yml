@@ -1,0 +1,110 @@
+# AUR packaging: validate the PKGBUILD on every change, publish on demand.
+#
+# Publish stays dormant until an AUR account exists and the repository
+# secrets AUR_SSH_PRIVATE_KEY / AUR_USERNAME are configured — see
+# docs/AUR.md for the full runbook. Nothing is published without an
+# explicit workflow_dispatch with publish=true.
+
+name: AUR
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/aur/**"
+      - ".github/workflows/aur.yml"
+  pull_request:
+    paths:
+      - "packaging/aur/**"
+      - ".github/workflows/aur.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish packaging/aur to the AUR (requires AUR credentials)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: aur-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install tooling
+        run: pacman -Syu --noconfirm --needed rust alsa-lib namcap shellcheck
+
+      - name: PKGBUILD syntax and lint
+        working-directory: packaging/aur
+        run: |
+          bash -n PKGBUILD
+          # SC2034/SC2154: makepkg-conventional variables (pkgver, $srcdir…).
+          # SC2164: makepkg runs build functions under errexit.
+          shellcheck -e SC2034,SC2154,SC2164 PKGBUILD
+          namcap PKGBUILD
+
+      - name: .SRCINFO is in sync
+        working-directory: packaging/aur
+        run: makepkg --printsrcinfo | diff -u .SRCINFO -
+
+      - name: Build and package (clean chroot equivalent)
+        run: |
+          useradd -m builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+          sudo -u builder bash -c 'cd packaging/aur && makepkg --noconfirm'
+
+      - name: Package lint and contents
+        working-directory: packaging/aur
+        run: |
+          namcap ./*.pkg.tar.zst
+          tar tf ./*.pkg.tar.zst | sort
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: validate
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Require AUR credentials
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
+        run: |
+          missing=0
+          [ -n "$AUR_SSH_PRIVATE_KEY" ] || { echo "::error::AUR_SSH_PRIVATE_KEY secret is not set (see docs/AUR.md)"; missing=1; }
+          [ -n "$AUR_USERNAME" ] || { echo "::error::AUR_USERNAME secret is not set (see docs/AUR.md)"; missing=1; }
+          exit "$missing"
+
+      - name: Configure AUR SSH key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          pacman -Syu --noconfirm --needed git openssh
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Push packaging/aur to the AUR
+        env:
+          AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
+        run: |
+          git clone ssh://aur@aur.archlinux.org/ampwire.git /tmp/aur-ampwire
+          cp packaging/aur/PKGBUILD packaging/aur/ampwire.desktop packaging/aur/ampwire.svg /tmp/aur-ampwire/
+          cd /tmp/aur-ampwire
+          makepkg --printsrcinfo > .SRCINFO
+          git config user.name "$AUR_USERNAME"
+          git config user.email "$AUR_USERNAME@aur.archlinux.org"
+          git add PKGBUILD .SRCINFO ampwire.desktop ampwire.svg
+          if git diff --cached --quiet; then
+            echo "AUR already up to date."
+            exit 0
+          fi
+          git commit -m "Update to $(bash -c 'source PKGBUILD; echo "$pkgver-$pkgrel"')"
+          git push origin master

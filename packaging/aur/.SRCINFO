@@ -1,0 +1,18 @@
+pkgbase = ampwire
+	pkgdesc = A terminal player inspired by Winamp 2, with modern hi-fi playback
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://ampwire.ezcurdia.dev/
+	arch = x86_64
+	license = MIT
+	makedepends = rust
+	depends = alsa-lib
+	depends = gcc-libs
+	source = ampwire-0.1.0.tar.gz::https://github.com/3zcurdia/ampwire/archive/refs/tags/v0.1.0.tar.gz
+	source = ampwire.desktop
+	source = ampwire.svg
+	sha256sums = 001a9e61c94951721097c21def472f10b4a846a3a80bc1b36d869ebb4048376b
+	sha256sums = 3a1c6cf087f6d10fc0761b25589b088c19a3735188f0c97f94fec5f12794241d
+	sha256sums = 0cda51a86fb34ccceba6ea856490c56a0fc95937c78b86e5f7aefe42d82408c7
+
+pkgname = ampwire

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ampwire
+GenericName=Music Player
+Comment=Terminal music player inspired by Winamp 2, with modern hi-fi playback
+Exec=ampwire
+Terminal=true
+Icon=ampwire
+Categories=AudioVideo;Audio;Player;ConsoleOnly;
+Keywords=music;player;winamp;jellyfin;smb;audio;terminal;
+StartupNotify=false

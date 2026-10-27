@@ -1,7 +1,7 @@
 #!/bin/sh
 # Thin wrapper around the cargo-dist installer for Ampwire.
 # Usage:
-#   curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh
+#   curl --proto '=https' --tlsv1.2 -LsSf https://ampwire.ezcurdia.dev/install.sh | sh
 # Pin a version:
 #   curl .../install.sh | AMPWIRE_VERSION=0.1.0 sh
 set -eu

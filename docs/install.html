@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Install — Ampwire</title>
   <meta name="description" content="Install Ampwire: curl, manual archives, upgrade, uninstall and troubleshooting.">
-  <link rel="canonical" href="https://3zcurdia.github.io/ampwire/install.html">
+  <link rel="canonical" href="https://ampwire.ezcurdia.dev/install.html">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -22,9 +22,15 @@
     <h1>Install</h1>
 
     <h2>Quick install</h2>
-    <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh">
-curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh
+    <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://ampwire.ezcurdia.dev/install.sh | sh">
+curl --proto '=https' --tlsv1.2 -LsSf https://ampwire.ezcurdia.dev/install.sh | sh
     </div>
+
+    <h2>Arch Linux (AUR)</h2>
+    <div class="code" data-copy="paru -S ampwire">
+paru -S ampwire
+    </div>
+    <p>Also with <code>yay -S ampwire</code>, or on Omarchy via <em>Install &rarr; AUR</em> / <code>omarchy pkg add ampwire</code>. The AUR package builds from source against your system toolchain (no glibc floor). It is prepared but not yet listed &mdash; until it appears on the AUR, use the prebuilt installer above or build from source.</p>
 
     <h2>Requirements</h2>
     <ul class="req">
@@ -36,8 +42,8 @@ curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install
 
     <h2>Upgrade</h2>
     <p>Re-run the curl command:</p>
-    <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh">
-curl --proto '=https' --tlsv1.2 -LsSf https://3zcurdia.github.io/ampwire/install.sh | sh
+    <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://ampwire.ezcurdia.dev/install.sh | sh">
+curl --proto '=https' --tlsv1.2 -LsSf https://ampwire.ezcurdia.dev/install.sh | sh
     </div>
 
     <h2>Uninstall</h2>

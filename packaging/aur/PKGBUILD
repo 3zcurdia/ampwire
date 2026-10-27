@@ -1,0 +1,64 @@
+# Maintainer: Ezcurdia <aur@ezcurdia.dev>
+# Contributor: Ampwire CI <aur@ezcurdia.dev>
+#
+# NOTE: pinned to v0.1.0, the first tag. That release predates MPRIS, the
+# control socket and `--status`/`--ctl` (src/mpris.rs, src/control.rs,
+# src/remote.rs landed after the tag), so the Omarchy bar-widget plugin
+# needs >= 0.2.0. Bump pkgver + sha256sums here when that release is cut;
+# see docs/AUR.md for the publish procedure.
+
+pkgname=ampwire
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A terminal player inspired by Winamp 2, with modern hi-fi playback"
+arch=('x86_64')
+url="https://ampwire.ezcurdia.dev/"
+license=('MIT')
+depends=('alsa-lib' 'gcc-libs')
+makedepends=('rust')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/3zcurdia/ampwire/archive/refs/tags/v$pkgver.tar.gz"
+        'ampwire.desktop'
+        'ampwire.svg')
+sha256sums=('001a9e61c94951721097c21def472f10b4a846a3a80bc1b36d869ebb4048376b'
+            '3a1c6cf087f6d10fc0761b25589b088c19a3735188f0c97f94fec5f12794241d'
+            '0cda51a86fb34ccceba6ea856490c56a0fc95937c78b86e5f7aefe42d82408c7')
+
+# makepkg's `lto` buildenv (prepare_buildenv, which runs after prepare() and
+# right before build()) appends LTOFLAGS (-flto=auto) to CFLAGS/CXXFLAGS.
+# That makes GCC emit *slim LTO* objects for ring's C shims: they carry no
+# machine code and no usable symbol map, so once rustc bundles them into the
+# rlib, rust-lld fails with `undefined symbol: ring_core_*`. Drop -flto so
+# the C shims are built as ordinary objects; the Rust side is unaffected.
+_strip_lto() {
+  CFLAGS="$(sed -E 's/(^| )-flto(=[^ ]*)?//g' <<<"$CFLAGS")"
+  CXXFLAGS="$(sed -E 's/(^| )-flto(=[^ ]*)?//g' <<<"$CXXFLAGS")"
+  export CFLAGS CXXFLAGS
+}
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  _strip_lto
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  # Plain `cargo test` opens no sound card and touches no network; the
+  # real-server tests are #[ignore]d and need AMPWIRE_SMB_TEST_* set.
+  _strip_lto
+  cargo test --frozen
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 "$srcdir/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
+  install -Dm644 "$srcdir/$pkgname.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/$pkgname.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
