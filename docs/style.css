@@ -78,6 +78,28 @@ details { background: var(--panel); border: 1px solid var(--border); border-radi
 summary { cursor: pointer; color: var(--accent); }
 .aria-live { position: absolute; left: -9999px; }
 img { max-width: 100%; height: auto; }
+.eyebrow { margin: 0; color: var(--muted); font-size: .78rem; letter-spacing: .14em; text-transform: uppercase; }
+.lead { margin: .25rem 0 .5rem; font-size: 1.35rem; line-height: 1.35; }
+.sub { color: var(--muted); }
+.cta { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .5rem; }
+.cta a { display: inline-block; padding: .55rem .9rem; border: 1px solid var(--border); border-radius: 6px; color: var(--fg); text-decoration: none; }
+.cta a:hover { border-color: var(--accent); }
+.cta a.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 700; }
+.cta a.primary:hover { background: var(--fg); border-color: var(--fg); }
+.grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); margin: 1.5rem 0; }
+.grid.two { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.1rem; }
+.card h3 { margin: 0 0 .45rem; color: var(--glow); font-size: 1rem; }
+.card p { margin: 0; color: var(--muted); font-size: .92rem; }
+.card code { color: var(--fg); }
+.section-lead { max-width: 70ch; color: var(--muted); }
+.note { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--glow); border-radius: 6px; padding: .85rem 1rem; color: var(--muted); }
+.note strong { color: var(--fg); }
+.soon { display: inline-block; margin-left: .4rem; padding: .18rem .45rem; border: 1px solid var(--glow); border-radius: 3px; color: var(--glow); font-size: .65rem; letter-spacing: .1em; text-transform: uppercase; vertical-align: middle; }
+.gallery { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); align-items: start; margin: 1.5rem 0; }
+.gallery figure { margin: 0; }
+.gallery figcaption { margin-top: .5rem; color: var(--muted); font-size: .8rem; text-align: center; }
+kbd { padding: .05rem .35rem; background: var(--code-bg); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; color: var(--fg); font: inherit; font-size: .85em; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }

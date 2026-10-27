@@ -47,8 +47,9 @@ dependency. The build is fully offline after `cargo fetch --locked`
 3. Check <https://aur.archlinux.org/packages/ampwire>: the page appears after
    the first push. From then on users install with `paru -S ampwire` / `yay -S ampwire`
    (or on Omarchy: *Install → AUR* / `omarchy pkg add ampwire`).
-4. Once the listing is live, drop the "not yet listed" caveat from
-   `README.md` and `docs/install.html` (the *Arch Linux (AUR)* sections).
+4. Once the listing is live, drop the "coming soon" caveat from `README.md`,
+   `docs/index.html` and `docs/install.html` (the *Arch Linux (AUR)* sections)
+   and show the `paru -S ampwire` / `yay -S ampwire` install commands again.
 
 ## Bumping the version
 

@@ -3,14 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ampwire — a terminal player inspired by Winamp 2</title>
-  <meta name="description" content="A terminal player inspired by Winamp 2, made for audiophiles — original-resolution playback with no transcoding or resampling.">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Ampwire — bit-perfect music in your terminal</title>
+  <meta name="description" content="A terminal music player for hi-fi listening. No transcoding, no resampling, no normalization: your music decoded once, locally, and played at its native sample rate and channel count.">
   <link rel="canonical" href="https://ampwire.ezcurdia.dev/">
-  <meta property="og:title" content="Ampwire">
-  <meta property="og:description" content="A terminal player inspired by Winamp 2, made for audiophiles — original-resolution playback with no transcoding or resampling.">
+  <meta property="og:title" content="Ampwire — bit-perfect music in your terminal">
+  <meta property="og:description" content="No transcoding. No resampling. No normalization. A Winamp 2-inspired terminal player for people who care about the signal.">
+  <meta property="og:image" content="https://ampwire.ezcurdia.dev/images/neon.png">
+  <meta property="og:image:alt" content="Ampwire playing a 24/96 FLAC file in the terminal">
   <meta property="og:url" content="https://ampwire.ezcurdia.dev/">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Ampwire">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://ampwire.ezcurdia.dev/images/neon.png">
+  <meta name="twitter:image:alt" content="Ampwire playing a 24/96 FLAC file in the terminal">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -25,39 +31,103 @@
   </header>
   <main id="main">
     <section class="hero">
+      <p class="eyebrow">Terminal music player · hi-fi first</p>
       <h1>Ampwire</h1>
-      <p>Ampwire is built for hi-fi listening: <strong>reproduce the source as it is</strong>, never transcode it into something more convenient — from a UI that looks like Winamp 2 at the turn of the millennium.</p>
-      <img src="images/neon.png" alt="Ampwire main window" width="1200" height="600">
-      <div>
-        <p><strong>Inspired by Winamp 2</strong>, implemented from scratch for the terminal — and built for audiophiles: modern hi-fi playback that never transcodes or resamples the source.</p>
-        <p>It borrows Winamp 2's anatomy — player, equalizer, playlist — rendered as a keyboard-driven Ratatui TUI in a btop-style cyberpunk-retro look. It is <em>not</em> a port, clone or replica of Winamp: the UI, the playback engine and the library handling are all written for the terminal from scratch.</p>
-        <p>Local lossless files, Jellyfin server streaming, native SMB shares — no kernel mount, no libsmbclient. Keyboard-driven Ratatui TUI.</p>
+      <p class="lead">Your music, exactly as it was mastered.</p>
+      <p>Ampwire plays the original signal. <strong>No transcoding. No resampling. No normalization.</strong> The bytes on your disk &mdash; or on your server &mdash; are decoded once, locally, and played at the track's own sample rate and channel count.</p>
+      <p class="sub">Winamp 2's anatomy rebuilt from scratch for the terminal: player, spectrum, 10-band EQ and playlist in a keyboard-driven Ratatui TUI.</p>
+      <div class="cta">
+        <a class="primary" href="#install">Install Ampwire</a>
+        <a href="https://github.com/3zcurdia/ampwire">View source</a>
+        <a href="install.html">Install guide</a>
       </div>
+      <img src="images/neon.png" alt="Ampwire playing a 24/96 FLAC file, showing the player, spectrum, equalizer and playlist panels" width="1492" height="867" fetchpriority="high">
     </section>
 
-    <h2>For audiophiles</h2>
-    <ul>
-      <li><strong>No transcoding.</strong> Nothing is re-encoded to another resolution or bitrate. Jellyfin is asked for the original file (<code>static=true</code>), SMB shares are read for their original bytes, and everything is decoded locally.</li>
-      <li><strong>No resampling.</strong> The output stream opens at the track's own sample rate and channel count; if the device cannot play that exact format, the track is reported as unplayable rather than converted to fit.</li>
-      <li><strong>No normalization, dithering or loudness matching.</strong> At volume 100, centered balance, no channel swap and a flat or off EQ, lossless playback is marked <code>bit-perfect</code> — the decoded samples pass through untouched. Volume, balance and the 10-band EQ are opt-in processing, never applied silently.</li>
-      <li><strong>Gapless</strong> between tracks with the same sample rate and channel count: the next decoder is swapped into the running stream at EOF, with no silence, click or device reopen.</li>
-      <li><strong>Decoded locally</strong> from FLAC, WAV/PCM, ALAC/AAC (M4A) and MP3 via Symphonia and cpal — local files, Jellyfin and SMB take the same path.</li>
-    </ul>
+    <h2 id="signal">The signal stays intact</h2>
+    <p class="section-lead">Most players are happy to convert your files into something more convenient. Ampwire is built the other way around: the file you own is the file you hear.</p>
+    <div class="grid two">
+      <article class="card">
+        <h3>No transcoding</h3>
+        <p>Nothing is re-encoded to a friendlier bitrate or format. Jellyfin is always asked for the original file (<code>static=true</code>); SMB shares are read for their original bytes. Whatever arrives is decoded locally &mdash; never converted.</p>
+      </article>
+      <article class="card">
+        <h3>No resampling</h3>
+        <p>The output stream opens at the track's own sample rate and channel count. If the default device cannot play that exact format, the track is reported as unplayable instead of quietly converted to fit.</p>
+      </article>
+      <article class="card">
+        <h3>Nothing applied silently</h3>
+        <p>At volume 100, centered balance, no channel swap and a flat or off EQ, the decoded samples pass through untouched &mdash; lossless playback is marked <code>bit-perfect</code>. Volume, balance and the 10-band EQ are opt-in processing, never automatic.</p>
+      </article>
+      <article class="card">
+        <h3>Gapless, for real</h3>
+        <p>Tracks that share a sample rate and channel count are joined inside the running stream: the next decoder is swapped in at EOF, with no silence, no click and no device reopen.</p>
+      </article>
+    </div>
+    <p class="note"><strong>What <code>bit-perfect</code> means here.</strong> It describes Ampwire's own chain: its volume, balance and EQ stages are bypassed. The OS mixer &mdash; PipeWire, CoreAudio, Bluetooth &mdash; can still resample on the way to the DAC, and Ampwire does not pretend otherwise.</p>
 
-    <h2>Install</h2>
+    <h2 id="sources">One player, all your sources</h2>
+    <p class="section-lead">Local folders, a Jellyfin server and native SMB shares all take the same decode path. No mount, no <code>libsmbclient</code>, no third-party service in the middle of your music.</p>
+    <div class="grid">
+      <article class="card">
+        <h3>Local files</h3>
+        <p>Load a folder or a single file. FLAC, WAV/PCM, MP3 and M4A (AAC or ALAC), decoded by Symphonia and played through cpal.</p>
+      </article>
+      <article class="card">
+        <h3>Jellyfin</h3>
+        <p>Press <kbd>j</kbd> and the whole server library lands in the playlist. Cache originals ahead of playback, stream with HTTP Range, or stream with the EQ bypassed &mdash; always the original file, never a transcode.</p>
+      </article>
+      <article class="card">
+        <h3>SMB shares</h3>
+        <p><code>smb://nas/Music</code> works anywhere a path does, through a native SMB2/3 client in pure Rust. No kernel mount, no extra system library.</p>
+      </article>
+    </div>
+
+    <h2 id="winamp">Winamp 2's soul, without the baggage</h2>
+    <p>Ampwire borrows Winamp 2's anatomy &mdash; player, equalizer, playlist &mdash; and nothing else. It is not a port, a clone or a skin: the UI, the playback engine and the library handling are written from scratch for the terminal.</p>
+    <p>What you get is a btop-style cyberpunk-retro frame around a modern Rust audio path: a live spectrum, LCD clock and seek bar that follow what is actually being heard, a 10-band EQ with presets, full-permutation shuffle, live search and album &rarr; disc &rarr; track ordering on load.</p>
+    <div class="grid">
+      <article class="card">
+        <h3>Keyboard only</h3>
+        <p><kbd>Space</kbd> play/pause, <kbd>l</kbd> open, <kbd>j</kbd> Jellyfin, <kbd>/</kbd> find, <kbd>?</kbd> the full keymap. Every action is remappable in <code>config.toml</code>.</p>
+      </article>
+      <article class="card">
+        <h3>Themed like your desktop</h3>
+        <p>On Omarchy the UI follows the active theme live. Or pick <code>neon</code>, <code>amber</code>, <code>matrix</code> or <code>synthwave</code>; non-truecolor terminals get a nearest 256-color mapping.</p>
+      </article>
+      <article class="card">
+        <h3>Media keys and scripts</h3>
+        <p>MPRIS2 on Linux exposes Ampwire to media keys, lock screens and <code>playerctl</code>. <code>ampwire --status --json</code> reports the real format and bit-perfect state; <code>--ctl</code> drives the running session.</p>
+      </article>
+    </div>
+    <div class="gallery">
+      <figure>
+        <img src="images/vertical.png" alt="Ampwire single-column layout with the neon theme" width="937" height="1028" loading="lazy">
+        <figcaption>Single column, neon theme</figcaption>
+      </figure>
+      <figure>
+        <img src="images/vertical-lumon.png" alt="Ampwire single-column layout with the Lumon light theme" width="937" height="1028" loading="lazy">
+        <figcaption>Single column, Lumon theme</figcaption>
+      </figure>
+    </div>
+
+    <h2 id="install">Install</h2>
     <p>Prebuilt binaries for macOS (Apple Silicon / Intel) and Linux (x86_64 / arm64):</p>
     <div class="install-box">
-      <p>macOS / Linux (curl):</p>
+      <p>macOS / Linux</p>
       <div class="code" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://ampwire.ezcurdia.dev/install.sh | sh">
 curl --proto '=https' --tlsv1.2 -LsSf https://ampwire.ezcurdia.dev/install.sh | sh
       </div>
     </div>
 
-    <h2>Requirements</h2>
+    <h3>Arch Linux (AUR) <span class="soon">coming soon</span></h3>
+    <p>The source-built AUR package is prepared in <code>packaging/aur/</code> and will be published as soon as AUR registration reopens. It builds against your system toolchain, so it has no glibc floor. Until then, use the prebuilt installer above or <a href="https://github.com/3zcurdia/ampwire#from-source">build from source</a>.</p>
+
+    <h3>Requirements</h3>
     <ul class="req">
       <li>macOS (Apple Silicon or Intel) or Linux with glibc &ge; 2.35.</li>
       <li>Linux: ALSA runtime (<code>libasound2</code> / <code>libasound2t64</code> on Debian/Ubuntu, <code>alsa-lib</code> on Fedora/Arch, <code>alsa</code> on openSUSE).</li>
-      <li>A real TTY; minimum terminal 40&times;3.</li>
+      <li>A real TTY; minimum terminal 40&times;3 (104&times;18 or larger recommended).</li>
       <li>Windows is unsupported.</li>
     </ul>
 
@@ -68,31 +138,20 @@ ampwire ~/Music
     <div class="code" data-copy="ampwire smb://nas/Music">
 ampwire smb://nas/Music
     </div>
-    <p><code>j</code> loads a Jellyfin library (if configured), <code>q</code> quits. <code>ampwire --demo</code> runs a no-audio tour. <code>ampwire --help</code> for options.</p>
-
-    <h2>Playback</h2>
-    <ul>
-      <li>Formats: WAV/PCM, FLAC, MP3, M4A (AAC or ALAC) — decoded with Symphonia and played through cpal <strong>at the track's own sample rate and channel count</strong> (no resampling; lossless sources show <code>bit-perfect</code>).</li>
-      <li>Play order: ordered (default) or full-permutation shuffle (<code>s</code> — every track plays once per round), repeat (<code>r</code>). Tracks auto-advance.</li>
-      <li>Gapless between same-format tracks: the engine pre-opens the next track and swaps decoders inside the running stream at EOF.</li>
-      <li>Jellyfin: with <code>[jellyfin]</code> configured, <code>j</code> loads every audio track on the server; <code>cache</code>, <code>stream</code> or <code>stream_pure</code> modes.</li>
-      <li>SMB: <code>smb://server/share/path</code> — a native SMB2/3 client (pure Rust, no <code>libsmbclient</code>, no kernel mount); <code>cache</code> or <code>stream</code> mode.</li>
-      <li>Volume, balance, <code>swap_channels</code> and a 10-band equalizer + preamp, all live in <code>config.toml</code>.</li>
-    </ul>
+    <p>Press <kbd>j</kbd> for a configured Jellyfin library, <kbd>l</kbd> to open a path, <kbd>?</kbd> for the full keymap and <kbd>q</kbd> to quit. <code>ampwire --demo</code> takes a no-audio tour; <code>ampwire --help</code> lists every option.</p>
 
     <h2>Verify the download</h2>
-    <p>Checksums ship with every release:</p>
+    <p>Every release ships SHA-256 checksums and signed build attestations.</p>
     <div class="code" data-copy="shasum -a 256 -c ampwire-*.tar.xz.sha256">
 shasum -a 256 -c ampwire-*.tar.xz.sha256   # macOS
 sha256sum -c ampwire-*.tar.xz.sha256        # Linux
     </div>
-    <p>Attestations:</p>
     <div class="code" data-copy="gh attestation verify ampwire-*.tar.xz --repo 3zcurdia/ampwire">
 gh attestation verify ampwire-*.tar.xz --repo 3zcurdia/ampwire
     </div>
 
-    <h2>More</h2>
-    <p><a href="https://github.com/3zcurdia/ampwire/blob/main/README.md">Full README</a> (keymap, configuration). <a href="https://github.com/3zcurdia/ampwire/releases">GitHub Releases</a>.</p>
+    <h2>Documentation</h2>
+    <p><a href="install.html">Install guide</a> &mdash; requirements, upgrades, uninstall and troubleshooting. <a href="https://github.com/3zcurdia/ampwire#readme">README</a> &mdash; full keymap, configuration and design notes. <a href="https://github.com/3zcurdia/ampwire/releases">Releases</a> &mdash; archives, checksums and attestations. <a href="https://github.com/3zcurdia/ampwire/issues">Issues</a> &mdash; bugs and feature requests.</p>
 
     <p class="aria-live" id="copy-status" aria-live="polite"></p>
   </main>

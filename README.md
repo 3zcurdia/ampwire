@@ -26,15 +26,9 @@ Prebuilt binaries for macOS (Apple Silicon / Intel) and Linux (x86_64 / arm64):
 curl --proto '=https' --tlsv1.2 -LsSf https://ampwire.ezcurdia.dev/install.sh | sh
 ```
 
-Arch Linux (AUR):
-
-```sh
-paru -S ampwire   # or: yay -S ampwire — on Omarchy: omarchy pkg add ampwire
-```
-
-The AUR package builds from source against your system toolchain (no glibc
-floor). It is prepared in `packaging/aur/` but not yet listed — until it
-appears on the AUR, use the prebuilt installer above or build from source.
+Arch Linux (AUR): **coming soon.** The source-built package (no glibc floor) is
+prepared in `packaging/aur/` and will be published once AUR registration
+reopens. Until then, use the prebuilt installer above or build from source.
 
 See the [install guide](https://ampwire.ezcurdia.dev/install.html) for requirements, upgrade, uninstall and troubleshooting. Prebuilt archive requirements: macOS or Linux with glibc ≥ 2.35; on Linux the ALSA runtime (`libasound2` / `libasound2t64` on Debian/Ubuntu, `alsa-lib` on Fedora/Arch, `alsa` on openSUSE). Windows is unsupported.
 
