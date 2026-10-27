@@ -26,6 +26,7 @@
   <main id="main">
     <section class="hero">
       <h1>Ampwire</h1>
+      <p>Ampwire is built for hi-fi listening: <strong>reproduce the source as it is</strong>, never transcode it into something more convenient — from a UI that looks like Winamp 2 at the turn of the millennium.</p>
       <img src="images/neon.png" alt="Ampwire main window" width="1200" height="600">
       <div>
         <p>A terminal player <strong>inspired by Winamp 2</strong>, implemented from scratch for the terminal — and built for audiophiles: modern hi-fi playback that never transcodes or resamples the source.</p>
@@ -35,7 +36,6 @@
     </section>
 
     <h2>For audiophiles</h2>
-    <p>Ampwire is built for hi-fi listening: <strong>reproduce the source as it is</strong>, never transcode it into something more convenient — from a UI that looks like Winamp 2 at the turn of the millennium.</p>
     <ul>
       <li><strong>No transcoding.</strong> Nothing is re-encoded to another resolution or bitrate. Jellyfin is asked for the original file (<code>static=true</code>), SMB shares are read for their original bytes, and everything is decoded locally.</li>
       <li><strong>No resampling.</strong> The output stream opens at the track's own sample rate and channel count; if the device cannot play that exact format, the track is reported as unplayable rather than converted to fit.</li>
