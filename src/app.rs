@@ -2343,6 +2343,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         };
 
         app.scan_mode = ScanMode::Replace;
@@ -2969,6 +2970,7 @@ mod tests {
             title: Some(format!("t-{id}")),
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 

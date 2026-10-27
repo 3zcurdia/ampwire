@@ -1321,6 +1321,7 @@ mod tests {
                 title: Some(format!("Track {i}")),
                 duration: None,
                 bitrate_kbps: None,
+                pos: Default::default(),
             })
             .collect()
     }
@@ -2355,6 +2356,7 @@ mod tests {
             title: Some(format!("R {id}")),
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 
@@ -2686,6 +2688,7 @@ mod tests {
             title: Some(format!("S {title}")),
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 

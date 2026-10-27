@@ -18,10 +18,12 @@ use crate::jellyfin::Client;
 pub const KEY: &str = "testkey-0123456789abcdef";
 
 /// Two library items: the first has no `Artists` (falls back to
-/// `AlbumArtist`) and an unknown extra field; the second has no
-/// `RunTimeTicks` (no duration). `TotalRecordCount` outgrows one page, so
-/// the loader really pages (`Page, Page, Done`).
-const ITEMS_PAGE: &str = r#"{"Items":[{"Id":"item1","Name":"Song One","AlbumArtist":"The Album Artist","RunTimeTicks":2500000000,"Container":"mp3","MediaSources":[{"Bitrate":320000,"Container":"mp3"}],"SomethingUnknown":{"nested":[1,2],"flag":true}},{"Id":"item2","Name":"Song Two","Artists":["Artist Two"],"Container":"flac","MediaSources":[{"Bitrate":1000000,"Container":"flac"}]}],"TotalRecordCount":600}"#;
+/// `AlbumArtist`), carries the album-position fields (`Album`,
+/// `IndexNumber`, `ParentIndexNumber`, plan 12) and an unknown extra
+/// field; the second has no `RunTimeTicks` (no duration).
+/// `TotalRecordCount` outgrows one page, so the loader really pages
+/// (`Page, Page, Done`).
+const ITEMS_PAGE: &str = r#"{"Items":[{"Id":"item1","Name":"Song One","AlbumArtist":"The Album Artist","Album":"The Album","IndexNumber":3,"ParentIndexNumber":2,"RunTimeTicks":2500000000,"Container":"mp3","MediaSources":[{"Bitrate":320000,"Container":"mp3"}],"SomethingUnknown":{"nested":[1,2],"flag":true}},{"Id":"item2","Name":"Song Two","Artists":["Artist Two"],"Container":"flac","MediaSources":[{"Bitrate":1000000,"Container":"flac"}]}],"TotalRecordCount":600}"#;
 /// What later pages return (the loader stops on the empty page).
 const ITEMS_EMPTY: &str = r#"{"Items":[],"TotalRecordCount":600}"#;
 const USERS: &str = r#"[{"Name":"tester","Id":"user1"}]"#;

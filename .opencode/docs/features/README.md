@@ -4,7 +4,7 @@ Plan `01` (layout) is done. Plans `02`–`08` turn the mock UI into a real playe
 `09` (gapless) came out of the 2026-10-23 audit; `10` (native SMB shares) was
 finished on 2026-10-25. Plan `11` is release/distribution work (GitHub
 Releases, the curl-to-sh installer and the GitHub Pages site), not player
-behavior.
+behavior. Plan `12` changes the playlist sort to album → disc → track.
 **Do them in numeric order.** Each plan lists its prerequisites and assumes
 the earlier ones are merged.
 
@@ -20,6 +20,7 @@ the earlier ones are merged.
 | [08](08-jellyfin.md) | ✅ done | Jellyfin server → playlist; temp-dir cache (3 ahead/3 behind) or HTTP streaming, optional EQ bypass | 03, 04, 05, 06 |
 | [09](09-gapless.md) | ✅ done | Gapless playback between same-format tracks; device/config cache | 03, 04, 05, 06, 08 |
 | [10](10-samba.md) | ✅ done | Native Samba: `smb://` as a file URL (scan, cache or stream, gapless) | 03, 04, 05, 06, 08, 09 |
+| [12](12-track-order.md) | ✅ done | Playlist order: album → disc → track, alphabetical fallback | 02, 08, 10 |
 
 ## Status line — read it before you touch a plan
 
@@ -86,7 +87,9 @@ in sync.
 
 - Load: CLI args **and** an in-app path prompt. Directories are scanned recursively.
 - Playlist controls: add / remove / clear / reorder / find-filter. Default order:
-  alphabetical by `artist - title`; untagged files sort by full path.
+  album → disc → track number (grouped by album tag, folder when it is
+  missing); tracks with no track number keep the `artist - title` order, and
+  untagged files sort by full path.
 - Audio: `symphonia` (decode) + `cpal` (output). Auto-advance at end of track;
   unreadable files are skipped with a notice.
 - Spectrum: real FFT, log-spaced bars. Timer comes from samples actually played.

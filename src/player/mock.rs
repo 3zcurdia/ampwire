@@ -110,6 +110,7 @@ fn fake_tracks() -> Vec<Track> {
                 title: Some(title.into()),
                 duration: Some(Duration::from_secs(secs)),
                 bitrate_kbps: None,
+                pos: Default::default(),
             }
         })
         .collect()

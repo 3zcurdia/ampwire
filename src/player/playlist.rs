@@ -76,7 +76,8 @@ impl Playlist {
     }
 
     /// Append exactly as given (plan 08): server pages arrive already
-    /// sorted by `Artist, SortName`, so the client must not re-sort them.
+    /// sorted by `AlbumArtist, Album, ParentIndexNumber, IndexNumber,
+    /// SortName`, so the client must not re-sort them.
     pub fn append_in_order(&mut self, new: Vec<Track>) {
         Arc::make_mut(&mut self.tracks).extend(new);
     }
@@ -181,7 +182,7 @@ mod tests {
     use super::*;
     use crate::player::TrackSource;
 
-    /// A tagged track keyed on `artist` (title empty), so `sort_key` is
+    /// A tagged track keyed on `artist` (title empty), so `alpha_key` is
     /// `"<key> - "` and sorting follows `key`.
     fn track(key: &str) -> Track {
         Track {
@@ -191,6 +192,7 @@ mod tests {
             title: Some(String::new()),
             duration: Some(Duration::from_secs(60)),
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 
@@ -229,6 +231,67 @@ mod tests {
         b.id = 2;
         p.append_sorted(vec![a, b]);
         assert_eq!(p.tracks().iter().map(|t| t.id).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    /// Plan 12: one mixed batch — a scrambled album, an un-numbered
+    /// tagged track and an untagged file — comes out album-grouped, then
+    /// disc, then track number; the others keep today's alpha order.
+    #[test]
+    fn append_sorted_orders_albums_by_disc_and_track() {
+        fn album(path: &str, artist: &str, album: &str, number: u32) -> Track {
+            let mut t = Track {
+                id: Track::next_id(),
+                source: TrackSource::Local(PathBuf::from(path)),
+                artist: Some(artist.into()),
+                title: Some(format!("{album} track {number}")),
+                duration: None,
+                bitrate_kbps: None,
+                pos: Default::default(),
+            };
+            t.pos.album = Some(album.into());
+            t.pos.number = Some(number);
+            t
+        }
+        let untagged = Track {
+            id: Track::next_id(),
+            source: TrackSource::Local(PathBuf::from("/m/untagged.flac")),
+            artist: None,
+            title: None,
+            duration: None,
+            bitrate_kbps: None,
+            pos: Default::default(),
+        };
+
+        let mut p = Playlist::new();
+        p.append_sorted(vec![
+            album("/m/b/02.flac", "Bee", "Beta", 2), // scrambled on purpose
+            track("a"),                              // un-numbered: today's order
+            album("/m/b/01.flac", "Bee", "Beta", 1),
+            untagged,
+            album("/m/a/01.flac", "Aph", "Alpha", 1),
+        ]);
+
+        let paths: Vec<String> = p
+            .tracks()
+            .iter()
+            .map(|t| match &t.source {
+                TrackSource::Local(path) => path.to_string_lossy().into_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                // Untagged: its path key starts with "/", before any letter.
+                "/m/untagged.flac".to_string(),
+                // Un-numbered "a - " stays in alphabetical position.
+                "/x/a.flac".to_string(),
+                // The two albums, grouped and in number order.
+                "/m/a/01.flac".to_string(),
+                "/m/b/01.flac".to_string(),
+                "/m/b/02.flac".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -332,6 +395,7 @@ mod tests {
             title: Some(format!("title-{id}")),
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 
@@ -339,8 +403,9 @@ mod tests {
     fn append_in_order_keeps_the_server_order_and_existing_tracks() {
         let mut p = playlist(&["b", "c"]);
         p.set_current(Some(0));
-        // Deliberately unsorted: the server already sorted by Artist,SortName
-        // and plan 08 forbids a second client-side sort.
+        // Deliberately unsorted: the server already sorted by
+        // AlbumArtist,Album,ParentIndexNumber,IndexNumber,SortName and
+        // plan 08 forbids a second client-side sort.
         p.append_in_order(vec![remote("zz"), remote("aa")]);
         assert_eq!(
             p.tracks()

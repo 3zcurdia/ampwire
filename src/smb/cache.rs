@@ -512,6 +512,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 
@@ -523,6 +524,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 
@@ -537,6 +539,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 

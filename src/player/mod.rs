@@ -158,6 +158,30 @@ fn path_stem(path: &std::path::Path) -> &str {
         .unwrap_or("?")
 }
 
+/// Album position tags (plan 12): what the playlist groups and orders by
+/// before falling back to [`Track::alpha_key`]. All `None` for a file
+/// without such tags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlbumPos {
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    /// Disc number, `None` when missing or `0`.
+    pub disc: Option<u32>,
+    /// Track number on the disc, `None` when missing or `0`.
+    pub number: Option<u32>,
+}
+
+/// What [`Playlist::append_sorted`][crate::player::playlist::Playlist::append_sorted]
+/// sorts on (plan 12): album group, disc, track number, then today's
+/// alphabetical key. Field order is the comparison order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SortKey {
+    group: String,
+    disc: u32,
+    number: u32,
+    alpha: String,
+}
+
 /// One playlist entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
@@ -169,6 +193,8 @@ pub struct Track {
     /// Lossy only: tagged (or estimated) bitrate in kbps. `None` for
     /// lossless sources and unknown files.
     pub bitrate_kbps: Option<u32>,
+    /// Album/disc/track tags that drive the sort (plan 12).
+    pub pos: AlbumPos,
 }
 
 impl Track {
@@ -194,11 +220,9 @@ impl Track {
         }
     }
 
-    /// Sort order: `artist - title` (lowercased) when both tags exist,
-    /// otherwise the full path as a lowercased string. A remote row has no
-    /// path, so it sorts on the title (the server's `Name`); an SMB row
-    /// sorts on its canonical URL.
-    pub fn sort_key(&self) -> String {
+    /// Today's alphabetical order (plans 02/08/10), used as the tie-break
+    /// and as the whole key when a track has no track number.
+    pub fn alpha_key(&self) -> String {
         match (&self.artist, &self.title) {
             (Some(artist), Some(title)) => format!("{artist} - {title}").to_lowercase(),
             _ => match &self.source {
@@ -206,6 +230,60 @@ impl Track {
                 TrackSource::Remote { .. } => self.title.clone().unwrap_or_default().to_lowercase(),
                 TrackSource::Smb { url } => url.canonical().to_lowercase(),
             },
+        }
+    }
+
+    /// Sort order (plan 12): a track with a track number sorts inside its
+    /// album group by disc (missing = 1) then number; a track without one
+    /// sorts exactly as before ([`alpha_key`][Self::alpha_key]).
+    pub fn sort_key(&self) -> SortKey {
+        let alpha = self.alpha_key();
+        match self.pos.number {
+            Some(number) => SortKey {
+                group: self.album_group().unwrap_or_else(|| self.folder_key()),
+                disc: self.pos.disc.unwrap_or(1),
+                number,
+                alpha,
+            },
+            None => SortKey {
+                group: alpha.clone(),
+                disc: 0,
+                number: 0,
+                alpha,
+            },
+        }
+    }
+
+    /// `"<album artist> - <album>"` lowercased (album artist falls back to
+    /// the track artist); `None` without an album tag.
+    fn album_group(&self) -> Option<String> {
+        let album = self.pos.album.as_deref()?;
+        let artist = self.pos.album_artist.as_deref().or(self.artist.as_deref());
+        let group = match artist {
+            Some(artist) => format!("{artist} - {album}"),
+            None => album.to_string(),
+        };
+        Some(group.to_lowercase())
+    }
+
+    /// The folder holding the track, lowercased, ending in `/` (so a
+    /// folder's numbered tracks sort right before its un-numbered files,
+    /// whose path key starts with the same text). A Jellyfin row has no
+    /// folder and falls back to its alpha key.
+    fn folder_key(&self) -> String {
+        match &self.source {
+            TrackSource::Local(path) => match path.parent() {
+                Some(dir) => format!("{}/", dir.to_string_lossy().to_lowercase()),
+                None => self.alpha_key(),
+            },
+            TrackSource::Smb { url } => {
+                let canonical = url.canonical().to_lowercase();
+                match canonical.rsplit_once('/') {
+                    Some((dir, _)) => format!("{dir}/"),
+                    None => canonical,
+                }
+            }
+            TrackSource::Remote { .. } => self.alpha_key(),
         }
     }
 
@@ -298,7 +376,8 @@ pub enum PlayerCommand {
     /// Append, sorted among themselves.
     AddTracks(Vec<Track>),
     /// Append without sorting (plan 08): remote tracks keep the server's
-    /// `Artist, SortName` order instead of being re-sorted client-side.
+    /// `AlbumArtist, Album, ParentIndexNumber, IndexNumber, SortName`
+    /// order instead of being re-sorted client-side.
     AppendInOrder(Vec<Track>),
     /// Remove every Jellyfin track (the `j` reload rule: drop the old
     /// remote batch before the new one arrives). Stops playback when the
@@ -327,6 +406,7 @@ mod tests {
             title: title.map(str::to_string),
             duration: None,
             bitrate_kbps: None,
+            pos: AlbumPos::default(),
         }
     }
 
@@ -350,13 +430,13 @@ mod tests {
     }
 
     #[test]
-    fn sort_key_is_artist_title_or_path_lowercase() {
+    fn alpha_key_is_artist_title_or_path_lowercase() {
         assert_eq!(
-            local("/M/A.flac", Some("Aphex Twin"), Some("Xtal")).sort_key(),
+            local("/M/A.flac", Some("Aphex Twin"), Some("Xtal")).alpha_key(),
             "aphex twin - xtal"
         );
         assert_eq!(
-            local("/M/01 Intro.flac", None, None).sort_key(),
+            local("/M/01 Intro.flac", None, None).alpha_key(),
             "/m/01 intro.flac"
         );
     }
@@ -383,6 +463,7 @@ mod tests {
             title: title.map(str::to_string),
             duration: None,
             bitrate_kbps: None,
+            pos: AlbumPos::default(),
         }
     }
 
@@ -398,6 +479,7 @@ mod tests {
             title: Some(format!("title-{id}")),
             duration: None,
             bitrate_kbps: None,
+            pos: AlbumPos::default(),
         }
     }
 
@@ -426,10 +508,10 @@ mod tests {
         // Sorting: canonical URL, lowercased (the path keeps its case
         // until the sort folds it, and the server is folded first).
         assert_eq!(
-            smb("Album/01 Intro.flac", None, None).sort_key(),
+            smb("Album/01 Intro.flac", None, None).alpha_key(),
             "smb://nas/music/album/01 intro.flac"
         );
-        assert_eq!(smb("", None, None).sort_key(), "smb://nas/music");
+        assert_eq!(smb("", None, None).alpha_key(), "smb://nas/music");
     }
 
     /// Plan 10, step 2: `is_remote()` covers both non-local sources (the
@@ -446,6 +528,160 @@ mod tests {
 
         let disk = local("/m/a.flac", None, None);
         assert!(!disk.is_remote() && !disk.is_jellyfin());
+    }
+
+    // --- album order (plan 12) ---
+
+    /// A local track with album-position tags (plan 12).
+    fn numbered(path: &str, album: Option<&str>, disc: Option<u32>, number: Option<u32>) -> Track {
+        let mut t = local(path, Some("Artist"), Some(path));
+        t.pos = AlbumPos {
+            album: album.map(str::to_string),
+            album_artist: None,
+            disc,
+            number,
+        };
+        t
+    }
+
+    /// Plan 12: within one album, disc 1 (tracks 1, 2, 9) sorts before
+    /// disc 2 — the disc boundary is compared before the track number.
+    #[test]
+    fn disc_then_number_within_an_album() {
+        let d1t1 = numbered("/m/a/01.flac", Some("Album"), Some(1), Some(1));
+        let d1t2 = numbered("/m/a/02.flac", Some("Album"), Some(1), Some(2));
+        let d1t9 = numbered("/m/a/09.flac", Some("Album"), Some(1), Some(9));
+        let d2t1 = numbered("/m/a/2-01.flac", Some("Album"), Some(2), Some(1));
+
+        assert!(d1t1.sort_key() < d1t2.sort_key(), "track 1 before track 2");
+        assert!(d1t2.sort_key() < d1t9.sort_key(), "track 2 before track 9");
+        assert!(
+            d1t9.sort_key() < d2t1.sort_key(),
+            "disc 1 track 9 before disc 2 track 1"
+        );
+    }
+
+    /// Plan 12: "no disc tag" and "disc 1" merge — a missing disc counts
+    /// as disc 1, so (None, 2) sits between (1, 1) and (1, 3).
+    #[test]
+    fn missing_disc_counts_as_disc_one() {
+        let one = numbered("/m/a/01.flac", Some("Album"), Some(1), Some(1));
+        let two = numbered("/m/a/02.flac", Some("Album"), None, Some(2));
+        let three = numbered("/m/a/03.flac", Some("Album"), Some(1), Some(3));
+
+        assert!(one.sort_key() < two.sort_key(), "(1,1) < (None,2)");
+        assert!(two.sort_key() < three.sort_key(), "(None,2) < (1,3)");
+    }
+
+    /// Plan 12: the track number beats the title alphabet — track 1
+    /// "Zebra" sorts before track 2 "Apple".
+    #[test]
+    fn track_number_beats_title_alphabet() {
+        let mut zebra = numbered("/m/a/01.flac", Some("Album"), Some(1), Some(1));
+        zebra.title = Some("Zebra".into());
+        let mut apple = numbered("/m/a/02.flac", Some("Album"), Some(1), Some(2));
+        apple.title = Some("Apple".into());
+
+        assert!(
+            zebra.sort_key() < apple.sort_key(),
+            "the number wins over the title"
+        );
+    }
+
+    /// Plan 12: without a track number the whole key is the alpha key
+    /// (group = alpha, disc/number 0) — even with an album tag — so
+    /// un-numbered tracks order exactly like `alpha_key()`.
+    #[test]
+    fn no_number_falls_back_to_alpha_key() {
+        let a = local("/m/a.flac", Some("Aphex Twin"), Some("Xtal"));
+        let mut b = local("/m/b.flac", Some("Boards of Canada"), Some("Roygbiv"));
+        b.pos.album = Some("Greatest".into()); // album tag, but no number
+
+        assert_eq!(
+            a.sort_key(),
+            SortKey {
+                group: a.alpha_key(),
+                disc: 0,
+                number: 0,
+                alpha: a.alpha_key(),
+            }
+        );
+        assert_eq!(
+            a.sort_key().cmp(&b.sort_key()),
+            a.alpha_key().cmp(&b.alpha_key()),
+            "un-numbered tracks order exactly like alpha_key()"
+        );
+    }
+
+    /// Plan 12: two "Greatest Hits" albums by different album artists do
+    /// not interleave — all of A's tracks, then all of B's.
+    #[test]
+    fn album_artist_separates_same_named_albums() {
+        let mut a1 = numbered("/m/a/01.flac", Some("Greatest Hits"), None, Some(1));
+        a1.pos.album_artist = Some("Artist A".into());
+        let mut a2 = numbered("/m/a/02.flac", Some("Greatest Hits"), None, Some(2));
+        a2.pos.album_artist = Some("Artist A".into());
+        let mut b1 = numbered("/m/b/01.flac", Some("Greatest Hits"), None, Some(1));
+        b1.pos.album_artist = Some("Artist B".into());
+        let mut b2 = numbered("/m/b/02.flac", Some("Greatest Hits"), None, Some(2));
+        b2.pos.album_artist = Some("Artist B".into());
+
+        let mut tracks = [b2, a1, b1, a2];
+        tracks.sort_by_key(|t| t.sort_key());
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|t| t.title.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            [
+                "/m/a/01.flac".to_string(),
+                "/m/a/02.flac".to_string(),
+                "/m/b/01.flac".to_string(),
+                "/m/b/02.flac".to_string(),
+            ],
+            "each album artist's tracks stay together"
+        );
+    }
+
+    /// Plan 12: numbered tracks without an album tag group by folder —
+    /// all of `/m/a` (by number), then the folder's untagged file (its
+    /// path key starts with the same text), then all of `/m/b`.
+    #[test]
+    fn folder_groups_numbered_tracks_without_album_tag() {
+        let a1 = numbered("/m/a/01.flac", None, None, Some(1));
+        let a2 = numbered("/m/a/02.flac", None, None, Some(2));
+        let b1 = numbered("/m/b/01.flac", None, None, Some(1));
+        // Untagged, so its alpha key is the path.
+        let x = local("/m/a/x.flac", None, None);
+
+        let mut tracks = [b1, x, a2, a1];
+        tracks.sort_by_key(|t| t.sort_key());
+        let paths: Vec<String> = tracks
+            .iter()
+            .map(|t| match &t.source {
+                TrackSource::Local(path) => path.to_string_lossy().into_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/m/a/01.flac".to_string(),
+                "/m/a/02.flac".to_string(),
+                "/m/a/x.flac".to_string(),
+                "/m/b/01.flac".to_string(),
+            ]
+        );
+    }
+
+    /// Plan 12: an SMB row's folder group drops the file name —
+    /// `…/Album/03.flac` groups as `smb://nas/music/album/`.
+    #[test]
+    fn smb_folder_key_drops_the_file_name() {
+        let mut t = smb("Album/03.flac", Some("Artist"), Some("Song"));
+        t.pos.number = Some(3); // numbered, but no album tag → folder group
+
+        assert_eq!(t.sort_key().group, "smb://nas/music/album/");
     }
 
     // --- format line (plan 05, step 3 + 7) ---
