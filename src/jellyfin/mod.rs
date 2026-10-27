@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::config::JellyfinConfig;
-use crate::player::{Track, TrackSource};
+use crate::player::{AlbumPos, Track, TrackSource};
 
 /// Server-side page size (the plan's 500 items per request).
 pub const PAGE_SIZE: usize = 500;
@@ -152,13 +152,15 @@ impl Client {
             .ok_or_else(|| "jellyfin: no users on the server".to_string())
     }
 
-    /// One page of audio items, server-sorted (`Artist, SortName`), mapped
-    /// to [`Track`]s, plus `TotalRecordCount` and how many items the page
-    /// really carried (malformed ones are dropped from `tracks`).
+    /// One page of audio items, server-sorted (`AlbumArtist, Album,
+    /// ParentIndexNumber, IndexNumber, SortName`), mapped to [`Track`]s,
+    /// plus `TotalRecordCount` and how many items the page really carried
+    /// (malformed ones are dropped from `tracks`).
     pub fn page(&self, user_id: &str, start: usize, limit: usize) -> Result<LibraryPage, String> {
         let path = format!(
             "/Items?userId={user_id}&Recursive=true&IncludeItemTypes=Audio\
-             &SortBy=Artist,SortName&SortOrder=Ascending&Fields=MediaSources\
+             &SortBy=AlbumArtist,Album,ParentIndexNumber,IndexNumber,SortName\
+             &SortOrder=Ascending&Fields=MediaSources\
              &StartIndex={start}&Limit={limit}"
         );
         let page: ItemsPage = self.get_json(&path)?;
@@ -288,6 +290,9 @@ struct Item {
     #[serde(default)]
     artists: Option<Vec<String>>,
     album_artist: Option<String>,
+    album: Option<String>,
+    index_number: Option<i64>,
+    parent_index_number: Option<i64>,
     run_time_ticks: Option<i64>,
     container: Option<String>,
     #[serde(default)]
@@ -377,6 +382,31 @@ fn track_from_item(item: Item) -> Option<Track> {
         return None;
     }
 
+    // Plan 12: album position, so the data matches local/SMB rows. The
+    // server already sorted on it; the client never re-sorts these.
+    let pos = AlbumPos {
+        album: item
+            .album
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string),
+        album_artist: item
+            .album_artist
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string),
+        disc: item
+            .parent_index_number
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+        number: item
+            .index_number
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+    };
+
     // `Artists[0]`, else `AlbumArtist`, else no artist line.
     let artist = item
         .artists
@@ -427,6 +457,7 @@ fn track_from_item(item: Item) -> Option<Track> {
         title: Some(title),
         duration,
         bitrate_kbps,
+        pos,
     })
 }
 
@@ -464,12 +495,22 @@ mod tests {
                 if item_id == "item1" && container.as_deref() == Some("mp3")),
             "container from MediaSources[0]"
         );
+        // Plan 12: the album-position fields map like the local/SMB rows.
+        assert_eq!(first.pos.album.as_deref(), Some("The Album"));
+        assert_eq!(first.pos.album_artist.as_deref(), Some("The Album Artist"));
+        assert_eq!(first.pos.disc, Some(2), "ParentIndexNumber");
+        assert_eq!(first.pos.number, Some(3), "IndexNumber");
 
         let second = &tracks[1];
         assert_eq!(second.remote_item_id(), Some("item2"));
         assert_eq!(second.artist.as_deref(), Some("Artist Two"), "Artists[0]");
         assert_eq!(second.duration, None, "missing RunTimeTicks → no duration");
         assert_eq!(second.bitrate_kbps, Some(1000));
+        assert_eq!(
+            second.pos,
+            AlbumPos::default(),
+            "no position tags → all None"
+        );
     }
 
     /// A second page past the items is empty but keeps the same total (the
@@ -677,6 +718,9 @@ mod tests {
             name: Some("Song".into()),
             artists: None,
             album_artist: None,
+            album: None,
+            index_number: None,
+            parent_index_number: None,
             run_time_ticks: None,
             container: Some("flac".into()),
             media_sources: None,

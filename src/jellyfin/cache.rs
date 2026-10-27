@@ -598,6 +598,7 @@ mod tests {
             title: Some(path.to_string()),
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 
@@ -612,6 +613,7 @@ mod tests {
             title: Some(format!("title-{id}")),
             duration: None,
             bitrate_kbps: None,
+            pos: Default::default(),
         }
     }
 

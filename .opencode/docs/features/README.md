@@ -87,7 +87,9 @@ in sync.
 
 - Load: CLI args **and** an in-app path prompt. Directories are scanned recursively.
 - Playlist controls: add / remove / clear / reorder / find-filter. Default order:
-  alphabetical by `artist - title`; untagged files sort by full path.
+  album → disc → track number (grouped by album tag, folder when it is
+  missing); tracks with no track number keep the `artist - title` order, and
+  untagged files sort by full path.
 - Audio: `symphonia` (decode) + `cpal` (output). Auto-advance at end of track;
   unreadable files are skipped with a notice.
 - Spectrum: real FFT, log-spaced bars. Timer comes from samples actually played.

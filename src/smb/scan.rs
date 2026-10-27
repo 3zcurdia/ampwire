@@ -179,6 +179,7 @@ fn track_for(url: SmbUrl, reader: Option<Box<dyn ShareReader>>, size: Option<u64
         title: fields.title,
         duration: fields.duration,
         bitrate_kbps: fields.bitrate_kbps,
+        pos: fields.pos,
     }
 }
 
@@ -586,6 +587,8 @@ mod tests {
         assert_eq!(tagged.title, local.title, "title");
         assert_eq!(tagged.duration, local.duration, "duration");
         assert_eq!(tagged.bitrate_kbps, local.bitrate_kbps, "bitrate line");
+        // Plan 12: the album-position tags pass through the same mapping.
+        assert_eq!(tagged.pos, local.pos, "album position (plan 12)");
         assert!(
             tagged.duration.is_some(),
             "the fixture has a duration, so lofty parsed it"

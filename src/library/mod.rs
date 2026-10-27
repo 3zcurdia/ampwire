@@ -38,6 +38,8 @@ pub struct TagFields {
     pub title: Option<String>,
     pub duration: Option<Duration>,
     pub bitrate_kbps: Option<u32>,
+    /// Album/disc/track tags (plan 12).
+    pub pos: crate::player::AlbumPos,
 }
 
 /// Apply [`read_track`]'s mapping to any file lofty could parse: tags first,
@@ -51,6 +53,10 @@ pub fn tag_fields(tagged: &lofty::file::TaggedFile, bytes: Option<u64>) -> TagFi
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
         fields.artist = clean(tag.artist().as_deref());
         fields.title = clean(tag.title().as_deref());
+        fields.pos.album = clean(tag.album().as_deref());
+        fields.pos.album_artist = clean(tag.get_string(ItemKey::AlbumArtist));
+        fields.pos.disc = tag.disk().filter(|n| *n > 0);
+        fields.pos.number = tag.track().filter(|n| *n > 0);
     }
 
     let duration = tagged.properties().duration();
@@ -92,6 +98,7 @@ pub fn read_track(path: &Path) -> Track {
         title: fields.title,
         duration: fields.duration,
         bitrate_kbps: fields.bitrate_kbps,
+        pos: fields.pos,
     }
 }
 
@@ -305,7 +312,7 @@ mod tests {
         assert_eq!(track.artist, None);
         assert_eq!(track.title, None);
         assert_eq!(track.duration, None, "0 bytes has no duration");
-        assert_eq!(track.sort_key(), path.to_string_lossy().to_lowercase());
+        assert_eq!(track.alpha_key(), path.to_string_lossy().to_lowercase());
     }
 
     #[test]
@@ -336,6 +343,40 @@ mod tests {
             (120..=135).contains(&kbps),
             "≈128 kbps from size/duration, got {kbps}"
         );
+    }
+
+    /// Plan 12: album/disc/track tags reach the track, and a track number
+    /// of 0 counts as missing.
+    #[test]
+    fn tag_fields_reads_album_disc_and_track() {
+        use lofty::config::WriteOptions;
+        use lofty::prelude::*;
+        use lofty::tag::{Tag, TagType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saw.wav");
+        write_wav(&path, 1);
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_album("Selected Ambient Works".into());
+        tag.insert_text(ItemKey::AlbumArtist, "Aphex Twin".into());
+        tag.set_disk(2);
+        tag.set_track(3);
+        tag.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        let track = read_track(&path);
+        assert_eq!(track.pos.album.as_deref(), Some("Selected Ambient Works"));
+        assert_eq!(track.pos.album_artist.as_deref(), Some("Aphex Twin"));
+        assert_eq!(track.pos.disc, Some(2));
+        assert_eq!(track.pos.number, Some(3));
+
+        // A track number of 0 counts as missing (`None`).
+        let zero = dir.path().join("zero.wav");
+        write_wav(&zero, 1);
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_track(0);
+        tag.save_to_path(&zero, WriteOptions::default()).unwrap();
+        assert_eq!(read_track(&zero).pos.number, None);
     }
 
     #[test]
