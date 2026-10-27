@@ -1,6 +1,11 @@
 # Plan 12 — Album order: sort by album → disc → track, alphabetical fallback
 
-**Status:** ⬜ not started
+**Status:** ✅ done — 2026-10-27, bd5299a. 496 tests pass (481 run, 15
+`#[ignore]`d: a visual dump, the three audio-device smokes, the real-server
+Jellyfin smoke, nine real-Samba smokes and the MPRIS session-bus smoke — the
+15 need hardware/servers this environment has none of), golden frames
+untouched (the mock player is never sorted), `cargo fmt --check` +
+`cargo clippy --all-targets -- -D warnings` + `cargo test` green.
 
 Goal: a loaded album plays in **album order** (1-01, 1-02, …, 2-01) instead of
 alphabetically by title. Tracks with no track-number tag keep **today's
@@ -450,3 +455,57 @@ golden frames are unchanged and the three cargo checks pass.
   client still never re-sorts Jellyfin pages.
 - A compilation without an album-artist tag splits by track artist — known
   limitation, not handled here.
+
+## Deviations (annotated when the plan finished, 2026-10-27)
+
+All nine steps shipped; every test the plan asked for exists and the golden
+frames are byte-identical. These are the places where the code diverges from
+— or had to interpret — the literal text above.
+
+1. **`track_from_item` builds `pos` before the artist fallback (as the plan
+   instructed — the first attempt after it did not compile).** The `pos`
+   snippet borrows `item.album_artist` via `as_deref()` while the artist
+   `or_else` closure *moves* it, so placement above the artist block is
+   mandatory; this is the plan's own "clone what the artist code later
+   moves" rule made concrete.
+2. **`smb/scan.rs` got its assertion inside the existing tagged-file test
+   (plan 7's conditional).** The module's `ShareFs` tests do build a tagged
+   file — `tags_come_from_the_remote_bytes_with_the_local_mapping` serves
+   the real `tests/fixtures/tone.flac` bytes through the fake share — so
+   the added line is `assert_eq!(tagged.pos, local.pos)`: the pass-through
+   property itself, since the fixture's own tag *values* are not part of
+   this plan.
+3. **Two plan-7 tests identify rows by source path, not title.**
+   `folder_groups_numbered_tracks_without_album_tag` and
+   `append_sorted_orders_albums_by_disc_and_track` compare the
+   `TrackSource::Local` paths because the untagged rows have no title to
+   map on. The asserted *ordering* is exactly what the plan specifies.
+4. **Clippy shaped two test bodies.** `cargo clippy --all-targets --
+   -D warnings` (the repo gate) rejects the natural phrasings, so
+   `album_artist_separates_same_named_albums` and
+   `folder_groups_numbered_tracks_without_album_tag` use
+   `sort_by_key(|t| t.sort_key())` over arrays rather than
+   `sort_by(...)` over `vec![...]`.
+5. **`no_number_falls_back_to_alpha_key` asserts one case more than
+   asked.** Besides the plan's `SortKey { group: alpha, disc: 0, number: 0,
+   alpha }` equality and the `.cmp` comparison against another un-numbered
+   track, it also pins an *album-tag-without-number* track to the same
+   shape — so nobody can later let the album tag alone activate grouping.
+6. **The `ITEMS_PAGE` fixture's doc comment was updated with the JSON**
+   (the plan forbade touching other JSON parts, not their comment), so the
+   description keeps naming what the fixture really carries.
+7. **The AGENTS.md test-count line keeps the file's Linux convention.**
+   `mpris.rs` is Linux-only, so this machine (macOS) reports 491 total /
+   477 run / 14 `#[ignore]`d while Linux reports 496 / 481 / 15; the line
+   uses the Linux numbers, as the previous entry did.
+8. **The 15 `#[ignore]`d smokes were not run here** — a real sound card, a
+   live Samba server, a real Jellyfin server and a session bus are all
+   absent from this environment. Everything plain `cargo test` runs is
+   green on top of the new tests.
+9. **Step 9.3's manual TTY check was not performed for the same reason**
+   (no interactive terminal or output device). Its coverage is split
+   between `tag_fields_reads_album_disc_and_track` (real lofty tags on
+   disk → `read_track` → `pos`), the seven `sort_key` unit tests,
+   `append_sorted_orders_albums_by_disc_and_track` and the untouched
+   goldens — an eyeball pass over a tagged multi-disc album folder is the
+   one thing left worth doing by hand.
