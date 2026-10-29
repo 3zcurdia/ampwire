@@ -12,7 +12,9 @@ pub mod playlist;
 pub mod real;
 pub mod rng;
 
+use std::ops::Deref;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -28,10 +30,12 @@ pub enum PlayState {
 /// Format of the current track — the hi-fi line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatInfo {
-    pub codec: String,
+    /// Shared (`Arc<str>`): a snapshot is taken every tick, and copying the
+    /// format line must not allocate.
+    pub codec: Arc<str>,
     pub bit_depth: Option<u8>,
     pub sample_rate: Option<u32>,
-    pub channels: String,
+    pub channels: Arc<str>,
     pub bit_perfect: bool,
     /// Lossy only: the tagged (or estimated) bitrate. `None` for lossless.
     pub bitrate_kbps: Option<u32>,
@@ -42,22 +46,18 @@ pub struct FormatInfo {
 
 impl FormatInfo {
     /// Nothing known yet: shown when stopped, or between `Load` and the
-    /// engine's `Started` event.
+    /// engine's `Started` event. An empty codec means "nothing playing": the
+    /// UI renders no format line.
     pub fn blank() -> Self {
         Self {
-            codec: String::new(),
+            codec: "".into(),
             bit_depth: None,
             sample_rate: None,
-            channels: String::new(),
+            channels: "".into(),
             bit_perfect: false,
             bitrate_kbps: None,
             lossless: false,
         }
-    }
-
-    /// "Nothing playing": codec empty, so the UI renders no format line.
-    pub fn empty() -> Self {
-        Self::blank()
     }
 
     /// The parts of the format line, widest first: codec, depth/rate
@@ -69,7 +69,7 @@ impl FormatInfo {
         if self.codec.is_empty() {
             return parts; // nothing playing: no format line
         }
-        parts.push(self.codec.clone());
+        parts.push(self.codec.to_string());
         let rate = self.sample_rate.map(format_khz);
         if self.lossless {
             match (self.bit_depth, &rate) {
@@ -87,7 +87,7 @@ impl FormatInfo {
             }
         }
         if !self.channels.is_empty() {
-            parts.push(self.channels.clone());
+            parts.push(self.channels.to_string());
         }
         parts
     }
@@ -107,7 +107,7 @@ pub fn format_khz(rate: u32) -> String {
     if rate.is_multiple_of(1000) {
         format!("{}", rate / 1000)
     } else {
-        let khz = format!("{:.1}", rate as f64 / 1000.0);
+        let khz = format!("{:.1}", f64::from(rate) / 1000.0);
         khz.trim_end_matches(".0").to_string()
     }
 }
@@ -128,6 +128,11 @@ impl Default for FormatInfo {
 
 /// Stable per-process track id, from a static counter.
 pub type TrackId = u64;
+
+/// The playlist's tracks, shared with snapshots. Each track sits behind its
+/// own `Arc`, so copying the list on write (`Arc::make_mut`) only bumps
+/// refcounts, and editing one track copies just that track.
+pub type TrackList = Arc<Vec<Arc<Track>>>;
 
 /// Where a track's audio comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,7 +294,9 @@ impl Track {
 
     /// Not a local file — Jellyfin *or* SMB (plan 10). Drives the
     /// remote-only cache windows (one per source) and the "no path in the
-    /// row" rules.
+    /// row" rules. Test-only: the windows take their source filter from the
+    /// per-cache `from_track`.
+    #[cfg(test)]
     pub fn is_remote(&self) -> bool {
         matches!(
             self.source,
@@ -300,7 +307,7 @@ impl Track {
     /// A Jellyfin item specifically: the rules that are Jellyfin's alone —
     /// the `j` reload rule ([`RemoveRemote`][PlayerCommand::RemoveRemote]),
     /// the Jellyfin download window and `stream_pure`'s EQ bypass — key off
-    /// this, never off [`is_remote`][Self::is_remote] (SMB tracks must not
+    /// this, never off a "remote" test (SMB tracks must not
     /// be dropped, downloaded or EQ-bypassed by a Jellyfin action).
     pub fn is_jellyfin(&self) -> bool {
         matches!(self.source, TrackSource::Remote { .. })
@@ -309,7 +316,8 @@ impl Track {
     /// An SMB row specifically — what the SMB rolling cache window (plan
     /// 10, step 5) and anything else SMB-only selects. Expressed through
     /// the other two so the relation stays visible: remote, and not the
-    /// Jellyfin half of them.
+    /// Jellyfin half of them. Test-only, like [`is_remote`][Self::is_remote].
+    #[cfg(test)]
     pub fn is_smb(&self) -> bool {
         self.is_remote() && !self.is_jellyfin()
     }
@@ -323,7 +331,7 @@ pub struct PlayerSnapshot {
     pub current: Option<usize>,
     pub position: Duration,
     /// Arc'd so snapshots are cheap (30 fps), not a full clone.
-    pub tracks: std::sync::Arc<Vec<Track>>,
+    pub tracks: TrackList,
     pub shuffle: bool,
     pub repeat: bool,
     /// 0–=100.
@@ -332,14 +340,46 @@ pub struct PlayerSnapshot {
     pub balance: i8,
     pub format: FormatInfo,
     /// Spectrum magnitudes, 0.0–1.0, low to high frequency.
-    pub spectrum: Vec<f32>,
+    pub spectrum: Bars,
     /// Spectrum peak caps, same length as `spectrum`.
-    pub peaks: Vec<f32>,
+    pub peaks: Bars,
+}
+
+/// Spectrum values held inline (at most [`crate::audio::analysis::BANDS`]),
+/// so a snapshot copies them without a heap allocation. Derefs to the bars
+/// as a slice: `len()`, indexing and iteration all work as on a `Vec`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Bars {
+    len: usize,
+    values: [f32; crate::audio::analysis::BANDS],
+}
+
+impl Bars {
+    /// A copy of `bars`. Panics if there are more than `BANDS` of them: the
+    /// analyzer and the mock both stay within that.
+    pub fn from_slice(bars: &[f32]) -> Self {
+        let mut values = [0.0; crate::audio::analysis::BANDS];
+        values[..bars.len()].copy_from_slice(bars);
+        Self {
+            len: bars.len(),
+            values,
+        }
+    }
+}
+
+impl Deref for Bars {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        &self.values[..self.len]
+    }
 }
 
 impl PlayerSnapshot {
     pub fn current_track(&self) -> Option<&Track> {
-        self.current.and_then(|i| self.tracks.get(i))
+        self.current
+            .and_then(|i| self.tracks.get(i))
+            .map(Arc::as_ref)
     }
 }
 
@@ -406,7 +446,7 @@ mod tests {
             title: title.map(str::to_string),
             duration: None,
             bitrate_kbps: None,
-            pos: AlbumPos::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -463,7 +503,7 @@ mod tests {
             title: title.map(str::to_string),
             duration: None,
             bitrate_kbps: None,
-            pos: AlbumPos::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -479,7 +519,7 @@ mod tests {
             title: Some(format!("title-{id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: AlbumPos::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -627,7 +667,7 @@ mod tests {
         b2.pos.album_artist = Some("Artist B".into());
 
         let mut tracks = [b2, a1, b1, a2];
-        tracks.sort_by_key(|t| t.sort_key());
+        tracks.sort_by_key(super::Track::sort_key);
         assert_eq!(
             tracks
                 .iter()
@@ -655,7 +695,7 @@ mod tests {
         let x = local("/m/a/x.flac", None, None);
 
         let mut tracks = [b1, x, a2, a1];
-        tracks.sort_by_key(|t| t.sort_key());
+        tracks.sort_by_key(super::Track::sort_key);
         let paths: Vec<String> = tracks
             .iter()
             .map(|t| match &t.source {
@@ -748,7 +788,7 @@ mod tests {
             ..FormatInfo::default()
         };
         assert_eq!(mono.describe(), "FLAC  24/96  mono");
-        assert_eq!(FormatInfo::empty().describe(), "", "no format line");
-        assert!(FormatInfo::empty().format_parts().is_empty());
+        assert_eq!(FormatInfo::blank().describe(), "", "no format line");
+        assert_eq!(FormatInfo::blank().format_parts().len(), 0);
     }
 }

@@ -43,7 +43,7 @@ pub enum ColorDepth {
 }
 
 impl ColorDepth {
-    /// Detect from the environment; defaults to TrueColor when unknown.
+    /// Detect from the environment; defaults to `TrueColor` when unknown.
     /// Detect from the environment. Truecolor is claimed only when `COLORTERM`
     /// is `truecolor` or `24bit`; an unset `COLORTERM` degrades to 256 colors
     /// (never pretends to truecolor it can't prove).
@@ -116,7 +116,7 @@ pub fn lighten(color: Color, amount: f32) -> Color {
     let Some((r, g, b)) = hex(color) else {
         return color;
     };
-    let f = |c: u8| (c as f32 + (255.0 - c as f32) * amount).round() as u8;
+    let f = |c: u8| (f32::from(c) + (255.0 - f32::from(c)) * amount).round() as u8;
     Color::Rgb(f(r), f(g), f(b))
 }
 
@@ -124,7 +124,9 @@ pub fn lighten(color: Color, amount: f32) -> Color {
 pub fn mix(a: Color, b: Color, t: f32) -> Color {
     match (hex(a), hex(b)) {
         (Some((r1, g1, b1)), Some((r2, g2, b2))) => {
-            let f = |c1: u8, c2: u8| (c1 as f32 + (c2 as f32 - c1 as f32) * t).round() as u8;
+            let f = |c1: u8, c2: u8| {
+                (f32::from(c1) + (f32::from(c2) - f32::from(c1)) * t).round() as u8
+            };
             Color::Rgb(f(r1, r2), f(g1, g2), f(b1, b2))
         }
         _ => b,
@@ -135,9 +137,9 @@ pub fn mix(a: Color, b: Color, t: f32) -> Color {
 pub fn distance(a: Color, b: Color) -> f32 {
     match (hex(a), hex(b)) {
         (Some((r1, g1, b1)), Some((r2, g2, b2))) => {
-            let dr = r1 as f32 - r2 as f32;
-            let dg = g1 as f32 - g2 as f32;
-            let db = b1 as f32 - b2 as f32;
+            let dr = f32::from(r1) - f32::from(r2);
+            let dg = f32::from(g1) - f32::from(g2);
+            let db = f32::from(b1) - f32::from(b2);
             (2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db).sqrt()
         }
         _ => 0.0,
@@ -149,8 +151,7 @@ fn build(colors: [(Role, Color); 7]) -> Theme {
         colors
             .iter()
             .find(|(r, _)| *r == role)
-            .map(|(_, c)| *c)
-            .unwrap_or(Color::Reset)
+            .map_or(Color::Reset, |(_, c)| *c)
     };
     let primary = get(Role::Primary);
     let glow = get(Role::Glow);
@@ -177,8 +178,7 @@ impl Theme {
         self.colors
             .iter()
             .find(|(r, _)| *r == role)
-            .map(|(_, c)| *c)
-            .unwrap_or(Color::Reset)
+            .map_or(Color::Reset, |(_, c)| *c)
     }
 
     /// Spectrum gradient entry for bucket `i` of `n`.
@@ -327,9 +327,9 @@ pub fn to_ansi256(color: Color) -> Color {
     let mut best = (0u8, f32::MAX);
     for i in 0..=255u8 {
         let (pr, pg, pb) = palette(i);
-        let d = (pr as f32 - r as f32).powi(2)
-            + (pg as f32 - g as f32).powi(2)
-            + (pb as f32 - b as f32).powi(2);
+        let d = (f32::from(pr) - f32::from(r)).powi(2)
+            + (f32::from(pg) - f32::from(g)).powi(2)
+            + (f32::from(pb) - f32::from(b)).powi(2);
         if d < best.1 {
             best = (i, d);
         }
@@ -345,9 +345,9 @@ pub fn to_ansi16(color: Color) -> Color {
     let mut best = (0u8, f32::MAX);
     for (i, &(pr, pg, pb)) in XTERM16.iter().enumerate() {
         // Weighted RGB distance (green counts more), same as `distance()`.
-        let dr = pr as f32 - r as f32;
-        let dg = pg as f32 - g as f32;
-        let db = pb as f32 - b as f32;
+        let dr = f32::from(pr) - f32::from(r);
+        let dg = f32::from(pg) - f32::from(g);
+        let db = f32::from(pb) - f32::from(b);
         let d = 2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db;
         if d < best.1 {
             best = (i as u8, d);

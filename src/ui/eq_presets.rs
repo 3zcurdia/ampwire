@@ -129,10 +129,10 @@ mod tests {
 
     #[test]
     fn overlay_lists_presets_at_80x24() {
-        let mut app = test_app();
-        app.dispatch(crate::action::Action::EqPresets);
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        let mut app = test_app();
+        app.dispatch(crate::action::Action::EqPresets);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -149,6 +149,8 @@ mod tests {
 
     #[test]
     fn small_terminal_keeps_the_cursor_visible() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let mut app = test_app();
         app.dispatch(crate::action::Action::EqPresets);
         // Walk the cursor to the last preset, then draw at 40×8: the list is
@@ -158,8 +160,6 @@ mod tests {
         }
         let last = PRESETS.len() - 1;
         assert_eq!(app.ui.presets.unwrap().cursor, last);
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal

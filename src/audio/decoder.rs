@@ -85,7 +85,7 @@ pub struct StreamInfo {
 /// A demuxed + decoded file. One [`Decoder`] per track being played.
 pub struct Decoder {
     format: Box<dyn FormatReader>,
-    decoder: Box<dyn AudioDecoder>,
+    codec: Box<dyn AudioDecoder>,
     track_id: u32,
     info: StreamInfo,
     /// Track time base, to convert a packet timestamp into seconds.
@@ -97,8 +97,6 @@ pub struct Decoder {
     /// `start_offset` (the demuxer can report the frame *before* the one
     /// whose samples actually come out).
     refine_offset: bool,
-    /// Reused conversion buffer: one decoded packet of interleaved `f32`.
-    packet: Vec<f32>,
 }
 
 impl Decoder {
@@ -159,9 +157,9 @@ impl Decoder {
                 track.time_base,
                 track.duration,
             ) {
-                (Some(frames), _, _) => {
-                    Some(Duration::from_secs_f64(frames as f64 / sample_rate as f64))
-                }
+                (Some(frames), _, _) => Some(Duration::from_secs_f64(
+                    frames as f64 / f64::from(sample_rate),
+                )),
                 (None, Some(time_base), Some(ticks)) => time_base
                     .calc_duration(ticks)
                     .map(|time| Duration::from_secs_f64(time.as_secs_f64())),
@@ -170,7 +168,10 @@ impl Decoder {
             (track.id, params, duration, track.time_base)
         };
 
-        let channels = params.channels.as_ref().map_or(0, |c| c.count());
+        let channels = params
+            .channels
+            .as_ref()
+            .map_or(0, symphonia::core::audio::Channels::count);
         if channels == 0 || channels > u16::MAX as usize {
             return Err("unknown channel count".into());
         }
@@ -211,21 +212,19 @@ impl Decoder {
             match time_base {
                 Some(time_base) => time_base
                     .calc_time(seeked.actual_ts)
-                    .map(|time| Duration::from_secs_f64(time.as_secs_f64()))
-                    .unwrap_or(start),
+                    .map_or(start, |time| Duration::from_secs_f64(time.as_secs_f64())),
                 None => start,
             }
         };
 
         Ok(Decoder {
             format,
-            decoder: codec,
+            codec,
             track_id,
             info,
             time_base,
             start_offset,
             refine_offset: !start.is_zero(),
-            packet: Vec::new(),
         })
     }
 
@@ -250,7 +249,7 @@ impl Decoder {
                 Ok(Some(packet)) => packet,
                 // Clean end of the container (symphonia 0.6 signals EOF as `None`).
                 Ok(None) => return Ok(false),
-                Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::Unsupported(_)) => {
+                Err(SymphoniaError::DecodeError(_) | SymphoniaError::Unsupported(_)) => {
                     packet_errors += 1;
                     if packet_errors >= MAX_PACKET_ERRORS {
                         return Err("corrupt stream".into());
@@ -265,7 +264,7 @@ impl Decoder {
             if packet.track_id != self.track_id {
                 continue;
             }
-            match self.decoder.decode(&packet) {
+            match self.codec.decode(&packet) {
                 Ok(decoded) => {
                     if decoded.is_empty() {
                         continue; // skip packet: no frames produced
@@ -281,16 +280,16 @@ impl Decoder {
                         }
                         self.refine_offset = false;
                     }
-                    // `decoded` borrows only `self.decoder`; `self.packet` and
-                    // `out` are disjoint, so this compiles without a method
-                    // taking `&mut self` (which would overlap the borrow).
-                    decoded.copy_to_vec_interleaved::<f32>(&mut self.packet);
-                    out.extend_from_slice(&self.packet);
+                    // Convert straight into the caller's buffer: one copy per
+                    // packet, no intermediate vector.
+                    let start = out.len();
+                    out.resize(start + decoded.samples_interleaved(), 0.0);
+                    decoded.copy_to_slice_interleaved::<f32, _>(&mut out[start..]);
                     return Ok(true);
                 }
                 // A damaged packet is skipped; the decoder consumed it, so the
                 // format reader keeps making progress.
-                Err(SymphoniaError::DecodeError(_)) => continue,
+                Err(SymphoniaError::DecodeError(_)) => {}
                 Err(SymphoniaError::IoError(e)) if e.kind() == ErrorKind::UnexpectedEof => {
                     return Ok(false);
                 }
@@ -509,12 +508,12 @@ mod tests {
             let mut samples = Vec::new();
             while decoder.read(&mut samples).expect("decodes after the seek") {}
             let info = decoder.info();
-            let rate = info.sample_rate as f64 * info.channels as f64;
-            let decoded = Duration::from_secs_f64(samples.len() as f64 / rate);
+            let rate = f64::from(info.sample_rate) * f64::from(info.channels);
+            let read_for = Duration::from_secs_f64(samples.len() as f64 / rate);
             let total = info.duration.expect("fixture duration");
             assert!(
-                (reported + decoded).abs_diff(total) < Duration::from_millis(50),
-                "{name}: offset {reported:?} + decoded {decoded:?} != {total:?}"
+                (reported + read_for).abs_diff(total) < Duration::from_millis(50),
+                "{name}: offset {reported:?} + decoded {read_for:?} != {total:?}"
             );
         }
     }

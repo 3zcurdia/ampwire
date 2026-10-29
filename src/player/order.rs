@@ -5,6 +5,10 @@
 //! track, the manual Next/Prev keys and plan 08's cache window all go
 //! through [`PlayOrder`], so they can never disagree about "what plays next".
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::Track;
 use super::rng::Rng;
 
 /// "Nothing is playing yet": every real index into `order` is `< len`, so
@@ -51,19 +55,16 @@ impl PlayOrder {
             self.pos = current.unwrap_or(NONE);
             return;
         }
-        match current {
-            Some(cur) => {
-                // The rest, shuffled, behind the current track at the front.
-                let mut rest: Vec<usize> = (0..len).filter(|&i| i != cur).collect();
-                fisher_yates(&mut rest, rng);
-                rest.insert(0, cur);
-                self.order = rest;
-                self.pos = 0;
-            }
-            None => {
-                fisher_yates(&mut self.order, rng);
-                self.pos = NONE;
-            }
+        if let Some(cur) = current {
+            // The rest, shuffled, behind the current track at the front.
+            let mut rest: Vec<usize> = (0..len).filter(|&i| i != cur).collect();
+            fisher_yates(&mut rest, rng);
+            rest.insert(0, cur);
+            self.order = rest;
+            self.pos = 0;
+        } else {
+            fisher_yates(&mut self.order, rng);
+            self.pos = NONE;
         }
     }
 
@@ -243,33 +244,89 @@ impl PlayOrder {
     }
 
     /// Look-ahead WITHOUT moving: the next `n` playlist indices, nearest
-    /// first. Never wraps and never reshuffles.
-    pub fn upcoming(&self, n: usize) -> Vec<usize> {
+    /// first. Never wraps and never reshuffles. Lazy: callers that stop
+    /// early (the cache windows) never pay for the whole list.
+    pub fn upcoming(&self, n: usize) -> impl Iterator<Item = usize> + '_ {
         let len = self.order.len();
-        if len == 0 || n == 0 {
-            return Vec::new();
-        }
-        let after = match self.pos {
-            NONE => 0,
-            pos => pos + 1,
+        let (start, end) = if len == 0 || n == 0 {
+            (0, 0)
+        } else {
+            let after = match self.pos {
+                NONE => 0,
+                pos => pos + 1,
+            };
+            (after.min(len), after.saturating_add(n).min(len))
         };
-        let end = after.saturating_add(n).min(len);
-        self.order.get(after..end).unwrap_or_default().to_vec()
+        self.order[start..end].iter().copied()
     }
 
     /// Look-behind WITHOUT moving: what `prev()` would return over `n` calls,
     /// nearest first and deduplicated at the start (the restart target).
-    pub fn previous(&self, n: usize) -> Vec<usize> {
+    pub fn previous(&self, n: usize) -> impl Iterator<Item = usize> + '_ {
         let len = self.order.len();
-        if len == 0 || n == 0 {
-            return Vec::new();
-        }
-        let nearest = match self.pos {
-            NONE => 0,
-            pos => pos.saturating_sub(1),
+        let (first, end) = if len == 0 || n == 0 {
+            (0, 0)
+        } else {
+            let nearest = match self.pos {
+                NONE => 0,
+                pos => pos.saturating_sub(1),
+            };
+            (nearest.saturating_sub(n.saturating_sub(1)), nearest + 1)
         };
-        let first = nearest.saturating_sub(n.saturating_sub(1));
-        (first..=nearest).rev().map(|i| self.order[i]).collect()
+        (first..end).rev().map(move |i| self.order[i])
+    }
+
+    /// A rolling cache window (plans 08/10): the `current` track first, then
+    /// up to `ahead` accepted tracks going forward in *play* order, then up
+    /// to `behind` going back. `keep` maps a track to the item to cache, or
+    /// `None` to skip it — a skipped track does not count toward the quota.
+    /// Each playlist index is considered once.
+    pub fn window<T>(
+        &self,
+        tracks: &[Arc<Track>],
+        current: Option<usize>,
+        ahead: usize,
+        behind: usize,
+        keep: impl Fn(&Track) -> Option<T>,
+    ) -> Vec<T> {
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut out: Vec<T> = Vec::new();
+        // Returns whether the track was accepted, i.e. counted toward a quota.
+        let mut admit = |index: usize, out: &mut Vec<T>| -> bool {
+            if !seen.insert(index) {
+                return false;
+            }
+            match tracks.get(index).and_then(|track| keep(track)) {
+                Some(item) => {
+                    out.push(item);
+                    true
+                }
+                None => false,
+            }
+        };
+
+        if let Some(current) = current {
+            admit(current, &mut out);
+        }
+        let mut count = 0;
+        for index in self.upcoming(tracks.len()) {
+            if count >= ahead {
+                break;
+            }
+            if admit(index, &mut out) {
+                count += 1;
+            }
+        }
+        let mut count = 0;
+        for index in self.previous(tracks.len()) {
+            if count >= behind {
+                break;
+            }
+            if admit(index, &mut out) {
+                count += 1;
+            }
+        }
+        out
     }
 
     /// The playlist index the cursor sits on, if anything is current.
@@ -461,7 +518,7 @@ mod tests {
         assert_eq!(sorted, (0..LEN).collect::<Vec<_>>(), "still a permutation");
         // The walk continues after the jumped-to track.
         if from != 2 {
-            assert_eq!(order.upcoming(1), vec![before[2]]);
+            assert_eq!(order.upcoming(1).collect::<Vec<usize>>(), vec![before[2]]);
         }
         // Nothing current yet → the jump lands in the first slot.
         let mut fresh = shuffled(LEN, 9);
@@ -478,10 +535,10 @@ mod tests {
         for _ in 0..4 {
             order.next(false, &mut rng);
         } // current = 3
-        assert_eq!(order.upcoming(3), vec![4, 5, 6]);
-        assert_eq!(order.previous(3), vec![2, 1, 0]);
+        assert_eq!(order.upcoming(3).collect::<Vec<usize>>(), vec![4, 5, 6]);
+        assert_eq!(order.previous(3).collect::<Vec<usize>>(), vec![2, 1, 0]);
         // Peek, then walk: same tracks, same order.
-        let up = order.upcoming(3);
+        let up = order.upcoming(3).collect::<Vec<usize>>();
         let walked: Vec<usize> = up
             .iter()
             .map(|_| order.next(false, &mut rng).unwrap())
@@ -493,11 +550,15 @@ mod tests {
         for _ in 0..LEN {
             end.next(false, &mut rng);
         }
-        assert_eq!(end.upcoming(3), Vec::<usize>::new(), "no wrap");
+        assert_eq!(
+            end.upcoming(3).collect::<Vec<usize>>(),
+            Vec::<usize>::new(),
+            "no wrap"
+        );
         // Behind the start there is only the restart target.
         let start = ordered(LEN);
-        assert_eq!(start.previous(3), vec![0]);
-        assert_eq!(start.upcoming(3), vec![0, 1, 2]);
+        assert_eq!(start.previous(3).collect::<Vec<usize>>(), vec![0]);
+        assert_eq!(start.upcoming(3).collect::<Vec<usize>>(), vec![0, 1, 2]);
     }
 
     // --- rebuild ---
@@ -506,7 +567,7 @@ mod tests {
 
     /// The full sequence `next()` would walk from here (no repeat).
     fn walk(order: &PlayOrder) -> Vec<usize> {
-        order.upcoming(order.order.len())
+        order.upcoming(order.order.len()).collect::<Vec<usize>>()
     }
 
     #[test]
@@ -515,12 +576,16 @@ mod tests {
         let mut order = shuffled(LEN, 3);
         order.next(false, &mut rng);
         order.next(false, &mut rng);
-        let history = order.previous(LEN);
+        let history = order.previous(LEN).collect::<Vec<usize>>();
         let current = order.current();
         let queued = walk(&order);
 
         order.appended(LEN + 4, current, &mut rng);
-        assert_eq!(order.previous(LEN + 4), history, "history untouched");
+        assert_eq!(
+            order.previous(LEN + 4).collect::<Vec<usize>>(),
+            history,
+            "history untouched"
+        );
         assert_eq!(order.current(), current, "current untouched");
         let after = walk(&order);
         let old_only: Vec<usize> = after.iter().copied().filter(|&i| i < LEN).collect();
@@ -642,8 +707,14 @@ mod tests {
         assert_eq!(order.next(false, &mut rng), None);
         assert_eq!(order.next(true, &mut rng), None);
         assert_eq!(order.prev(), None);
-        assert_eq!(order.upcoming(3), Vec::<usize>::new());
-        assert_eq!(order.previous(3), Vec::<usize>::new());
+        assert_eq!(
+            order.upcoming(3).collect::<Vec<usize>>(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            order.previous(3).collect::<Vec<usize>>(),
+            Vec::<usize>::new()
+        );
         order.jump_to(0);
         assert_eq!(order.current(), None);
         // rebuild to empty from a populated state.

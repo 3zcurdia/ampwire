@@ -5,9 +5,20 @@
 //! `player::real` backend drives it); `--demo`, `--dump` and the tests keep
 //! the mock player.
 
+// Pedantic cast lints are allowed crate-wide: the audio and terminal code
+// converts between sample, frame, pixel and cell counts on purpose, and
+// every such cast is bounded by a range check or a clamp at its site.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
 mod action;
 mod app;
 mod audio;
+mod cache_window;
 mod config;
 #[cfg(unix)]
 mod control;
@@ -90,7 +101,7 @@ fn print_help() {
 
 /// Render one frame into a `TestBackend` and print it as plain text. Never
 /// enters raw mode or the alternate screen.
-fn dump(dump: Dump) -> std::io::Result<()> {
+fn dump(dump: &Dump) -> std::io::Result<()> {
     let config = Config::default();
     let (keymap, _) = Keymap::from_overrides(&config.keys);
     let theme = Theme::preset("neon").expect("neon preset exists");
@@ -180,7 +191,7 @@ fn main() -> std::io::Result<()> {
     }
 
     match parse_dump(&args) {
-        Ok(Some(dump_req)) => return dump(dump_req),
+        Ok(Some(dump_req)) => return dump(&dump_req),
         Ok(None) => {}
         Err(msg) => {
             eprintln!("ampwire: {msg}");
@@ -296,17 +307,14 @@ fn resolve_theme(config: &Config) -> Theme {
     match config.theme.preset.as_str() {
         "omarchy" => {
             let mut watch = omarchy::OmarchyWatch::new();
-            match watch.check(config.theme.transparent) {
-                Ok(Some(mut theme)) => {
-                    App::apply_theme_overrides(&mut theme, config);
-                    theme
-                }
-                _ => {
-                    // Omarchy missing or unreadable: silently use neon.
-                    let mut theme = Theme::preset("neon").expect("neon preset exists");
-                    App::apply_theme_overrides(&mut theme, config);
-                    theme
-                }
+            if let Ok(Some(mut theme)) = watch.check(config.theme.transparent) {
+                App::apply_theme_overrides(&mut theme, config);
+                theme
+            } else {
+                // Omarchy missing or unreadable: silently use neon.
+                let mut theme = Theme::preset("neon").expect("neon preset exists");
+                App::apply_theme_overrides(&mut theme, config);
+                theme
             }
         }
         name => {
@@ -359,11 +367,7 @@ mod tests {
                 LoadInput::Local(std::path::PathBuf::from("./local album")),
             ]
         );
-        assert!(
-            load_inputs_from_args(&args(&[]))
-                .expect("no args")
-                .is_empty()
-        );
+        assert_eq!(load_inputs_from_args(&args(&[])).expect("no args").len(), 0);
     }
 
     /// A malformed `smb://` stops the run with the fixed line — the same

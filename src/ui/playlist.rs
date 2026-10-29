@@ -126,6 +126,10 @@ fn truncate_ellipsis(text: &str, width: usize) -> String {
     out
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one draw pass for the playlist rows, footer and scrollbar"
+)]
 pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let theme = &app.theme;
     let keymap = &app.keymap;
@@ -134,16 +138,10 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
 
     // Totals always count the *whole* playlist, filtered or not; unknown
     // durations are excluded from the sum.
-    let total_secs: u64 = snapshot
-        .tracks
-        .iter()
-        .filter_map(|t| t.duration)
-        .map(|d| d.as_secs())
-        .sum();
     let totals = format!(
         "{} · {}",
         snapshot.tracks.len(),
-        format_duration(total_secs)
+        format_duration(app.playlist_seconds())
     );
     // The notice slot: an open prompt types here, else the active filter,
     // else whatever notice was left (truncated; totals always fit).
@@ -193,7 +191,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
                 break;
             }
             let cell = &mut buf[(inner.x + i as u16, inner.y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(theme.color(Role::Muted));
         }
         return;
@@ -245,7 +243,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
 
         // Marker.
         let cell = &mut buf[(x, y)];
-        cell.set_symbol(&marker.to_string());
+        cell.set_char(marker);
         cell.set_fg(theme.color(Role::Accent));
         x += 1;
 
@@ -255,7 +253,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
                 break;
             }
             let cell = &mut buf[(x, y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(theme.color(Role::Muted));
             x += 1;
         }
@@ -275,7 +273,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         let truncated = crate::ui::player::truncate_to_width(&name, available);
         for c in truncated.chars() {
             let cell = &mut buf[(x, y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_style(title_style);
             x += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
         }
@@ -283,7 +281,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         let dx = inner.x + list_width - 1 - duration_width as u16;
         for (i, c) in duration.chars().enumerate() {
             let cell = &mut buf[(dx + i as u16, y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(if is_current {
                 theme.color(Role::Accent)
             } else {
@@ -311,10 +309,10 @@ fn render_scrollbar(app: &App, buf: &mut Buffer, scroll: usize, total: usize, in
     let thumb_pos = (scroll as f32 / max_scroll * (track_h - thumb_h)).round();
 
     for i in 0..inner.height {
-        let in_thumb = (i as f32) >= thumb_pos && (i as f32) < thumb_pos + thumb_h;
+        let in_thumb = f32::from(i) >= thumb_pos && f32::from(i) < thumb_pos + thumb_h;
         let cell = &mut buf[(x, inner.y + i)];
         if in_thumb {
-            cell.set_symbol(&glyphs::TRACK_FULL.to_string());
+            cell.set_char(glyphs::TRACK_FULL);
             cell.set_fg(theme.color(Role::Primary));
         } else {
             cell.set_symbol("│");

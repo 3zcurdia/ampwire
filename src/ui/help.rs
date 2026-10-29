@@ -113,7 +113,7 @@ fn build_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<14}", keys_text),
+                format!("  {keys_text:<14}"),
                 Style::default().fg(theme.color(Role::Accent)),
             ),
             Span::styled(
@@ -184,7 +184,7 @@ mod tests {
         let mut overrides = std::collections::HashMap::new();
         overrides.insert("next".to_string(), vec!["n".into()]);
         let (keymap, conflicts) = Keymap::from_overrides(&overrides);
-        assert!(conflicts.is_empty());
+        assert_eq!(conflicts.len(), 0);
         let app = App::new(Config::default(), keymap, theme::neon(), false);
         let lines = build_lines(&app, &theme::neon());
         let next_line = lines

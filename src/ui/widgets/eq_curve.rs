@@ -57,7 +57,7 @@ impl Widget for EqCurve<'_> {
                     i as f32 * (dots_w as f32 - 1.0) / (n - 1) as f32
                 };
                 let v = v.clamp(-1.0, 1.0);
-                let y = (1.0 - (v + 1.0) / 2.0) * (dots_h as f32 - 1.0);
+                let y = (1.0 - f32::midpoint(v, 1.0)) * (dots_h as f32 - 1.0);
                 (x, y)
             })
             .collect();
@@ -103,7 +103,7 @@ impl Widget for EqCurve<'_> {
                 if bits != 0 {
                     let cell = &mut buf[(area.x + cx as u16, area.y + cy as u16)];
                     if let Some(c) = char::from_u32(BRAILLE_BLANK + bits) {
-                        cell.set_symbol(&c.to_string());
+                        cell.set_char(c);
                         cell.set_fg(self.color);
                     }
                 }

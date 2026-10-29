@@ -153,7 +153,7 @@ impl Key {
         if self.modifiers.contains(KeyModifiers::SHIFT) {
             out.push_str("shift+");
         }
-        out.push_str(&match self.code {
+        let name = match self.code {
             KeyCode::Char(' ') => "space".to_string(),
             KeyCode::Char(c) => c.to_string(),
             KeyCode::Enter => "enter".into(),
@@ -172,14 +172,22 @@ impl Key {
             KeyCode::PageDown => "pgdn".into(),
             KeyCode::F(n) => format!("f{n}"),
             other => format!("{other:?}"),
-        });
+        };
+        out.push_str(&name);
         out
     }
 }
 
 /// Default bindings: `(scope, key spec, action)`.
 fn defaults() -> Vec<(Scope, Key, Action)> {
-    use Action::*;
+    use Action::{
+        Add, BalanceLeft, BalanceRight, BandDown, BandLeft, BandRight, BandUp, Clear, ClearFilter,
+        CursorDown, CursorUp, CycleOrder, Del, EqPresets, EqReset, EqToggle, Find, FocusNext,
+        FocusPrev, Help, JumpEnd, JumpHome, LoadJellyfin, MoveDown, MoveUp, Next, Open, PageDown,
+        PageUp, Pause, Play, PlayPause, Prev, Quit, SeekBack, SeekFwd, Select, Stop, ToggleColumns,
+        ToggleEq, TogglePlayer, TogglePlaylist, ToggleRepeat, ToggleShuffle, ToggleTimeMode,
+        VolumeDown, VolumeUp,
+    };
     let raw: Vec<(Scope, &str, Action)> = vec![
         // Global transport
         (Scope::Global, "space", PlayPause),
@@ -548,7 +556,7 @@ mod tests {
     }
 
     /// Non-letter chars keep the SHIFT tolerance: `+` arrives shifted from
-    /// many terminals but must still hit VolumeUp.
+    /// many terminals but must still hit `VolumeUp`.
     #[test]
     fn shifted_symbols_still_match_unshifted_bindings() {
         let map = Keymap::defaults();
@@ -747,15 +755,13 @@ mod tests {
             assert_eq!(
                 map.resolve(*scope, *key),
                 Some(*action),
-                "{scope:?} + {:?} should be {:?}",
-                key,
-                action
+                "{scope:?} + {key:?} should be {action:?}"
             );
         }
     }
 
     /// Plan 06: `o` / `0` live in the EQ scope only — no global fallback,
-    /// no clash with `shift+o` (cycle_order) or `1`/`2`/`3`.
+    /// no clash with `shift+o` (`cycle_order`) or `1`/`2`/`3`.
     #[test]
     fn eq_toggle_and_reset_are_eq_scope_only() {
         let map = Keymap::defaults();
@@ -786,6 +792,8 @@ mod tests {
 
     #[test]
     fn remap_next_to_n_updates_hints_and_transport() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         // remap `next = ["n"]`: `b` no longer maps to Next, and the transport
         // row shows `n`.
         let mut overrides = HashMap::new();
@@ -804,8 +812,6 @@ mod tests {
         assert_eq!(map.hint(Action::Next).as_deref(), Some("n"));
 
         // The transport box (drawn from keymap.hint) shows the remapped key.
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
         let app = crate::app::App::new(
             crate::config::Config::default(),
             map,

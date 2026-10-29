@@ -7,7 +7,7 @@ fn version_prints_exact_line() {
     assert!(out.status.success(), "exit status: {:?}", out.status);
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(stdout, format!("ampwire {}\n", env!("CARGO_PKG_VERSION")));
-    assert!(out.stderr.is_empty());
+    assert_eq!(out.stderr, [] as [u8; 0]);
 }
 
 #[test]

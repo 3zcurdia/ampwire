@@ -106,7 +106,7 @@ impl SmbUrl {
             match segment {
                 // Empty segments (`a//b`, a trailing `/`) and `.` are
                 // dropped; `..` is a traversal attempt, never normalized.
-                "" | "." => continue,
+                "" | "." => {}
                 ".." => return Err(SMB_DOTS.to_string()),
                 segment if segment.contains(['\\', '?', '#']) => {
                     return Err(SMB_CHARS.to_string());
@@ -127,7 +127,7 @@ impl SmbUrl {
     pub(crate) fn extension(&self) -> Option<String> {
         let name = self.path.rsplit('/').next().unwrap_or_default();
         let ext = name.rsplit_once('.').map(|(_, ext)| ext)?;
-        let cleaned: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let cleaned: String = ext.chars().filter(char::is_ascii_alphanumeric).collect();
         (!cleaned.is_empty()).then(|| cleaned.to_ascii_lowercase())
     }
 
@@ -350,7 +350,7 @@ impl SmbClientCfg {
         match config {
             Some(config) => {
                 let mut cfg = Self::new("", config.username.clone(), config.password.clone());
-                cfg.domain = config.domain.clone();
+                config.domain.clone_into(&mut cfg.domain);
                 cfg
             }
             None => Self::new("", "", ""),
@@ -1000,6 +1000,7 @@ mod tests {
     #[test]
     #[ignore = "needs a live Samba server (see module docs)"]
     fn smb_spike_streams_for_thirty_seconds_without_disconnecting() {
+        const CHUNK: usize = 64 * 1024;
         let Some(target) = target() else {
             return eprintln!("smb_spike: AMPWIRE_SMB_TEST_SERVER/SHARE not set, skipped");
         };
@@ -1013,7 +1014,6 @@ mod tests {
         let mut source = crate::smb::source::SmbFileSource::open(&client, &path)
             .unwrap_or_else(|e| panic!("open {file}: {e}"));
 
-        const CHUNK: usize = 64 * 1024;
         let mut buf = vec![0u8; CHUNK];
         let started = Instant::now();
         let mut bytes = 0u64;

@@ -15,11 +15,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
+use crate::cache_window::{self, DownloadError, Flow, WindowCmd, fetch_one};
 use crate::jellyfin::{Client, ItemId};
 use crate::player::order::PlayOrder;
 use crate::player::{Track, TrackSource};
@@ -30,7 +31,7 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Read/write chunk while downloading (the plan's 256 KiB).
 const CHUNK: usize = 256 * 1024;
 /// Directories left behind by a crash are swept after this long.
-pub const STALE_AGE: Duration = Duration::from_secs(24 * 3600);
+pub const STALE_AGE: Duration = Duration::from_hours(24);
 /// Directory-name prefix this app creates for the Jellyfin window — the
 /// *only* thing the sweep and the eviction will ever touch by name. The
 /// SMB window (plan 10, step 5) reuses [`create_own_dir`] /
@@ -53,36 +54,19 @@ impl RemoteRef {
                 item_id: item_id.clone(),
                 container: container.clone(),
             }),
-            TrackSource::Smb { .. } => None,
-            TrackSource::Local(_) => None,
+            TrackSource::Smb { .. } | TrackSource::Local(_) => None,
         }
     }
 }
 
-/// UI → downloader thread.
-#[derive(Debug)]
-pub enum CacheCmd {
-    /// New wanted set, already in priority order: current, ahead (nearest
-    /// first), behind (nearest first).
-    Window(Vec<RemoteRef>),
-    Shutdown,
-}
+/// UI → downloader thread: the window, or shutdown.
+pub type CacheCmd = WindowCmd<RemoteRef>;
 
 /// Downloader → UI thread.
 #[derive(Debug)]
 pub enum CacheEvent {
     Ready { item_id: ItemId, path: PathBuf },
     Failed { item_id: ItemId, error: String },
-}
-
-/// What the downloader should do after one item (internal).
-enum Flow {
-    /// Finished (or failed) this item: continue down the list.
-    Continue,
-    /// A newer window arrived: start over from its first item.
-    Restart,
-    /// Shutdown: leave the loop.
-    Stop,
 }
 
 /// The temp-dir window. Dropping it stops the thread **and** removes the
@@ -121,7 +105,7 @@ impl Cache {
         let thread_dir = dir.clone();
         let join = std::thread::Builder::new()
             .name("ampwire-jellyfin-cache".into())
-            .spawn(move || run(client, thread_dir, max_bytes, cmd_rx, ev_tx))?;
+            .spawn(move || run(&client, &thread_dir, max_bytes, &cmd_rx, &ev_tx))?;
 
         Ok(Cache {
             tx: cmd_tx,
@@ -290,104 +274,33 @@ fn is_our_dir_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
     !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The window in play order: current (if remote) → `ahead` next remote
-/// tracks → `behind` previous ones, nearest first, deduplicated. Local
-/// tracks are skipped and never counted, so shuffle (which reorders the
-/// play sequence, not the playlist) is respected automatically.
+/// The Jellyfin window: the rule is [`PlayOrder::window`]; only remote
+/// Jellyfin tracks are downloadable here (an SMB row has its own window,
+/// plan 10, step 2).
 pub fn compute_window(
     order: &PlayOrder,
-    tracks: &[Track],
+    tracks: &[Arc<Track>],
     current: Option<usize>,
     ahead: usize,
     behind: usize,
 ) -> Vec<RemoteRef> {
-    let mut seen: HashSet<usize> = HashSet::new();
-    let mut wanted: Vec<usize> = Vec::new();
-
-    let mut take = |index: usize, wanted: &mut Vec<usize>| {
-        // Only *Jellyfin* tracks are downloadable: an SMB row in the same
-        // playlist has its own window (plan 10, step 2).
-        if seen.insert(index) && tracks.get(index).is_some_and(Track::is_jellyfin) {
-            wanted.push(index);
-        }
-    };
-
-    if let Some(current) = current {
-        take(current, &mut wanted);
-    }
-    // `N` large enough to find `ahead` *remote* tracks among everything.
-    let mut count = 0;
-    for index in order.upcoming(tracks.len()) {
-        if count >= ahead {
-            break;
-        }
-        let before = wanted.len();
-        take(index, &mut wanted);
-        if wanted.len() > before {
-            count += 1;
-        }
-    }
-    let mut count = 0;
-    for index in order.previous(tracks.len()) {
-        if count >= behind {
-            break;
-        }
-        let before = wanted.len();
-        take(index, &mut wanted);
-        if wanted.len() > before {
-            count += 1;
-        }
-    }
-
-    wanted
-        .into_iter()
-        .filter_map(|index| RemoteRef::from_track(&tracks[index]))
-        .collect()
+    order.window(tracks, current, ahead, behind, RemoteRef::from_track)
 }
 
 /// The downloader thread: wait for a window → evict → fetch in priority
 /// order, restarting whenever a newer window arrives.
 fn run(
-    client: Client,
-    dir: PathBuf,
+    client: &Client,
+    dir: &Path,
     max_bytes: u64,
-    rx: Receiver<CacheCmd>,
-    tx: Sender<CacheEvent>,
+    rx: &Receiver<CacheCmd>,
+    tx: &Sender<CacheEvent>,
 ) {
-    let mut wanted: Vec<RemoteRef>;
-    loop {
-        // 1. Block until the player hands over a window.
-        match rx.recv() {
-            Ok(CacheCmd::Window(list)) => {
-                evict(&dir, &list);
-                wanted = list;
-            }
-            Ok(CacheCmd::Shutdown) | Err(_) => return,
-        }
-
-        // 2. Fetch the list in priority order (current first).
-        let mut index = 0;
-        while index < wanted.len() {
-            // A newer window that arrived between items preempts ours.
-            while let Ok(cmd) = rx.try_recv() {
-                match cmd {
-                    CacheCmd::Window(list) => {
-                        evict(&dir, &list);
-                        wanted = list;
-                        index = 0;
-                    }
-                    CacheCmd::Shutdown => return,
-                }
-            }
-            let item = wanted[index].clone();
-            match fetch(&client, &dir, &item, max_bytes, &rx, &tx, &mut wanted) {
-                Flow::Continue => index += 1,
-                Flow::Restart => index = 0,
-                Flow::Stop => return,
-            }
-        }
-        // 3. Window satisfied → back to step 1 and wait.
-    }
+    cache_window::run(
+        rx,
+        |list| evict(dir, list),
+        |item, rx, wanted| fetch(client, dir, item, max_bytes, rx, tx, wanted),
+    );
 }
 
 /// Fetch one item for the window: [`download_original`], checking for a
@@ -402,24 +315,13 @@ fn fetch(
     tx: &Sender<CacheEvent>,
     wanted: &mut Vec<RemoteRef>,
 ) -> Flow {
-    // Continue, unless a newer window (Restart) or shutdown (Stop) arrived.
-    let mut flow = Flow::Continue;
-    let result = download_original(client, item, dir, max_bytes, || {
-        match rx.try_recv() {
-            Ok(CacheCmd::Window(list)) => {
-                evict(dir, &list);
-                let still_wanted = list.iter().any(|ref_| ref_.item_id == item.item_id);
-                *wanted = list;
-                flow = Flow::Restart;
-                !still_wanted // still wanted: finish this file, then re-check
-            }
-            Ok(CacheCmd::Shutdown) | Err(TryRecvError::Disconnected) => {
-                flow = Flow::Stop;
-                true
-            }
-            Err(TryRecvError::Empty) => false,
-        }
-    });
+    let (flow, result) = fetch_one(
+        rx,
+        wanted,
+        |list| evict(dir, list),
+        |r| r.item_id == item.item_id,
+        |interrupt| download_original(client, item, dir, max_bytes, interrupt),
+    );
     match result {
         Ok(path) => {
             let _ = tx.send(CacheEvent::Ready {
@@ -436,16 +338,6 @@ fn fetch(
         }
     }
     flow
-}
-
-/// Why [`download_original`] produced no file.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DownloadError {
-    /// The caller's `interrupt` asked to stop; the `.part` is gone.
-    Interrupted,
-    /// A key-free, user-facing reason (`file is over the 512 MiB cache
-    /// limit`, `jellyfin: cannot reach server`, …).
-    Failed(String),
 }
 
 /// The one way a Jellyfin original becomes a local file — for the cache
@@ -582,6 +474,11 @@ fn content_length(response: &ureq::http::Response<ureq::Body>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// The playlist's shared shape: each track behind its own `Arc`.
+    fn arc(tracks: &[Track]) -> Vec<Arc<Track>> {
+        tracks.iter().cloned().map(Arc::new).collect()
+    }
+
     use std::path::PathBuf;
 
     use super::*;
@@ -598,7 +495,7 @@ mod tests {
             title: Some(path.to_string()),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -613,7 +510,25 @@ mod tests {
             title: Some(format!("title-{id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
+        }
+    }
+
+    fn smb(path: &str) -> Track {
+        Track {
+            id: Track::next_id(),
+            source: TrackSource::Smb {
+                url: crate::smb::SmbUrl {
+                    server: "nas".into(),
+                    share: "Music".into(),
+                    path: path.into(),
+                },
+            },
+            artist: None,
+            title: None,
+            duration: None,
+            bitrate_kbps: None,
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -652,18 +567,21 @@ mod tests {
         let order = ordered(tracks.len(), Some(1));
         // Local tracks are skipped *and* don't count toward ahead/behind.
         assert_eq!(
-            ids(&compute_window(&order, &tracks, Some(1), 3, 2)),
+            ids(&compute_window(&order, &arc(&tracks), Some(1), 3, 2)),
             ["a", "b", "c"],
             "current first, then the next remotes; the local behind is gone"
         );
         // The current track is in front even when ahead/behind are zero.
-        assert_eq!(ids(&compute_window(&order, &tracks, Some(1), 0, 0)), ["a"]);
+        assert_eq!(
+            ids(&compute_window(&order, &arc(&tracks), Some(1), 0, 0)),
+            ["a"]
+        );
         // Behind reaches back over the local track at index 0 — but locals
         // never enter the window (cursor on the last track, as the order
         // would really be after playing up to it).
         let order_end = ordered(tracks.len(), Some(4));
         assert_eq!(
-            ids(&compute_window(&order_end, &tracks, Some(4), 0, 3)),
+            ids(&compute_window(&order_end, &arc(&tracks), Some(4), 0, 3)),
             ["c", "b", "a"]
         );
     }
@@ -673,11 +591,25 @@ mod tests {
         let tracks = vec![local("/x/0.flac"), remote("a"), remote("b")];
         let order = ordered(tracks.len(), None);
         assert_eq!(
-            ids(&compute_window(&order, &tracks, None, 2, 2)),
+            ids(&compute_window(&order, &arc(&tracks), None, 2, 2)),
             ["a", "b"]
         );
         // Nothing current and no look-ahead: empty, never a panic.
-        assert!(compute_window(&order, &tracks, None, 0, 0).is_empty());
+        assert_eq!(compute_window(&order, &arc(&tracks), None, 0, 0).len(), 0);
+    }
+
+    /// The mirror of the SMB cache's mixed-source window test: an SMB row
+    /// never enters the Jellyfin window and never eats its quota.
+    #[test]
+    fn window_skips_smb_tracks_without_counting_them() {
+        // [R-a, S-x, R-b, R-c], current = the remote at index 0.
+        let tracks = vec![remote("a"), smb("x.flac"), remote("b"), remote("c")];
+        let order = ordered(tracks.len(), Some(0));
+        assert_eq!(
+            ids(&compute_window(&order, &arc(&tracks), Some(0), 3, 2)),
+            ["a", "b", "c"],
+            "the SMB row is skipped, so three ahead still yields b and c"
+        );
     }
 
     #[test]
@@ -686,16 +618,19 @@ mod tests {
         let tracks = vec![remote("a"), remote("b"), remote("c")];
         let order = ordered(tracks.len(), Some(2));
         assert_eq!(
-            ids(&compute_window(&order, &tracks, Some(2), 3, 3)),
+            ids(&compute_window(&order, &arc(&tracks), Some(2), 3, 3)),
             ["c", "b", "a"]
         );
-        assert_eq!(ids(&compute_window(&order, &tracks, Some(2), 3, 0)), ["c"]);
+        assert_eq!(
+            ids(&compute_window(&order, &arc(&tracks), Some(2), 3, 0)),
+            ["c"]
+        );
 
         // Current is the first: nothing is behind (the "previous" peek at
         // the start is the restart target, which is the current track).
         let order = ordered(tracks.len(), Some(0));
         assert_eq!(
-            ids(&compute_window(&order, &tracks, Some(0), 2, 3)),
+            ids(&compute_window(&order, &arc(&tracks), Some(0), 2, 3)),
             ["a", "b", "c"]
         );
     }
@@ -704,10 +639,10 @@ mod tests {
     fn window_follows_shuffle_not_playlist_order() {
         let tracks: Vec<Track> = (0..6).map(|i| remote(&format!("r{i}"))).collect();
         let order = shuffled(tracks.len(), Some(0), 7);
-        let window = compute_window(&order, &tracks, Some(0), 6, 6);
+        let window = compute_window(&order, &arc(&tracks), Some(0), 6, 6);
         // All-remote list: the window is the whole play order, current first.
         let mut expected: Vec<String> = vec!["r0".to_string()];
-        expected.extend(order.upcoming(tracks.len()).iter().map(|&i| {
+        expected.extend(order.upcoming(tracks.len()).map(|i| {
             RemoteRef::from_track(&tracks[i])
                 .expect("remote")
                 .item_id
@@ -725,8 +660,11 @@ mod tests {
     fn window_of_an_all_local_playlist_is_empty() {
         let tracks: Vec<Track> = (0..5).map(|i| local(&format!("/x/{i}.flac"))).collect();
         let order = ordered(tracks.len(), Some(2));
-        assert!(compute_window(&order, &tracks, Some(2), 3, 3).is_empty());
-        assert!(compute_window(&order, &tracks, None, 10, 10).is_empty());
+        assert_eq!(
+            compute_window(&order, &arc(&tracks), Some(2), 3, 3).len(),
+            0
+        );
+        assert_eq!(compute_window(&order, &arc(&tracks), None, 10, 10).len(), 0);
     }
 
     // --- directory sweep + lifecycle (plan 08, Decisions) ---
@@ -750,8 +688,8 @@ mod tests {
         for dir in [&stale, &fresh, &unrelated, &not_a_pid] {
             fs::create_dir_all(dir).unwrap();
         }
-        age_dir(&stale, Duration::from_secs(25 * 3600)); // > 24 h
-        age_dir(&not_a_pid, Duration::from_secs(25 * 3600)); // wrong pattern
+        age_dir(&stale, Duration::from_hours(25)); // > 24 h
+        age_dir(&not_a_pid, Duration::from_hours(25)); // wrong pattern
 
         let removed = sweep_stale_dirs(parent.path(), STALE_AGE, DIR_PREFIX);
         assert_eq!(removed, 1, "exactly the stale crash leftover");

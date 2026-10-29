@@ -30,8 +30,6 @@ use crate::smb::{LoadInput, parse_load_input};
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// A status/control request is tiny; refuse anything larger.
 const MAX_REQUEST: usize = 64 * 1024;
-/// Non-blocking accept: sleep instead of spinning.
-const ACCEPT_SLEEP: Duration = Duration::from_millis(20);
 
 /// What `start` did. `AlreadyRunning` means the paths were forwarded.
 pub enum Start {
@@ -51,8 +49,15 @@ pub struct ControlServer {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
+        self.stop.store(true, Ordering::Release);
+        // The accept is blocking: one throwaway connection wakes it so it
+        // sees `stop` (the Release store pairs with the loop's Acquire
+        // load). If that connect fails (the socket file is gone) the
+        // thread is left to exit with the process rather than joined forever.
+        let woke = UnixStream::connect(&self.path).is_ok();
+        if let Some(thread) = self.thread.take()
+            && woke
+        {
             let _ = thread.join();
         }
         let _ = fs::remove_file(&self.path);
@@ -215,10 +220,9 @@ fn start_at(path: &Path, view: SharedView, tx: Sender<RemoteCommand>) -> io::Res
 fn bind(path: &Path, view: SharedView, tx: Sender<RemoteCommand>) -> io::Result<ControlServer> {
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
-    let thread = thread::spawn(move || accept_loop(listener, thread_stop, view, tx));
+    let thread = thread::spawn(move || accept_loop(&listener, &thread_stop, &view, &tx));
     Ok(ControlServer {
         path: path.to_path_buf(),
         stop,
@@ -227,17 +231,22 @@ fn bind(path: &Path, view: SharedView, tx: Sender<RemoteCommand>) -> io::Result<
 }
 
 fn accept_loop(
-    listener: UnixListener,
-    stop: Arc<AtomicBool>,
-    view: SharedView,
-    tx: Sender<RemoteCommand>,
+    listener: &UnixListener,
+    stop: &AtomicBool,
+    view: &SharedView,
+    tx: &Sender<RemoteCommand>,
 ) {
-    while !stop.load(Ordering::Relaxed) {
+    // Blocks in `accept` (no polling): an idle session costs no wake-ups.
+    // `ControlServer::drop` ends the loop with one connection of its own.
+    loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                let _ = handle_client(stream, &view, &tx);
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let _ = handle_client(stream, view, tx);
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_SLEEP),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
@@ -416,18 +425,13 @@ fn resolve_local_arg(text: &str) -> String {
     let path = Path::new(text);
     let resolved = if let Some(rest) = text.strip_prefix("~/") {
         std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .unwrap_or_else(|| path.to_path_buf())
+            .map_or_else(|| path.to_path_buf(), |home| PathBuf::from(home).join(rest))
     } else if text == "~" {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.to_path_buf())
+        std::env::var_os("HOME").map_or_else(|| path.to_path_buf(), PathBuf::from)
     } else if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
     };
     resolved.to_string_lossy().into_owned()
 }
@@ -524,7 +528,7 @@ pub fn client_status(json: bool) -> i32 {
     } else {
         print_human(&view);
     }
-    if view.running { 0 } else { 1 }
+    i32::from(!view.running)
 }
 
 /// `ampwire --ctl <command> [value]`. Returns the process exit code.
@@ -626,22 +630,17 @@ fn print_human(view: &View) {
     if view.track.is_some() && !view.format.codec.is_empty() {
         println!("{}", format_line(&view.format));
     }
-    let duration = view
-        .track
-        .as_ref()
-        .map(|track| track.duration_ms)
-        .unwrap_or(0);
+    let duration = view.track.as_ref().map_or(0, |track| track.duration_ms);
     let position = mmss(view.position_ms);
     let total = if duration == 0 {
         "--:--".to_string()
     } else {
         mmss(duration)
     };
-    let playlist = view
-        .playlist
-        .index
-        .map(|index| format!("{}/{}", index + 1, view.playlist.length))
-        .unwrap_or_else(|| format!("0/{}", view.playlist.length));
+    let playlist = view.playlist.index.map_or_else(
+        || format!("0/{}", view.playlist.length),
+        |index| format!("{}/{}", index + 1, view.playlist.length),
+    );
     println!(
         "{position} / {total} · volume {} · shuffle {} · repeat {} · playlist {playlist}",
         view.volume,
@@ -654,30 +653,42 @@ fn print_human(view: &View) {
 }
 
 fn format_line(format: &crate::remote::FormatView) -> String {
+    use std::fmt::Write as _;
+    // Writing into a `String` cannot fail, so the results are dropped.
     let mut text = format.codec.clone();
     if format.lossless {
         match (format.bit_depth, format.sample_rate) {
-            (Some(depth), Some(rate)) => text.push_str(&format!(
-                " {depth}/{}/{}",
-                crate::player::format_khz(rate),
-                format.channels
-            )),
-            (Some(depth), None) => text.push_str(&format!(" {depth}-bit {}", format.channels)),
-            (None, Some(rate)) => text.push_str(&format!(
-                " {}/{}",
-                crate::player::format_khz(rate),
-                format.channels
-            )),
-            (None, None) => text.push_str(&format!(" {}", format.channels)),
+            (Some(depth), Some(rate)) => {
+                let _ = write!(
+                    text,
+                    " {depth}/{}/{}",
+                    crate::player::format_khz(rate),
+                    format.channels
+                );
+            }
+            (Some(depth), None) => {
+                let _ = write!(text, " {depth}-bit {}", format.channels);
+            }
+            (None, Some(rate)) => {
+                let _ = write!(
+                    text,
+                    " {}/{}",
+                    crate::player::format_khz(rate),
+                    format.channels
+                );
+            }
+            (None, None) => {
+                let _ = write!(text, " {}", format.channels);
+            }
         }
     } else {
         if let Some(kbps) = format.bitrate_kbps {
-            text.push_str(&format!(" {kbps}kbps"));
+            let _ = write!(text, " {kbps}kbps");
         }
         if let Some(rate) = format.sample_rate {
-            text.push_str(&format!(" {}kHz", crate::player::format_khz(rate)));
+            let _ = write!(text, " {}kHz", crate::player::format_khz(rate));
         }
-        text.push_str(&format!(" {}", format.channels));
+        let _ = write!(text, " {}", format.channels);
     }
     if format.bit_perfect {
         text.push_str(" · bit-perfect (app)");

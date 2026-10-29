@@ -36,7 +36,7 @@ use crate::smb::cache::{
 use super::order::PlayOrder;
 use super::playlist::Playlist;
 use super::rng::Rng;
-use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, Track, TrackSource};
+use super::{Bars, FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, TrackSource};
 
 /// Only the last `TAP_ANALYZE` tapped samples feed one FFT frame.
 const TAP_ANALYZE: usize = 4096;
@@ -47,6 +47,10 @@ const RELEASE: f32 = 0.45;
 /// Peak caps fall at this factor per frame (mock copy).
 const PEAK_FALL: f32 = 0.06;
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the player holds independent flags (shuffle, repeat, bit-perfect source, notice shown) mirrored in the snapshot"
+)]
 pub struct RealPlayer {
     playlist: Playlist,
     state: PlayState,
@@ -95,8 +99,8 @@ pub struct RealPlayer {
     /// Reused tap-drain buffer (no per-frame allocation).
     tap_buf: Vec<f32>,
     /// Smoothed band levels / peak caps, 0.0–1.0 (plan 04: 32 real bands).
-    spectrum: Vec<f32>,
-    peaks: Vec<f32>,
+    spectrum: [f32; BANDS],
+    peaks: [f32; BANDS],
     /// The engine seam: production [`Engine`], a recording fake in tests.
     engine: Box<dyn AudioOut>,
     order: PlayOrder,
@@ -190,7 +194,7 @@ impl RealPlayer {
                         player.cache = Some(cache);
                     }
                     Err(reason) => {
-                        player.notice = Some(format!("jellyfin: cache unavailable ({reason})"))
+                        player.notice = Some(format!("jellyfin: cache unavailable ({reason})"));
                     }
                 }
             }
@@ -224,8 +228,8 @@ impl RealPlayer {
             pending_start: None,
             analyzer: Box::new(Analyzer::new()),
             tap_buf: Vec::new(),
-            spectrum: vec![0.0; BANDS],
-            peaks: vec![0.0; BANDS],
+            spectrum: [0.0; BANDS],
+            peaks: [0.0; BANDS],
             engine,
             order: PlayOrder::new(),
             fail_streak: 0,
@@ -245,7 +249,7 @@ impl RealPlayer {
 
     pub fn snapshot(&self) -> PlayerSnapshot {
         let format = if self.state == PlayState::Stopped {
-            FormatInfo::empty()
+            FormatInfo::blank()
         } else {
             let mut format = self.format.clone();
             // Bit-perfect marker (plan 05/06): only a lossless source with
@@ -273,8 +277,8 @@ impl RealPlayer {
             volume: self.volume,
             balance: self.balance,
             format,
-            spectrum: self.spectrum.clone(),
-            peaks: self.peaks.clone(),
+            spectrum: Bars::from_slice(&self.spectrum),
+            peaks: Bars::from_slice(&self.peaks),
         }
     }
 
@@ -345,9 +349,9 @@ impl RealPlayer {
                     .playlist
                     .tracks()
                     .iter()
-                    .map(Track::is_jellyfin)
+                    .map(|track| track.is_jellyfin())
                     .collect();
-                let was_current = self.playlist.remove_where(|track| track.is_jellyfin());
+                let was_current = self.playlist.remove_where(super::Track::is_jellyfin);
                 self.order
                     .removed(&removed, self.playlist.current(), &mut self.rng);
                 self.update_cache_window();
@@ -414,7 +418,7 @@ impl RealPlayer {
             PlayerCommand::SetEq { enabled, gains } => self.set_eq(enabled, gains),
             _ => {}
         }
-        self.handle_transport(cmd);
+        self.handle_transport(&cmd);
     }
 
     /// Volume 0–=100 → the shared gain target (0 = silence, 100 = unity).
@@ -456,7 +460,7 @@ impl RealPlayer {
                 .playlist
                 .current()
                 .and_then(|index| self.playlist.tracks().get(index))
-                .is_some_and(Track::is_jellyfin)
+                .is_some_and(|track| track.is_jellyfin())
     }
 
     /// The EQ really shaping the samples right now — what the bit-perfect
@@ -466,11 +470,11 @@ impl RealPlayer {
     }
 
     /// Transport — everything that needs a non-empty playlist.
-    fn handle_transport(&mut self, cmd: PlayerCommand) {
+    fn handle_transport(&mut self, cmd: &PlayerCommand) {
         if self.playlist.is_empty() {
             return;
         }
-        match cmd {
+        match *cmd {
             PlayerCommand::Play => match self.state {
                 PlayState::Paused => {
                     self.engine.send(EngineCmd::Resume);
@@ -497,8 +501,8 @@ impl RealPlayer {
             }
             PlayerCommand::Stop => self.stop_playback(),
             PlayerCommand::TogglePlayPause => match self.state {
-                PlayState::Playing => self.handle_transport(PlayerCommand::Pause),
-                _ => self.handle_transport(PlayerCommand::Play),
+                PlayState::Playing => self.handle_transport(&PlayerCommand::Pause),
+                _ => self.handle_transport(&PlayerCommand::Play),
             },
             // End of track and manual Next share one rule (plan §Decisions).
             PlayerCommand::Next => self.advance_after_end(),
@@ -514,7 +518,6 @@ impl RealPlayer {
                 self.order.jump_to(i);
                 self.start_track(i);
             }
-            PlayerCommand::PlayTrack(_) => {}
             PlayerCommand::SeekBy(delta) => self.seek_by(delta),
             PlayerCommand::SeekTo(target) => self.seek_to(target),
             PlayerCommand::ToggleShuffle => {
@@ -583,7 +586,7 @@ impl RealPlayer {
     pub fn tick(&mut self, _dt: Duration) {
         for event in self.engine.poll() {
             match event {
-                EngineEvent::Started(info, handle) => self.on_started(info, handle),
+                EngineEvent::Started(info, handle) => self.on_started(&info, handle),
                 // Plan 09, step 4: remember the switch; the track change
                 // itself happens when the clock reaches the boundary.
                 EngineEvent::Advanced(info) => self.pending_advance = Some(info),
@@ -598,7 +601,7 @@ impl RealPlayer {
         self.check_boundary();
         self.poll_cache();
         self.poll_smb_cache();
-        self.update_spectrum();
+        self.decay_spectrum();
     }
 
     /// Plan 09, step 4: move `current` (cursor, clock base, format line)
@@ -652,7 +655,7 @@ impl RealPlayer {
     /// decoder's accurate duration when the tag had none or lied (the tag
     /// is off by more than a second) — and the gapless queue for what
     /// plays next (plan 09, step 5).
-    fn on_started(&mut self, info: StreamInfo, handle: PlaybackHandle) {
+    fn on_started(&mut self, info: &StreamInfo, handle: PlaybackHandle) {
         self.fail_streak = 0;
         // Buffering is over: retire that exact notice if it is still up
         // (anything else queued meanwhile keeps its place).
@@ -668,7 +671,7 @@ impl RealPlayer {
         let current = self.playlist.current();
         self.handle = Some(handle);
         self.pending_start = None; // the live clock takes over
-        self.apply_format(&info, current);
+        self.apply_format(info, current);
         // `stream_pure` (plan 08): first remote track of the session — say
         // what is different about it. Shown at `Started`, so it is never
         // clobbered by (and never hides) the `buffering…` it follows.
@@ -704,14 +707,14 @@ impl RealPlayer {
         };
         self.source_exact = info.f32_exact;
         self.format = FormatInfo {
-            codec: info.codec.clone(),
+            codec: info.codec.as_str().into(),
             // The marker itself is computed in `snapshot()` from the live
             // volume/balance (plan 05); the stored format only carries the
             // source's losslessness.
             bit_perfect: false,
             bit_depth: info.bit_depth,
             sample_rate: Some(info.sample_rate),
-            channels: channels_label(info.channels),
+            channels: channels_label(info.channels).into(),
             bitrate_kbps,
             lossless: info.lossless,
         };
@@ -734,8 +737,7 @@ impl RealPlayer {
             .playlist
             .current()
             .and_then(|i| self.playlist.tracks().get(i))
-            .map(|t| t.display_name())
-            .unwrap_or_else(|| "track".into());
+            .map_or_else(|| "track".into(), |t| t.display_name());
         if self.fail_streak >= self.playlist.len() {
             // Keep the last reason in the give-up notice: without it the
             // user only sees silence and "no playable tracks" — e.g. a
@@ -808,7 +810,7 @@ impl RealPlayer {
                 .playlist
                 .tracks()
                 .get(i)
-                .is_some_and(Track::is_jellyfin);
+                .is_some_and(|track| track.is_jellyfin());
         self.params.set_eq_bypass(bypass);
         let engine_load = match source {
             TrackSource::Local(path) => {
@@ -898,16 +900,15 @@ impl RealPlayer {
                         .as_ref()
                         .and_then(|config| config.cache_dir.clone());
                     let cfg = crate::smb::SmbClientCfg::for_url(url, self.smb.as_ref());
-                    match SmbCache::new(cfg, parent) {
-                        Ok(cache) => self.smb_cache = Some(cache),
-                        Err(_) => {
-                            // No window to download into: stop with the
-                            // reason instead of skipping through every SMB
-                            // track in the list (the plan's cache rule).
-                            self.stop_playback();
-                            self.notice = Some("smb: cache unavailable".into());
-                            return false;
-                        }
+                    if let Ok(cache) = SmbCache::new(cfg, parent) {
+                        self.smb_cache = Some(cache);
+                    } else {
+                        // No window to download into: stop with the reason
+                        // instead of skipping through every SMB track in the
+                        // list (the plan's cache rule).
+                        self.stop_playback();
+                        self.notice = Some("smb: cache unavailable".into());
+                        return false;
                     }
                 }
                 let ready = self
@@ -969,8 +970,7 @@ impl RealPlayer {
         } else {
             self.order
                 .upcoming(1)
-                .first()
-                .copied()
+                .next()
                 .and_then(|i| self.queue_source(i))
         };
         match queued {
@@ -1087,15 +1087,8 @@ impl RealPlayer {
                 if self.pending_remote.as_ref() != Some(&item_id) {
                     return; // stale: the user already moved on
                 }
-                let start = self.pending_start.unwrap_or(Duration::ZERO);
-                let keep_paused = self.state == PlayState::Paused;
                 self.pending_remote = None;
-                self.engine.send(EngineCmd::Load { path, start });
-                if keep_paused {
-                    self.engine.send(EngineCmd::Pause);
-                } else {
-                    self.engine.send(EngineCmd::Resume);
-                }
+                self.load_ready_file(path);
             }
             CacheEvent::Failed { item_id, error } => {
                 if self.pending_remote.as_ref() != Some(&item_id) {
@@ -1131,15 +1124,8 @@ impl RealPlayer {
                 if self.pending_smb.as_ref() != Some(&url) {
                     return; // stale: the user already moved on
                 }
-                let start = self.pending_start.unwrap_or(Duration::ZERO);
-                let keep_paused = self.state == PlayState::Paused;
                 self.pending_smb = None;
-                self.engine.send(EngineCmd::Load { path, start });
-                if keep_paused {
-                    self.engine.send(EngineCmd::Pause);
-                } else {
-                    self.engine.send(EngineCmd::Resume);
-                }
+                self.load_ready_file(path);
             }
             SmbCacheEvent::Failed { url, error } => {
                 if self.pending_smb.as_ref() != Some(&url) {
@@ -1151,6 +1137,20 @@ impl RealPlayer {
                 self.on_error(PlayError::Failed(error));
             }
         }
+    }
+
+    /// Load a downloaded file the track was waiting for, at the pending start
+    /// offset. The engine's pause flag survives a `Load`, so the state the
+    /// user left (paused or playing) is re-asserted right after it.
+    fn load_ready_file(&mut self, path: std::path::PathBuf) {
+        let start = self.pending_start.unwrap_or(Duration::ZERO);
+        let keep_paused = self.state == PlayState::Paused;
+        self.engine.send(EngineCmd::Load { path, start });
+        self.engine.send(if keep_paused {
+            EngineCmd::Pause
+        } else {
+            EngineCmd::Resume
+        });
     }
 
     /// Halt playback but keep the current track selected (Stop semantics).
@@ -1171,11 +1171,10 @@ impl RealPlayer {
         self.pending_smb = None;
     }
 
-    /// Smooth the analyzer's band levels into the bars (plan §step 6):
-    /// instant attack, release `0.45`, peak caps falling at `0.06` — the
-    /// exact constants of `MockPlayer::tick`. Paused decays the bars
-    /// (`×0.75`), stopped zeroes everything.
-    fn update_spectrum(&mut self) {
+    /// Bars and peak caps while nothing is analysed (plan §step 6): paused
+    /// decays them (`×0.75`), stopped zeroes everything. Runs on every tick,
+    /// since it costs nothing; the playing case is [`RealPlayer::analyze`].
+    fn decay_spectrum(&mut self) {
         match self.state {
             PlayState::Stopped => {
                 self.spectrum.iter_mut().for_each(|bin| *bin = 0.0);
@@ -1186,37 +1185,48 @@ impl RealPlayer {
                     *bin *= PAUSE_DECAY;
                 }
             }
-            PlayState::Playing => {
-                let mut target = [0.0; BANDS];
-                if let Some(handle) = &mut self.handle {
-                    // Drain the tap completely; only the newest samples feed
-                    // one FFT frame (the ring is bigger than a frame).
-                    self.tap_buf.clear();
-                    while let Ok(sample) = handle.tap.pop() {
-                        self.tap_buf.push(sample);
-                    }
-                    if self.tap_buf.len() > TAP_ANALYZE {
-                        let excess = self.tap_buf.len() - TAP_ANALYZE;
-                        self.tap_buf.drain(..excess);
-                    }
-                    self.analyzer.push(&self.tap_buf);
-                    self.analyzer.bands(handle.sample_rate, &mut target);
-                }
-                for (i, bin) in self.spectrum.iter_mut().enumerate() {
-                    let target = target[i];
-                    // Attack fast, release moderately fast (mock copy).
-                    if target > *bin {
-                        *bin = target;
-                    } else {
-                        *bin = (*bin - target).mul_add(RELEASE, target);
-                    }
-                    let cap = &mut self.peaks[i];
-                    if *bin >= *cap {
-                        *cap = *bin;
-                    } else {
-                        *cap = (*cap - *bin).mul_add(PEAK_FALL, *bin).max(*bin);
-                    }
-                }
+            PlayState::Playing => {}
+        }
+    }
+
+    /// Analyse the tap and smooth the result into the bars (plan §step 6):
+    /// instant attack, release `0.45`, peak caps falling at `0.06` — the
+    /// exact constants of `MockPlayer::tick`. Only while playing. The FFT is
+    /// the expensive part, so the UI calls this once per frame it draws
+    /// rather than on every tick (input, remote commands and poll wake-ups
+    /// would otherwise each run a transform nobody sees).
+    pub fn analyze(&mut self) {
+        if self.state != PlayState::Playing {
+            return;
+        }
+        let mut target = [0.0; BANDS];
+        if let Some(handle) = &mut self.handle {
+            // Drain the tap completely; only the newest samples feed
+            // one FFT frame (the ring is bigger than a frame).
+            self.tap_buf.clear();
+            while let Ok(sample) = handle.tap.pop() {
+                self.tap_buf.push(sample);
+            }
+            if self.tap_buf.len() > TAP_ANALYZE {
+                let excess = self.tap_buf.len() - TAP_ANALYZE;
+                self.tap_buf.drain(..excess);
+            }
+            self.analyzer.push(&self.tap_buf);
+            self.analyzer.bands(handle.sample_rate, &mut target);
+        }
+        for (i, bin) in self.spectrum.iter_mut().enumerate() {
+            let target = target[i];
+            // Attack fast, release moderately fast (mock copy).
+            if target > *bin {
+                *bin = target;
+            } else {
+                *bin = (*bin - target).mul_add(RELEASE, target);
+            }
+            let cap = &mut self.peaks[i];
+            if *bin >= *cap {
+                *cap = *bin;
+            } else {
+                *cap = (*cap - *bin).mul_add(PEAK_FALL, *bin).max(*bin);
             }
         }
     }
@@ -1254,7 +1264,7 @@ fn position(start_offset: Duration, played_frames: u64, sample_rate: u32) -> Dur
     if sample_rate == 0 {
         return start_offset;
     }
-    start_offset + Duration::from_secs_f64(played_frames as f64 / sample_rate as f64)
+    start_offset + Duration::from_secs_f64(played_frames as f64 / f64::from(sample_rate))
 }
 
 /// Wall-clock seed for shuffle (tests build players through `with_engine` and
@@ -1262,8 +1272,7 @@ fn position(start_offset: Duration, played_frames: u64, sample_rate: u32) -> Dur
 fn wall_clock_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        .map_or(0x9E37_79B9_7F4A_7C15, |since| since.as_nanos() as u64)
 }
 
 #[cfg(test)]
@@ -1327,7 +1336,7 @@ mod tests {
                 title: Some(format!("Track {i}")),
                 duration: None,
                 bitrate_kbps: None,
-                pos: Default::default(),
+                pos: crate::player::AlbumPos::default(),
             })
             .collect()
     }
@@ -1660,10 +1669,10 @@ mod tests {
         queue(&events, fake_started_at(0));
         player.tick(Duration::ZERO);
         let format = player.snapshot().format;
-        assert_eq!(format.codec, "FLAC");
+        assert_eq!(&*format.codec, "FLAC");
         assert_eq!(format.bit_depth, Some(16));
         assert_eq!(format.sample_rate, Some(44_100));
-        assert_eq!(format.channels, "stereo");
+        assert_eq!(&*format.channels, "stereo");
         assert!(format.lossless);
         assert!(format.bit_perfect, "lossless at 100 % / centered");
         // Lossy start → no bit-perfect flag.
@@ -1675,9 +1684,9 @@ mod tests {
         queue(&events, EngineEvent::Started(lossy, fake_handle(0)));
         player.tick(Duration::ZERO);
         let format = player.snapshot().format;
-        assert_eq!(format.codec, "MP3");
+        assert_eq!(&*format.codec, "MP3");
         assert!(!format.bit_perfect);
-        assert_eq!(format.channels, "mono");
+        assert_eq!(&*format.channels, "mono");
         // Stop → blank again.
         player.handle(PlayerCommand::Stop);
         assert_eq!(player.snapshot().format, FormatInfo::blank());
@@ -1754,7 +1763,7 @@ mod tests {
 
         player.handle(PlayerCommand::ReplaceTracks(vec![]));
         assert_eq!(player.state, PlayState::Stopped);
-        assert!(player.playlist.is_empty());
+        assert_eq!(player.playlist.len(), 0);
         assert!(matches!(log_of(&cmds).last(), Some(EngineCmd::Stop)));
     }
 
@@ -1781,7 +1790,7 @@ mod tests {
         player.handle(PlayerCommand::Play);
         player.handle(PlayerCommand::ClearPlaylist);
         assert_eq!(player.state, PlayState::Stopped);
-        assert!(player.playlist.is_empty());
+        assert_eq!(player.playlist.len(), 0);
         // Transport on the empty list is a no-op, never a panic.
         player.handle(PlayerCommand::Next);
         player.handle(PlayerCommand::Play);
@@ -2211,10 +2220,10 @@ mod tests {
     fn advanced_moves_the_current_track_exactly_at_the_boundary() {
         let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
-        let played = Arc::new(AtomicU64::new(0));
+        let heard = Arc::new(AtomicU64::new(0));
         let boundary = Arc::new(AtomicU64::new(110_250)); // 2.5 s in
         let handle = PlaybackHandle {
-            played: Arc::clone(&played),
+            played: Arc::clone(&heard),
             boundary: Arc::clone(&boundary),
             sample_rate: 44_100,
             start_offset: Duration::ZERO,
@@ -2236,19 +2245,19 @@ mod tests {
             Some(0),
             "the event alone moves nothing"
         );
-        assert_eq!(player.snapshot().format.codec, "FLAC", "not yet");
+        assert_eq!(&*player.snapshot().format.codec, "FLAC", "not yet");
 
         // One frame short of the boundary: still the old track.
-        played.store(110_249, Ordering::Relaxed);
+        heard.store(110_249, Ordering::Relaxed);
         player.tick(Duration::ZERO);
         assert_eq!(player.playlist.current(), Some(0), "one frame early");
 
         // Exactly the boundary frame: the track change happens now.
-        played.store(110_250, Ordering::Relaxed);
+        heard.store(110_250, Ordering::Relaxed);
         player.tick(Duration::ZERO);
         assert_eq!(player.playlist.current(), Some(1), "crossed");
         let snapshot = player.snapshot();
-        assert_eq!(snapshot.format.codec, "MP3", "format line switched");
+        assert_eq!(&*snapshot.format.codec, "MP3", "format line switched");
         assert_eq!(
             snapshot.position,
             Duration::ZERO,
@@ -2256,7 +2265,7 @@ mod tests {
         );
 
         // The clock keeps counting from the boundary (not from frame 0).
-        played.store(110_250 + 44_100, Ordering::Relaxed);
+        heard.store(110_250 + 44_100, Ordering::Relaxed);
         assert_eq!(player.snapshot().position, Duration::from_secs(1));
 
         // The queue moved on to the track after that.
@@ -2364,6 +2373,28 @@ mod tests {
         assert!(snapshot.peaks.iter().all(|v| *v == 0.0));
     }
 
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the test sets the bars to exactly 1.0 and checks they stay there"
+    )]
+    fn playing_bars_move_only_when_analysed() {
+        let (mut player, _cmds, events, ..) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        player.spectrum.iter_mut().for_each(|b| *b = 1.0);
+        player.tick(Duration::ZERO);
+        assert!(
+            player.snapshot().spectrum.iter().all(|v| *v == 1.0),
+            "a tick runs no analysis"
+        );
+        // An empty tap releases toward zero by `RELEASE` (0.45).
+        player.analyze();
+        let released = player.snapshot().spectrum[0];
+        assert!((released - 0.45).abs() < 1e-6, "one analysis: {released}");
+    }
+
     // --- cache mode: buffering, ready and failure (plan 08, step 5) ---
 
     /// A remote (Jellyfin) track for the mixed-list tests.
@@ -2378,7 +2409,7 @@ mod tests {
             title: Some(format!("R {id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -2390,23 +2421,19 @@ mod tests {
     fn shuffle_view(player: &RealPlayer) -> (Vec<u64>, Vec<u64>) {
         let tracks = player.playlist.tracks();
         let len = tracks.len();
-        let mut played: Vec<u64> = player
+        let mut history: Vec<u64> = player
             .order
             .previous(len)
+            .collect::<Vec<_>>()
             .iter()
             .rev()
             .map(|&i| tracks[i].id)
             .collect();
         if let Some(current) = player.playlist.current() {
-            played.push(tracks[current].id);
+            history.push(tracks[current].id);
         }
-        let upcoming = player
-            .order
-            .upcoming(len)
-            .iter()
-            .map(|&i| tracks[i].id)
-            .collect();
-        (played, upcoming)
+        let upcoming = player.order.upcoming(len).map(|i| tracks[i].id).collect();
+        (history, upcoming)
     }
 
     /// Audit P3: in shuffle, editing the playlist must not reshuffle what is
@@ -2421,16 +2448,16 @@ mod tests {
         player.handle(PlayerCommand::Play);
         player.handle(PlayerCommand::Next);
         player.handle(PlayerCommand::Next);
-        let (played, upcoming) = shuffle_view(&player);
-        assert_eq!(played.len(), 3);
+        let (history, upcoming) = shuffle_view(&player);
+        assert_eq!(history.len(), 3);
 
         // Append: old upcoming keeps its relative order, new ids join it.
         let added = tracks(5);
         let added_ids: Vec<u64> = added.iter().map(|t| t.id).collect();
         player.handle(PlayerCommand::AppendInOrder(added));
-        let (played_after, upcoming_after) = shuffle_view(&player);
+        let (history_after, upcoming_after) = shuffle_view(&player);
         assert_eq!(
-            played_after, played,
+            history_after, history,
             "history and current survive an append"
         );
         let old_only: Vec<u64> = upcoming_after
@@ -2455,7 +2482,7 @@ mod tests {
             .unwrap();
         player.handle(PlayerCommand::RemoveTrack(index));
         let (played_now, upcoming_now) = shuffle_view(&player);
-        assert_eq!(played_now, played);
+        assert_eq!(played_now, history);
         let expected: Vec<u64> = upcoming_after
             .iter()
             .copied()
@@ -2481,7 +2508,7 @@ mod tests {
         std::fs::create_dir(&stale).unwrap();
         std::fs::File::open(&stale)
             .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600))
+            .set_modified(std::time::SystemTime::now() - Duration::from_hours(25))
             .unwrap();
         let config = JellyfinConfig {
             url: "http://127.0.0.1:9".into(),
@@ -2710,7 +2737,7 @@ mod tests {
             title: Some(format!("S {title}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 

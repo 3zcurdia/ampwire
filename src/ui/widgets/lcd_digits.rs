@@ -33,8 +33,7 @@ pub fn lcd_width(text: &str) -> u16 {
     let mut glyphs = 0u16;
     for c in text.chars() {
         width += match c {
-            ':' | '.' => 1,
-            ' ' => 1,
+            ':' | '.' | ' ' => 1,
             _ => 3,
         };
         glyphs += 1;
@@ -92,7 +91,7 @@ fn write_row(buf: &mut Buffer, x: u16, y: u16, glyphs: &str, fg: Color) {
     for (i, c) in glyphs.chars().enumerate() {
         let cx = x + i as u16;
         if let Some(cell) = buf.cell_mut((cx, y)) {
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(fg);
         }
     }

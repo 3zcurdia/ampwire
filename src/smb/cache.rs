@@ -23,11 +23,12 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::cache_window::{self, DownloadError, Flow, WindowCmd, fetch_one};
 use crate::jellyfin::cache::{create_fresh_file, create_own_dir, size_label};
 use crate::player::order::PlayOrder;
 use crate::player::{Track, TrackSource};
@@ -41,7 +42,7 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Read/write chunk while downloading (the plan's 256 KiB).
 const CHUNK: usize = 256 * 1024;
 /// Directories left behind by a crash are swept after this long.
-pub const STALE_AGE: Duration = Duration::from_secs(24 * 3600);
+pub const STALE_AGE: Duration = Duration::from_hours(24);
 /// Directory-name prefix this app creates — the *only* thing the sweep and
 /// the eviction will ever touch by name.
 pub const DIR_PREFIX: &str = "ampwire-smb-";
@@ -62,39 +63,14 @@ impl SmbRef {
     }
 }
 
-/// UI → downloader thread.
-#[derive(Debug)]
-pub enum SmbCacheCmd {
-    /// New wanted set, already in priority order: current, ahead (nearest
-    /// first), behind (nearest first).
-    Window(Vec<SmbRef>),
-    Shutdown,
-}
+/// UI → downloader thread: the window, or shutdown.
+pub type SmbCacheCmd = WindowCmd<SmbRef>;
 
 /// Downloader → UI thread.
 #[derive(Debug)]
 pub enum SmbCacheEvent {
     Ready { url: SmbUrl, path: PathBuf },
     Failed { url: SmbUrl, error: String },
-}
-
-/// What the downloader should do after one item (internal).
-enum Flow {
-    /// Finished (or failed) this item: continue down the list.
-    Continue,
-    /// A newer window arrived: start over from its first item.
-    Restart,
-    /// Shutdown: leave the loop.
-    Stop,
-}
-
-/// Why [`download_file`] produced no file.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DownloadError {
-    /// The caller's `interrupt` asked to stop; the `.part` is gone.
-    Interrupted,
-    /// A key-free, user-facing reason (`smb: cannot connect`, …).
-    Failed(String),
 }
 
 /// The temp-dir window. Dropping it stops the thread **and** removes the
@@ -132,7 +108,7 @@ impl SmbCache {
         let thread_dir = dir.clone();
         let join = std::thread::Builder::new()
             .name("ampwire-smb-cache".into())
-            .spawn(move || run(cfg, thread_dir, max_bytes, cmd_rx, ev_tx))?;
+            .spawn(move || run(&cfg, &thread_dir, max_bytes, &cmd_rx, &ev_tx))?;
 
         Ok(SmbCache {
             tx: cmd_tx,
@@ -210,104 +186,33 @@ impl Drop for SmbCache {
     }
 }
 
-/// The window in play order: current (if SMB) → `ahead` next SMB tracks →
-/// `behind` previous ones, nearest first, deduplicated. Local and Jellyfin
-/// tracks are skipped and never counted, so shuffle (which reorders the play
-/// sequence, not the playlist) is respected automatically.
+/// The SMB window: the rule is [`PlayOrder::window`]; only `smb://` tracks
+/// are downloadable here (a Jellyfin row has its own window, plan 10,
+/// step 2).
 pub fn compute_smb_window(
     order: &PlayOrder,
-    tracks: &[Track],
+    tracks: &[Arc<Track>],
     current: Option<usize>,
     ahead: usize,
     behind: usize,
 ) -> Vec<SmbRef> {
-    let mut seen: HashSet<usize> = HashSet::new();
-    let mut wanted: Vec<usize> = Vec::new();
-
-    let mut take = |index: usize, wanted: &mut Vec<usize>| {
-        // Only *SMB* tracks are downloadable here: a Jellyfin row in the
-        // same playlist has its own window (plan 10, step 2).
-        if seen.insert(index) && tracks.get(index).is_some_and(Track::is_smb) {
-            wanted.push(index);
-        }
-    };
-
-    if let Some(current) = current {
-        take(current, &mut wanted);
-    }
-    // `N` large enough to find `ahead` *SMB* tracks among everything.
-    let mut count = 0;
-    for index in order.upcoming(tracks.len()) {
-        if count >= ahead {
-            break;
-        }
-        let before = wanted.len();
-        take(index, &mut wanted);
-        if wanted.len() > before {
-            count += 1;
-        }
-    }
-    let mut count = 0;
-    for index in order.previous(tracks.len()) {
-        if count >= behind {
-            break;
-        }
-        let before = wanted.len();
-        take(index, &mut wanted);
-        if wanted.len() > before {
-            count += 1;
-        }
-    }
-
-    wanted
-        .into_iter()
-        .filter_map(|index| SmbRef::from_track(&tracks[index]))
-        .collect()
+    order.window(tracks, current, ahead, behind, SmbRef::from_track)
 }
 
 /// The downloader thread: wait for a window → evict → fetch in priority
 /// order, restarting whenever a newer window arrives.
 fn run(
-    cfg: SmbClientCfg,
-    dir: PathBuf,
+    cfg: &SmbClientCfg,
+    dir: &Path,
     max_bytes: u64,
-    rx: Receiver<SmbCacheCmd>,
-    tx: Sender<SmbCacheEvent>,
+    rx: &Receiver<SmbCacheCmd>,
+    tx: &Sender<SmbCacheEvent>,
 ) {
-    let mut wanted: Vec<SmbRef>;
-    loop {
-        // 1. Block until the player hands over a window.
-        match rx.recv() {
-            Ok(SmbCacheCmd::Window(list)) => {
-                evict(&dir, &list);
-                wanted = list;
-            }
-            Ok(SmbCacheCmd::Shutdown) | Err(_) => return,
-        }
-
-        // 2. Fetch the list in priority order (current first).
-        let mut index = 0;
-        while index < wanted.len() {
-            // A newer window that arrived between items preempts ours.
-            while let Ok(cmd) = rx.try_recv() {
-                match cmd {
-                    SmbCacheCmd::Window(list) => {
-                        evict(&dir, &list);
-                        wanted = list;
-                        index = 0;
-                    }
-                    SmbCacheCmd::Shutdown => return,
-                }
-            }
-            let item = wanted[index].clone();
-            match fetch(&cfg, &dir, &item, max_bytes, &rx, &tx, &mut wanted) {
-                Flow::Continue => index += 1,
-                Flow::Restart => index = 0,
-                Flow::Stop => return,
-            }
-        }
-        // 3. Window satisfied → back to step 1 and wait.
-    }
+    cache_window::run(
+        rx,
+        |list| evict(dir, list),
+        |item, rx, wanted| fetch(cfg, dir, item, max_bytes, rx, tx, wanted),
+    );
 }
 
 /// Fetch one file for the window: [`download_file`], checking for a newer
@@ -322,21 +227,13 @@ fn fetch(
     tx: &Sender<SmbCacheEvent>,
     wanted: &mut Vec<SmbRef>,
 ) -> Flow {
-    let mut flow = Flow::Continue;
-    let result = download_file(cfg, item, dir, max_bytes, || match rx.try_recv() {
-        Ok(SmbCacheCmd::Window(list)) => {
-            evict(dir, &list);
-            let still_wanted = list.iter().any(|ref_| ref_.url == item.url);
-            *wanted = list;
-            flow = Flow::Restart;
-            !still_wanted // still wanted: finish this file, then re-check
-        }
-        Ok(SmbCacheCmd::Shutdown) | Err(TryRecvError::Disconnected) => {
-            flow = Flow::Stop;
-            true
-        }
-        Err(TryRecvError::Empty) => false,
-    });
+    let (flow, result) = fetch_one(
+        rx,
+        wanted,
+        |list| evict(dir, list),
+        |r| r.url == item.url,
+        |interrupt| download_file(cfg, item, dir, max_bytes, interrupt),
+    );
     match result {
         Ok(path) => {
             let _ = tx.send(SmbCacheEvent::Ready {
@@ -491,6 +388,11 @@ fn ext_for(url: &SmbUrl) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The playlist's shared shape: each track behind its own `Arc`.
+    fn arc(tracks: &[Track]) -> Vec<Arc<Track>> {
+        tracks.iter().cloned().map(Arc::new).collect()
+    }
+
     use super::*;
     use crate::jellyfin::cache::sweep_stale_dirs;
     use crate::player::TrackSource;
@@ -512,7 +414,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -524,7 +426,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -539,7 +441,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -559,7 +461,7 @@ mod tests {
         order.appended(tracks.len(), Some(0), &mut crate::player::rng::Rng::new(1));
 
         // current = 0, two ahead → 2 and 4 (1 and 3 are not SMB).
-        let window = compute_smb_window(&order, &tracks, Some(0), 2, 0);
+        let window = compute_smb_window(&order, &arc(&tracks), Some(0), 2, 0);
         assert_eq!(
             window.iter().map(|r| r.url.canonical()).collect::<Vec<_>>(),
             vec![
@@ -579,7 +481,7 @@ mod tests {
             false,
             &mut crate::player::rng::Rng::new(1),
         );
-        let window = compute_smb_window(&order, &tracks, Some(4), 0, 2);
+        let window = compute_smb_window(&order, &arc(&tracks), Some(4), 0, 2);
         assert_eq!(
             window.iter().map(|r| r.url.canonical()).collect::<Vec<_>>(),
             vec![
@@ -598,7 +500,7 @@ mod tests {
             false,
             &mut crate::player::rng::Rng::new(1),
         );
-        let window = compute_smb_window(&order, &tracks, None, 1, 1);
+        let window = compute_smb_window(&order, &arc(&tracks), None, 1, 1);
         assert_eq!(
             window.iter().map(|r| r.url.canonical()).collect::<Vec<_>>(),
             vec!["smb://nas/Music/a.flac"],
@@ -610,7 +512,10 @@ mod tests {
         let only_local = vec![local_track("/m/a.mp3")];
         let mut order = PlayOrder::new();
         order.appended(1, Some(0), &mut crate::player::rng::Rng::new(1));
-        assert!(compute_smb_window(&order, &only_local, Some(0), 3, 3).is_empty());
+        assert_eq!(
+            compute_smb_window(&order, &arc(&only_local), Some(0), 3, 3).len(),
+            0
+        );
     }
 
     /// Eviction deletes files (and `.part`s) whose URL left the window, and
@@ -720,9 +625,9 @@ mod tests {
         for dir in [&stale, &fresh, &unrelated, &not_a_pid, &other_window] {
             fs::create_dir_all(dir).unwrap();
         }
-        age_dir(&stale, Duration::from_secs(25 * 3600)); // > 24 h
-        age_dir(&not_a_pid, Duration::from_secs(25 * 3600)); // wrong pattern
-        age_dir(&other_window, Duration::from_secs(25 * 3600)); // other window
+        age_dir(&stale, Duration::from_hours(25)); // > 24 h
+        age_dir(&not_a_pid, Duration::from_hours(25)); // wrong pattern
+        age_dir(&other_window, Duration::from_hours(25)); // other window
 
         let removed = sweep_stale_dirs(parent.path(), STALE_AGE, DIR_PREFIX);
         assert_eq!(removed, 1, "exactly the stale crash leftover");
@@ -863,9 +768,9 @@ mod tests {
         match error {
             DownloadError::Failed(reason) => {
                 assert!(reason.contains("over the"), "reason: {reason}");
-                assert!(!reason.contains("nas") && !reason.contains("/"), "{reason}");
+                assert!(!reason.contains("nas") && !reason.contains('/'), "{reason}");
             }
-            other => panic!("expected a Failed cap notice: {other:?}"),
+            other @ DownloadError::Interrupted => panic!("expected a Failed cap notice: {other:?}"),
         }
         assert!(
             fs::read_dir(other.path())
@@ -893,7 +798,7 @@ mod tests {
                 assert_eq!(url.canonical(), "smb://nas/Music/a.flac");
                 assert_eq!(path, PathBuf::from("/tmp/x.flac"));
             }
-            other => panic!("expected Ready: {other:?}"),
+            other @ SmbCacheEvent::Failed { .. } => panic!("expected Ready: {other:?}"),
         }
         match failed {
             SmbCacheEvent::Failed { error, .. } => {
@@ -902,7 +807,7 @@ mod tests {
                     "{error}"
                 );
             }
-            other => panic!("expected Failed: {other:?}"),
+            other @ SmbCacheEvent::Ready { .. } => panic!("expected Failed: {other:?}"),
         }
         // The command shapes the player sends.
         let window = SmbCacheCmd::Window(vec![SmbRef { url: url("a.flac") }]);

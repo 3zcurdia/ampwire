@@ -14,8 +14,7 @@ fn main() {
     for device in host.output_devices().expect("enumerate") {
         let name = device
             .description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_else(|_| "<unnamed>".into());
+            .map_or_else(|_| "<unnamed>".into(), |d| d.name().to_string());
         println!("== {name}");
         let Ok(configs) = device.supported_output_configs() else {
             println!("   (configs unreadable)");

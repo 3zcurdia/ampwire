@@ -458,7 +458,11 @@ impl Config {
         };
 
         set_table(&mut doc, "layout", |t| {
-            set_preserving_decor(t, "columns", toml_edit::value(self.layout.columns as i64));
+            set_preserving_decor(
+                t,
+                "columns",
+                toml_edit::value(i64::from(self.layout.columns)),
+            );
             set_preserving_decor(
                 t,
                 "playlist_side",

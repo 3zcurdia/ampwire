@@ -13,7 +13,7 @@ use crate::keymap::Keymap;
 use crate::library::ScanMsg;
 use crate::player::mock::MockPlayer;
 use crate::player::real::RealPlayer;
-use crate::player::{PlayState, PlayerCommand, PlayerSnapshot, Track};
+use crate::player::{PlayState, PlayerCommand, PlayerSnapshot, Track, TrackList};
 use crate::remote::{RemoteCommand, SharedView, View, write_view};
 use crate::smb::LoadInput;
 use crate::ui;
@@ -41,6 +41,10 @@ const MARQUEE: Duration = Duration::from_millis(200);
 const BLINK: Duration = Duration::from_millis(500);
 /// Omarchy theme change check cadence.
 const OMARCHY_INTERVAL: Duration = Duration::from_secs(1);
+/// The shared view (`--status`, MPRIS) is rebuilt at most this often. It
+/// allocates its strings, and MPRIS itself polls at 200 ms. A remote command
+/// publishes at once, see [`App::drain_remote`].
+const VIEW_INTERVAL: Duration = Duration::from_millis(100);
 /// Save the config this long after the last volume/balance change (the
 /// slider emits one command per keypress; writing TOML each time is waste).
 const CONFIG_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -87,6 +91,10 @@ pub struct PresetPicker {
     pub saved_on: bool,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "UI state is a set of independent flags (help, prompts, panels, notices), not a state machine"
+)]
 /// Per-frame UI state the panels read.
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -147,7 +155,7 @@ impl Default for UiState {
 /// One computed [`App::visible_indices`] and what it was computed from.
 #[derive(Debug)]
 struct VisibleCache {
-    tracks: Arc<Vec<Track>>,
+    tracks: TrackList,
     filter: Option<String>,
     indices: Arc<[usize]>,
 }
@@ -187,6 +195,14 @@ impl Backend {
         }
     }
 
+    /// The spectrum analysis for one drawn frame (real player only: the mock
+    /// animates its bars in `tick`).
+    fn analyze(&mut self) {
+        if let Backend::Real(player) = self {
+            player.analyze();
+        }
+    }
+
     fn snapshot(&self) -> PlayerSnapshot {
         match self {
             Backend::Mock(player) => player.snapshot(),
@@ -204,6 +220,10 @@ impl Backend {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the app holds several independent flags (quit, read-only, dirty, omarchy fallback)"
+)]
 pub struct App {
     pub ui: UiState,
     pub theme: Theme,
@@ -224,6 +244,9 @@ pub struct App {
     marquee_acc: Duration,
     blink_acc: Duration,
     omarchy_acc: Duration,
+    /// Time since the shared view was last published (see [`VIEW_INTERVAL`]).
+    /// Starts at the interval so the first tick publishes.
+    view_acc: Duration,
     /// Where layout hotkeys save the config. `None` = don't persist (tests).
     config_path: Option<std::path::PathBuf>,
     /// True when the on-disk config failed to load: never write back.
@@ -237,6 +260,8 @@ pub struct App {
     last_area: Option<Rect>,
     /// Memo behind [`App::visible_indices`].
     visible_cache: RefCell<Option<VisibleCache>>,
+    /// Memo behind [`App::playlist_seconds`]: the summed duration of one list.
+    total_cache: RefCell<Option<(TrackList, u64)>>,
     /// Omarchy is unavailable and the neon fallback is already applied.
     omarchy_fallback: bool,
     /// A background directory scan is in flight (plan 02, step 8).
@@ -311,11 +336,13 @@ impl App {
             marquee_acc: Duration::ZERO,
             blink_acc: Duration::ZERO,
             omarchy_acc: Duration::ZERO,
+            view_acc: VIEW_INTERVAL,
             config_path: None,
             read_only: false,
             config_dirty_since: None,
             last_area: None,
             visible_cache: RefCell::new(None),
+            total_cache: RefCell::new(None),
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
@@ -374,12 +401,14 @@ impl App {
             marquee_acc: Duration::ZERO,
             blink_acc: Duration::ZERO,
             omarchy_acc: Duration::ZERO,
+            view_acc: VIEW_INTERVAL,
             // Demo mode never writes: layout changes stay in memory only.
             config_path: if demo { None } else { config_path },
             read_only: false,
             config_dirty_since: None,
             last_area: None,
             visible_cache: RefCell::new(None),
+            total_cache: RefCell::new(None),
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
@@ -464,7 +493,7 @@ impl App {
     }
 
     pub fn compute_layout(&self, area: ratatui::layout::Rect) -> ui::layout::ComputedLayout {
-        compute_layout(area, &self.layout_prefs(), &self.ui.vis)
+        compute_layout(area, &self.layout_prefs(), self.ui.vis)
     }
 
     /// Run the event loop.
@@ -480,6 +509,11 @@ impl App {
             let now = Instant::now();
             let due = now >= self.next_frame;
             if self.dirty || due {
+                if due {
+                    // The spectrum follows the frame cadence, not the tick.
+                    self.player.analyze();
+                    self.snapshot = self.player.snapshot();
+                }
                 let size = terminal.size()?;
                 self.sync_to_area(Rect::new(0, 0, size.width, size.height));
                 terminal.draw(|frame| ui::render(frame, self))?;
@@ -584,9 +618,14 @@ impl App {
                 commands.push(command);
             }
         }
+        let any = !commands.is_empty();
         for command in commands {
             self.dirty = true;
             self.apply_remote(command);
+        }
+        if any {
+            // Let the shared view show the result on this very tick.
+            self.view_acc = VIEW_INTERVAL;
         }
     }
 
@@ -690,6 +729,26 @@ impl App {
             indices: Arc::clone(&indices),
         });
         indices
+    }
+
+    /// Summed length of the whole playlist in whole seconds, tracks with an
+    /// unknown duration excluded. The footer asks every frame, so it is
+    /// memoized per track list (same pointer rule as `visible_indices`).
+    pub fn playlist_seconds(&self) -> u64 {
+        let tracks = &self.snapshot.tracks;
+        let mut cache = self.total_cache.borrow_mut();
+        if let Some((hit, seconds)) = cache.as_ref()
+            && Arc::ptr_eq(hit, tracks)
+        {
+            return *seconds;
+        }
+        let seconds = tracks
+            .iter()
+            .filter_map(|t| t.duration)
+            .map(|d| d.as_secs())
+            .sum();
+        *cache = Some((Arc::clone(tracks), seconds));
+        seconds
     }
 
     /// Keep the cursor inside the visible list after it changes shape.
@@ -834,7 +893,7 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let prompt = self.ui.prompt.take().expect("prompt is open");
-                self.submit_prompt(prompt);
+                self.submit_prompt(&prompt);
             }
             KeyCode::Esc => {
                 let kind = prompt.kind;
@@ -885,7 +944,7 @@ impl App {
     /// the local route: expand `~`, the path must exist, then scan
     /// replace/append — which is why a broken URL still reports
     /// `not found: smb://…`.
-    fn submit_prompt(&mut self, prompt: Prompt) {
+    fn submit_prompt(&mut self, prompt: &Prompt) {
         match prompt.kind {
             // Enter in Find keeps the filter and just closed the prompt.
             PromptKind::Find => {}
@@ -955,7 +1014,11 @@ impl App {
             self.config_dirty_since = None;
             self.save_config();
         }
-        self.publish_view();
+        self.view_acc += dt;
+        if self.view_acc >= VIEW_INTERVAL {
+            self.view_acc = Duration::ZERO;
+            self.publish_view();
+        }
     }
 
     /// Kick off a background load of `inputs` (plan 02, step 8; plan 10,
@@ -995,7 +1058,7 @@ impl App {
         // measured ≈0.7 s per file: every tag read is ~16 round trips), so
         // the URL is announced right away instead of leaving the UI silent
         // until the first 50-file progress tick.
-        let announced = urls.first().map(|url| url.canonical());
+        let announced = urls.first().map(super::smb::SmbUrl::canonical);
         for url in urls {
             let cfg = self.smb_client_cfg(&url);
             crate::smb::scan::spawn_smb_scan(url, cfg, tx.clone());
@@ -1022,7 +1085,7 @@ impl App {
     /// (plan 10, step 1), so nothing outside the tests uses this.
     #[cfg(test)]
     pub fn load_paths(&mut self, paths: Vec<std::path::PathBuf>, mode: ScanMode) {
-        self.load_inputs(paths.into_iter().map(LoadInput::Local).collect(), mode)
+        self.load_inputs(paths.into_iter().map(LoadInput::Local).collect(), mode);
     }
 
     /// Drain pending scan messages. `Done` applies the tracks according to
@@ -1126,7 +1189,7 @@ impl App {
             .config
             .jellyfin
             .as_ref()
-            .is_some_and(|jf| jf.is_complete());
+            .is_some_and(super::config::JellyfinConfig::is_complete);
         if !configured {
             self.ui.notice = Some("jellyfin: add [jellyfin] url and api_key to config.toml".into());
             return;
@@ -1214,6 +1277,9 @@ impl App {
                 theme.apply_depth(ui::theme::ColorDepth::detect());
                 self.theme = theme;
                 self.omarchy_fallback = false;
+                // Only a real theme change needs a redraw now; an unchanged
+                // poll leaves the frame cadence alone.
+                self.dirty = true;
             }
             Ok(None) => {}
             Err(_reason) => {
@@ -1225,12 +1291,10 @@ impl App {
                     Self::apply_theme_overrides(&mut self.theme, &self.config);
                     self.theme.apply_depth(ui::theme::ColorDepth::detect());
                     self.omarchy_fallback = true;
+                    self.dirty = true;
                 }
             }
         }
-        // The poll runs once a second; a redraw then is the idle cadence
-        // anyway, and it makes a real theme change visible immediately.
-        self.dirty = true;
     }
 
     /// Apply per-role overrides from `[theme.colors]` on top of a preset.
@@ -1244,7 +1308,19 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match over every action; splitting it would scatter the action table"
+    )]
     pub fn dispatch(&mut self, action: Action) {
+        use Action::{
+            Add, BalanceLeft, BalanceRight, BandDown, BandLeft, BandRight, BandUp, Clear,
+            ClearFilter, CursorDown, CursorUp, CycleOrder, Del, EqPresets, EqReset, EqToggle, Find,
+            FocusNext, FocusPrev, Help, JumpEnd, JumpHome, LoadJellyfin, MoveDown, MoveUp, Next,
+            Open, PageDown, PageUp, Pause, Play, PlayPause, Prev, Quit, SeekBack, SeekFwd, Select,
+            Stop, ToggleColumns, ToggleEq, TogglePlayer, TogglePlaylist, ToggleRepeat,
+            ToggleShuffle, ToggleTimeMode, VolumeDown, VolumeUp,
+        };
         if self.ui.show_help
             && action != Action::Help
             && action != Action::Quit
@@ -1255,7 +1331,6 @@ impl App {
             return;
         }
 
-        use Action::*;
         match action {
             Quit => {
                 self.should_quit = true;
@@ -1440,7 +1515,7 @@ impl App {
     }
 
     fn change_volume(&mut self, delta: i32) {
-        let volume = (self.snapshot.volume as i32 + delta).clamp(0, 100) as u8;
+        let volume = (i32::from(self.snapshot.volume) + delta).clamp(0, 100) as u8;
         self.set_volume_to(volume);
     }
 
@@ -1457,7 +1532,7 @@ impl App {
     }
 
     fn change_balance(&mut self, delta: i32) {
-        let balance = (self.snapshot.balance as i32 + delta).clamp(-100, 100) as i8;
+        let balance = (i32::from(self.snapshot.balance) + delta).clamp(-100, 100) as i8;
         self.player.handle(PlayerCommand::SetBalance(balance));
         self.config.audio.balance = balance;
         self.config_dirty_since = Some(Instant::now());
@@ -1880,6 +1955,37 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_view_publishes_on_a_cadence_and_remote_commands_at_once() {
+        let (mut app, _dir) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let view = crate::remote::new_view();
+        app.set_remote(rx, Arc::clone(&view));
+        app.tick(Duration::ZERO); // baseline publish
+        let baseline = crate::remote::read_view(&view).volume;
+        app.set_volume_to(30);
+        app.tick(Duration::from_millis(10));
+        assert_eq!(
+            crate::remote::read_view(&view).volume,
+            baseline,
+            "inside the interval"
+        );
+        app.tick(Duration::from_millis(100));
+        assert_eq!(
+            crate::remote::read_view(&view).volume,
+            30,
+            "published on the cadence"
+        );
+
+        tx.send(RemoteCommand::SetVolume(42)).unwrap();
+        app.tick(Duration::ZERO);
+        assert_eq!(
+            crate::remote::read_view(&view).volume,
+            42,
+            "a remote command publishes at once"
+        );
+    }
+
+    #[test]
     fn remote_volume_updates_snapshot_and_config() {
         let (mut app, _dir, tx) = remote_app();
         tx.send(RemoteCommand::SetVolume(42)).unwrap();
@@ -2112,7 +2218,10 @@ mod tests {
     fn prompt_keys_type_backspace_and_escape() {
         let (mut app, _dir) = test_app();
         app.dispatch(Action::Open);
-        assert_eq!(app.ui.prompt.as_ref().map(|p| p.label()), Some("open"));
+        assert_eq!(
+            app.ui.prompt.as_ref().map(super::Prompt::label),
+            Some("open")
+        );
 
         for c in "music".chars() {
             app.handle_key(press(KeyCode::Char(c)));
@@ -2343,7 +2452,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         };
 
         app.scan_mode = ScanMode::Replace;
@@ -2393,6 +2502,17 @@ mod tests {
         app.dispatch(Action::Open);
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn playlist_seconds_follows_the_list_and_is_memoized() {
+        let (mut app, _dir) = test_app();
+        let full = app.playlist_seconds();
+        assert!(full > 0, "the mock list has durations");
+        // A second read of the same list is the memo's hit.
+        assert_eq!(app.playlist_seconds(), full);
+        app.dispatch(Action::Clear);
+        assert_eq!(app.playlist_seconds(), 0, "an edit invalidates the memo");
     }
 
     #[test]
@@ -2615,7 +2735,11 @@ mod tests {
         assert!(!dir.path().join("config.toml").exists());
 
         // Age the flag past the debounce window, then tick.
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
         assert!(
             dir.path().join("config.toml").exists(),
@@ -2651,7 +2775,11 @@ mod tests {
         );
         app.dispatch(Action::VolumeDown);
         app.dispatch(Action::BalanceRight);
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
         assert!(!path.exists(), "demo mode never writes the config");
     }
@@ -2670,7 +2798,11 @@ mod tests {
         );
         app.set_read_only(true, None);
         app.dispatch(Action::VolumeDown);
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -2742,7 +2874,11 @@ mod tests {
             app.dispatch(Action::BandUp); // preamp +3
         }
         app.dispatch(Action::EqToggle); // and off
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
 
         let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
@@ -2782,7 +2918,11 @@ mod tests {
         app.ui.focus = Scope::Eq;
         app.dispatch(Action::BandUp);
         app.dispatch(Action::EqToggle);
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
         assert!(!path.exists(), "demo mode never writes the config");
     }
@@ -2970,7 +3110,7 @@ mod tests {
             title: Some(format!("t-{id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 

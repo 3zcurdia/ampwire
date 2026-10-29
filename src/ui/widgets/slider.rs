@@ -27,7 +27,7 @@ impl Widget for HSlider<'_> {
                     return;
                 }
                 let cell = &mut buf[(x, area.y)];
-                cell.set_symbol(&c.to_string());
+                cell.set_char(c);
                 cell.set_fg(self.label_style);
                 x += 1;
             }
@@ -40,7 +40,7 @@ impl Widget for HSlider<'_> {
         if track_width == 0 {
             return;
         }
-        let knob_x = x + ((self.value.clamp(0.0, 1.0) * (track_width - 1) as f32).round() as u16);
+        let knob_x = x + ((self.value.clamp(0.0, 1.0) * f32::from(track_width - 1)).round() as u16);
         for i in 0..track_width {
             let cell = &mut buf[(x + i, area.y)];
             if x + i == knob_x {
@@ -72,10 +72,10 @@ impl Widget for VSlider {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let rows = area.height as f32;
+        let rows = f32::from(area.height);
         // +12 dB (+1.0) sits at the top row, -12 dB (-1.0) at the bottom, so
         // the knob lines up with the `+12 / 0 / -12` scale labels.
-        let norm = (self.value.clamp(-1.0, 1.0) + 1.0) / 2.0;
+        let norm = f32::midpoint(self.value.clamp(-1.0, 1.0), 1.0);
         let knob_y = area.y + ((1.0 - norm) * (rows - 1.0)).round() as u16;
         for i in 0..area.height {
             let cell = &mut buf[(area.x, area.y + i)];
