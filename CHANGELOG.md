@@ -7,10 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-29
+
 ### Fixed
 - The `bit-perfect` marker no longer shows for sources that `f32` cannot hold
   exactly (32-bit integer PCM/FLAC, 64-bit float PCM); the docs now say that on
   Linux a PipeWire/Pulse/`dmix` default device can still resample after Ampwire.
+
+### Changed
+- Idle CPU is lower across the board: the audio engine thread now blocks on its
+  command channel when nothing plays (100 ms waits while paused) instead of
+  waking every 5 ms, and the control socket blocks in `accept` instead of
+  waking about 50 times a second.
+- Playlist tracks are shared per track (`Arc<Track>`), so loading a large
+  Jellyfin or SMB library and mid-playlist edits no longer clone the whole
+  track list; the playlist footer's total duration is memoized and the
+  Jellyfin/SMB cache windows now share one implementation.
+- The spectrum FFT runs once per drawn frame rather than per wake-up, snapshot
+  spectrum bars and format info no longer allocate, the `--status`/MPRIS view
+  publishes at most every 100 ms, and the Omarchy theme check only redraws when
+  the theme actually changed.
+- Play-order look-ahead/look-behind became lazy iterators, so the cache windows
+  stop after the few tracks they need, and decode packets now go straight into
+  the output buffer without a scratch copy.
+
+### Added
+- `docs/architecture.md`: a full description of the thread model, module
+  boundaries and playback pipeline.
 
 ## [0.1.0] - 2026-10-27
 
@@ -74,5 +97,6 @@ playback — local files, Jellyfin streaming and native SMB shares.
   server-sorted by `AlbumArtist, Album, ParentIndexNumber, IndexNumber,
   SortName`.
 
-[Unreleased]: https://github.com/3zcurdia/ampwire/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/3zcurdia/ampwire/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/3zcurdia/ampwire/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/3zcurdia/ampwire/releases/tag/v0.1.0
