@@ -41,6 +41,10 @@ const MARQUEE: Duration = Duration::from_millis(200);
 const BLINK: Duration = Duration::from_millis(500);
 /// Omarchy theme change check cadence.
 const OMARCHY_INTERVAL: Duration = Duration::from_secs(1);
+/// The shared view (`--status`, MPRIS) is rebuilt at most this often. It
+/// allocates its strings, and MPRIS itself polls at 200 ms. A remote command
+/// publishes at once, see [`App::drain_remote`].
+const VIEW_INTERVAL: Duration = Duration::from_millis(100);
 /// Save the config this long after the last volume/balance change (the
 /// slider emits one command per keypress; writing TOML each time is waste).
 const CONFIG_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -232,6 +236,9 @@ pub struct App {
     marquee_acc: Duration,
     blink_acc: Duration,
     omarchy_acc: Duration,
+    /// Time since the shared view was last published (see [`VIEW_INTERVAL`]).
+    /// Starts at the interval so the first tick publishes.
+    view_acc: Duration,
     /// Where layout hotkeys save the config. `None` = don't persist (tests).
     config_path: Option<std::path::PathBuf>,
     /// True when the on-disk config failed to load: never write back.
@@ -321,6 +328,7 @@ impl App {
             marquee_acc: Duration::ZERO,
             blink_acc: Duration::ZERO,
             omarchy_acc: Duration::ZERO,
+            view_acc: VIEW_INTERVAL,
             config_path: None,
             read_only: false,
             config_dirty_since: None,
@@ -385,6 +393,7 @@ impl App {
             marquee_acc: Duration::ZERO,
             blink_acc: Duration::ZERO,
             omarchy_acc: Duration::ZERO,
+            view_acc: VIEW_INTERVAL,
             // Demo mode never writes: layout changes stay in memory only.
             config_path: if demo { None } else { config_path },
             read_only: false,
@@ -601,9 +610,14 @@ impl App {
                 commands.push(command);
             }
         }
+        let any = !commands.is_empty();
         for command in commands {
             self.dirty = true;
             self.apply_remote(command);
+        }
+        if any {
+            // Let the shared view show the result on this very tick.
+            self.view_acc = VIEW_INTERVAL;
         }
     }
 
@@ -992,7 +1006,11 @@ impl App {
             self.config_dirty_since = None;
             self.save_config();
         }
-        self.publish_view();
+        self.view_acc += dt;
+        if self.view_acc >= VIEW_INTERVAL {
+            self.view_acc = Duration::ZERO;
+            self.publish_view();
+        }
     }
 
     /// Kick off a background load of `inputs` (plan 02, step 8; plan 10,
@@ -1915,6 +1933,37 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.set_remote(rx, crate::remote::new_view());
         (app, dir, tx)
+    }
+
+    #[test]
+    fn the_shared_view_publishes_on_a_cadence_and_remote_commands_at_once() {
+        let (mut app, _dir) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let view = crate::remote::new_view();
+        app.set_remote(rx, Arc::clone(&view));
+        app.tick(Duration::ZERO); // baseline publish
+        let baseline = crate::remote::read_view(&view).volume;
+        app.set_volume_to(30);
+        app.tick(Duration::from_millis(10));
+        assert_eq!(
+            crate::remote::read_view(&view).volume,
+            baseline,
+            "inside the interval"
+        );
+        app.tick(Duration::from_millis(100));
+        assert_eq!(
+            crate::remote::read_view(&view).volume,
+            30,
+            "published on the cadence"
+        );
+
+        tx.send(RemoteCommand::SetVolume(42)).unwrap();
+        app.tick(Duration::ZERO);
+        assert_eq!(
+            crate::remote::read_view(&view).volume,
+            42,
+            "a remote command publishes at once"
+        );
     }
 
     #[test]
