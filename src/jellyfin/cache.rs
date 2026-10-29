@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
@@ -296,7 +296,7 @@ fn is_our_dir_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
 /// play sequence, not the playlist) is respected automatically.
 pub fn compute_window(
     order: &PlayOrder,
-    tracks: &[Track],
+    tracks: &[Arc<Track>],
     current: Option<usize>,
     ahead: usize,
     behind: usize,
@@ -307,7 +307,7 @@ pub fn compute_window(
     let mut take = |index: usize, wanted: &mut Vec<usize>| {
         // Only *Jellyfin* tracks are downloadable: an SMB row in the same
         // playlist has its own window (plan 10, step 2).
-        if seen.insert(index) && tracks.get(index).is_some_and(Track::is_jellyfin) {
+        if seen.insert(index) && tracks.get(index).is_some_and(|track| track.is_jellyfin()) {
             wanted.push(index);
         }
     };
@@ -582,6 +582,11 @@ fn content_length(response: &ureq::http::Response<ureq::Body>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// The playlist's shared shape: each track behind its own `Arc`.
+    fn arc(tracks: &[Track]) -> Vec<Arc<Track>> {
+        tracks.iter().cloned().map(Arc::new).collect()
+    }
+
     use std::path::PathBuf;
 
     use super::*;
@@ -652,18 +657,21 @@ mod tests {
         let order = ordered(tracks.len(), Some(1));
         // Local tracks are skipped *and* don't count toward ahead/behind.
         assert_eq!(
-            ids(&compute_window(&order, &tracks, Some(1), 3, 2)),
+            ids(&compute_window(&order, &arc(&tracks), Some(1), 3, 2)),
             ["a", "b", "c"],
             "current first, then the next remotes; the local behind is gone"
         );
         // The current track is in front even when ahead/behind are zero.
-        assert_eq!(ids(&compute_window(&order, &tracks, Some(1), 0, 0)), ["a"]);
+        assert_eq!(
+            ids(&compute_window(&order, &arc(&tracks), Some(1), 0, 0)),
+            ["a"]
+        );
         // Behind reaches back over the local track at index 0 — but locals
         // never enter the window (cursor on the last track, as the order
         // would really be after playing up to it).
         let order_end = ordered(tracks.len(), Some(4));
         assert_eq!(
-            ids(&compute_window(&order_end, &tracks, Some(4), 0, 3)),
+            ids(&compute_window(&order_end, &arc(&tracks), Some(4), 0, 3)),
             ["c", "b", "a"]
         );
     }
@@ -673,11 +681,11 @@ mod tests {
         let tracks = vec![local("/x/0.flac"), remote("a"), remote("b")];
         let order = ordered(tracks.len(), None);
         assert_eq!(
-            ids(&compute_window(&order, &tracks, None, 2, 2)),
+            ids(&compute_window(&order, &arc(&tracks), None, 2, 2)),
             ["a", "b"]
         );
         // Nothing current and no look-ahead: empty, never a panic.
-        assert!(compute_window(&order, &tracks, None, 0, 0).is_empty());
+        assert!(compute_window(&order, &arc(&tracks), None, 0, 0).is_empty());
     }
 
     #[test]
@@ -686,16 +694,19 @@ mod tests {
         let tracks = vec![remote("a"), remote("b"), remote("c")];
         let order = ordered(tracks.len(), Some(2));
         assert_eq!(
-            ids(&compute_window(&order, &tracks, Some(2), 3, 3)),
+            ids(&compute_window(&order, &arc(&tracks), Some(2), 3, 3)),
             ["c", "b", "a"]
         );
-        assert_eq!(ids(&compute_window(&order, &tracks, Some(2), 3, 0)), ["c"]);
+        assert_eq!(
+            ids(&compute_window(&order, &arc(&tracks), Some(2), 3, 0)),
+            ["c"]
+        );
 
         // Current is the first: nothing is behind (the "previous" peek at
         // the start is the restart target, which is the current track).
         let order = ordered(tracks.len(), Some(0));
         assert_eq!(
-            ids(&compute_window(&order, &tracks, Some(0), 2, 3)),
+            ids(&compute_window(&order, &arc(&tracks), Some(0), 2, 3)),
             ["a", "b", "c"]
         );
     }
@@ -704,7 +715,7 @@ mod tests {
     fn window_follows_shuffle_not_playlist_order() {
         let tracks: Vec<Track> = (0..6).map(|i| remote(&format!("r{i}"))).collect();
         let order = shuffled(tracks.len(), Some(0), 7);
-        let window = compute_window(&order, &tracks, Some(0), 6, 6);
+        let window = compute_window(&order, &arc(&tracks), Some(0), 6, 6);
         // All-remote list: the window is the whole play order, current first.
         let mut expected: Vec<String> = vec!["r0".to_string()];
         expected.extend(order.upcoming(tracks.len()).iter().map(|&i| {
@@ -725,8 +736,8 @@ mod tests {
     fn window_of_an_all_local_playlist_is_empty() {
         let tracks: Vec<Track> = (0..5).map(|i| local(&format!("/x/{i}.flac"))).collect();
         let order = ordered(tracks.len(), Some(2));
-        assert!(compute_window(&order, &tracks, Some(2), 3, 3).is_empty());
-        assert!(compute_window(&order, &tracks, None, 10, 10).is_empty());
+        assert!(compute_window(&order, &arc(&tracks), Some(2), 3, 3).is_empty());
+        assert!(compute_window(&order, &arc(&tracks), None, 10, 10).is_empty());
     }
 
     // --- directory sweep + lifecycle (plan 08, Decisions) ---

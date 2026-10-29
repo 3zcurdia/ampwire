@@ -23,8 +23,8 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -216,7 +216,7 @@ impl Drop for SmbCache {
 /// sequence, not the playlist) is respected automatically.
 pub fn compute_smb_window(
     order: &PlayOrder,
-    tracks: &[Track],
+    tracks: &[Arc<Track>],
     current: Option<usize>,
     ahead: usize,
     behind: usize,
@@ -227,7 +227,7 @@ pub fn compute_smb_window(
     let mut take = |index: usize, wanted: &mut Vec<usize>| {
         // Only *SMB* tracks are downloadable here: a Jellyfin row in the
         // same playlist has its own window (plan 10, step 2).
-        if seen.insert(index) && tracks.get(index).is_some_and(Track::is_smb) {
+        if seen.insert(index) && tracks.get(index).is_some_and(|track| track.is_smb()) {
             wanted.push(index);
         }
     };
@@ -491,6 +491,11 @@ fn ext_for(url: &SmbUrl) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The playlist's shared shape: each track behind its own `Arc`.
+    fn arc(tracks: &[Track]) -> Vec<Arc<Track>> {
+        tracks.iter().cloned().map(Arc::new).collect()
+    }
+
     use super::*;
     use crate::jellyfin::cache::sweep_stale_dirs;
     use crate::player::TrackSource;
@@ -559,7 +564,7 @@ mod tests {
         order.appended(tracks.len(), Some(0), &mut crate::player::rng::Rng::new(1));
 
         // current = 0, two ahead → 2 and 4 (1 and 3 are not SMB).
-        let window = compute_smb_window(&order, &tracks, Some(0), 2, 0);
+        let window = compute_smb_window(&order, &arc(&tracks), Some(0), 2, 0);
         assert_eq!(
             window.iter().map(|r| r.url.canonical()).collect::<Vec<_>>(),
             vec![
@@ -579,7 +584,7 @@ mod tests {
             false,
             &mut crate::player::rng::Rng::new(1),
         );
-        let window = compute_smb_window(&order, &tracks, Some(4), 0, 2);
+        let window = compute_smb_window(&order, &arc(&tracks), Some(4), 0, 2);
         assert_eq!(
             window.iter().map(|r| r.url.canonical()).collect::<Vec<_>>(),
             vec![
@@ -598,7 +603,7 @@ mod tests {
             false,
             &mut crate::player::rng::Rng::new(1),
         );
-        let window = compute_smb_window(&order, &tracks, None, 1, 1);
+        let window = compute_smb_window(&order, &arc(&tracks), None, 1, 1);
         assert_eq!(
             window.iter().map(|r| r.url.canonical()).collect::<Vec<_>>(),
             vec!["smb://nas/Music/a.flac"],
@@ -610,7 +615,7 @@ mod tests {
         let only_local = vec![local_track("/m/a.mp3")];
         let mut order = PlayOrder::new();
         order.appended(1, Some(0), &mut crate::player::rng::Rng::new(1));
-        assert!(compute_smb_window(&order, &only_local, Some(0), 3, 3).is_empty());
+        assert!(compute_smb_window(&order, &arc(&only_local), Some(0), 3, 3).is_empty());
     }
 
     /// Eviction deletes files (and `.part`s) whose URL left the window, and

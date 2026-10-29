@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::Track;
+use super::{Track, TrackList};
 
 /// An ordered list of tracks plus the index of the current one.
 ///
@@ -12,7 +12,7 @@ use super::Track;
 /// can be taken 30 times a second for the cost of an `Arc` clone.
 #[derive(Debug, Clone, Default)]
 pub struct Playlist {
-    tracks: Arc<Vec<Track>>,
+    tracks: TrackList,
     current: Option<usize>,
 }
 
@@ -25,7 +25,7 @@ impl Playlist {
     /// must survive for the golden frames).
     pub fn from_tracks(tracks: Vec<Track>) -> Self {
         Self {
-            tracks: Arc::new(tracks),
+            tracks: Arc::new(tracks.into_iter().map(Arc::new).collect()),
             current: None,
         }
     }
@@ -34,7 +34,7 @@ impl Playlist {
     #[cfg(test)]
     pub fn set_title(&mut self, index: usize, title: &str) {
         if let Some(track) = Arc::make_mut(&mut self.tracks).get_mut(index) {
-            track.title = Some(title.into());
+            Arc::make_mut(track).title = Some(title.into());
         }
     }
 
@@ -43,11 +43,11 @@ impl Playlist {
     /// are missing, which is what makes the remaining-time display work.
     pub fn set_duration(&mut self, index: usize, duration: Duration) {
         if let Some(track) = Arc::make_mut(&mut self.tracks).get_mut(index) {
-            track.duration = Some(duration);
+            Arc::make_mut(track).duration = Some(duration);
         }
     }
 
-    pub fn tracks(&self) -> &Arc<Vec<Track>> {
+    pub fn tracks(&self) -> &TrackList {
         &self.tracks
     }
 
@@ -72,14 +72,14 @@ impl Playlist {
     pub fn append_sorted(&mut self, mut new: Vec<Track>) {
         // One key per track, not two allocations per comparison (audit P5).
         new.sort_by_cached_key(Track::sort_key);
-        Arc::make_mut(&mut self.tracks).extend(new);
+        Arc::make_mut(&mut self.tracks).extend(new.into_iter().map(Arc::new));
     }
 
     /// Append exactly as given (plan 08): server pages arrive already
     /// sorted by `AlbumArtist, Album, ParentIndexNumber, IndexNumber,
     /// SortName`, so the client must not re-sort them.
     pub fn append_in_order(&mut self, new: Vec<Track>) {
-        Arc::make_mut(&mut self.tracks).extend(new);
+        Arc::make_mut(&mut self.tracks).extend(new.into_iter().map(Arc::new));
     }
 
     /// Remove every track matching `f` in one pass. Returns `true` when the
@@ -89,7 +89,7 @@ impl Playlist {
     pub fn remove_where(&mut self, f: impl Fn(&Track) -> bool) -> bool {
         let current = self.current;
         let tracks = Arc::make_mut(&mut self.tracks);
-        let mut kept: Vec<Track> = Vec::with_capacity(tracks.len());
+        let mut kept: Vec<Arc<Track>> = Vec::with_capacity(tracks.len());
         let mut new_current = None;
         let mut removed_current = false;
         for (index, track) in tracks.drain(..).enumerate() {
@@ -127,7 +127,8 @@ impl Playlist {
 
     /// Empty the list; nothing is current any more.
     pub fn clear(&mut self) {
-        Arc::make_mut(&mut self.tracks).clear();
+        // A fresh empty list: never copy the old one just to drop it.
+        self.tracks = TrackList::default();
         self.current = None;
     }
 
@@ -377,7 +378,7 @@ mod tests {
     fn snapshot_shares_the_arc() {
         // The list Arc is shared, not deep-cloned (plan §step 4).
         let p = playlist(&["a"]);
-        let snap: Arc<Vec<Track>> = Arc::clone(p.tracks());
+        let snap: TrackList = Arc::clone(p.tracks());
         assert!(Arc::ptr_eq(&snap, p.tracks()));
     }
 

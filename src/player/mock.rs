@@ -8,6 +8,7 @@
 //! exactly.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::playlist::Playlist;
@@ -397,6 +398,7 @@ impl MockPlayer {
         self.playlist
             .current()
             .and_then(|i| self.playlist.tracks().get(i))
+            .map(Arc::as_ref)
     }
 
     /// Advance the clock, spectrum, and peaks. Called from `App::tick` with

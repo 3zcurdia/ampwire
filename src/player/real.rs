@@ -36,7 +36,7 @@ use crate::smb::cache::{
 use super::order::PlayOrder;
 use super::playlist::Playlist;
 use super::rng::Rng;
-use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, Track, TrackSource};
+use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, TrackSource};
 
 /// Only the last `TAP_ANALYZE` tapped samples feed one FFT frame.
 const TAP_ANALYZE: usize = 4096;
@@ -345,7 +345,7 @@ impl RealPlayer {
                     .playlist
                     .tracks()
                     .iter()
-                    .map(Track::is_jellyfin)
+                    .map(|track| track.is_jellyfin())
                     .collect();
                 let was_current = self.playlist.remove_where(|track| track.is_jellyfin());
                 self.order
@@ -456,7 +456,7 @@ impl RealPlayer {
                 .playlist
                 .current()
                 .and_then(|index| self.playlist.tracks().get(index))
-                .is_some_and(Track::is_jellyfin)
+                .is_some_and(|track| track.is_jellyfin())
     }
 
     /// The EQ really shaping the samples right now — what the bit-perfect
@@ -808,7 +808,7 @@ impl RealPlayer {
                 .playlist
                 .tracks()
                 .get(i)
-                .is_some_and(Track::is_jellyfin);
+                .is_some_and(|track| track.is_jellyfin());
         self.params.set_eq_bypass(bypass);
         let engine_load = match source {
             TrackSource::Local(path) => {

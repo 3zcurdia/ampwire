@@ -13,7 +13,7 @@ use crate::keymap::Keymap;
 use crate::library::ScanMsg;
 use crate::player::mock::MockPlayer;
 use crate::player::real::RealPlayer;
-use crate::player::{PlayState, PlayerCommand, PlayerSnapshot, Track};
+use crate::player::{PlayState, PlayerCommand, PlayerSnapshot, Track, TrackList};
 use crate::remote::{RemoteCommand, SharedView, View, write_view};
 use crate::smb::LoadInput;
 use crate::ui;
@@ -147,7 +147,7 @@ impl Default for UiState {
 /// One computed [`App::visible_indices`] and what it was computed from.
 #[derive(Debug)]
 struct VisibleCache {
-    tracks: Arc<Vec<Track>>,
+    tracks: TrackList,
     filter: Option<String>,
     indices: Arc<[usize]>,
 }

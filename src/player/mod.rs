@@ -13,6 +13,7 @@ pub mod real;
 pub mod rng;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -128,6 +129,11 @@ impl Default for FormatInfo {
 
 /// Stable per-process track id, from a static counter.
 pub type TrackId = u64;
+
+/// The playlist's tracks, shared with snapshots. Each track sits behind its
+/// own `Arc`, so copying the list on write (`Arc::make_mut`) only bumps
+/// refcounts, and editing one track copies just that track.
+pub type TrackList = Arc<Vec<Arc<Track>>>;
 
 /// Where a track's audio comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,7 +329,7 @@ pub struct PlayerSnapshot {
     pub current: Option<usize>,
     pub position: Duration,
     /// Arc'd so snapshots are cheap (30 fps), not a full clone.
-    pub tracks: std::sync::Arc<Vec<Track>>,
+    pub tracks: TrackList,
     pub shuffle: bool,
     pub repeat: bool,
     /// 0–=100.
@@ -339,7 +345,9 @@ pub struct PlayerSnapshot {
 
 impl PlayerSnapshot {
     pub fn current_track(&self) -> Option<&Track> {
-        self.current.and_then(|i| self.tracks.get(i))
+        self.current
+            .and_then(|i| self.tracks.get(i))
+            .map(Arc::as_ref)
     }
 }
 
