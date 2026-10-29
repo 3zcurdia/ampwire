@@ -29,7 +29,7 @@ pub enum Flow {
 /// Why one item did not come down. The caller's `interrupt` asked to stop
 /// (the `.part` file is already gone), or the item failed for a reason the
 /// user may see — key-free and fixed-text.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum DownloadError {
     Interrupted,
     Failed(String),
