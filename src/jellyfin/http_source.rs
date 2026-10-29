@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use symphonia::core::io::MediaSource;
 
-use super::cache::{DownloadError, MAX_FILE_BYTES, RemoteRef, download_original};
+use super::cache::{MAX_FILE_BYTES, RemoteRef, download_original};
 use super::{Client, ItemId};
+use crate::cache_window::DownloadError;
 
 /// Forward seeks up to this distance are served by discarding from the
 /// open body instead of re-opening a connection (the plan's 64 KiB).

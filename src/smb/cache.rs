@@ -23,11 +23,12 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::cache_window::{self, DownloadError, Flow, WindowCmd, fetch_one};
 use crate::jellyfin::cache::{create_fresh_file, create_own_dir, size_label};
 use crate::player::order::PlayOrder;
 use crate::player::{Track, TrackSource};
@@ -62,39 +63,14 @@ impl SmbRef {
     }
 }
 
-/// UI → downloader thread.
-#[derive(Debug)]
-pub enum SmbCacheCmd {
-    /// New wanted set, already in priority order: current, ahead (nearest
-    /// first), behind (nearest first).
-    Window(Vec<SmbRef>),
-    Shutdown,
-}
+/// UI → downloader thread: the window, or shutdown.
+pub type SmbCacheCmd = WindowCmd<SmbRef>;
 
 /// Downloader → UI thread.
 #[derive(Debug)]
 pub enum SmbCacheEvent {
     Ready { url: SmbUrl, path: PathBuf },
     Failed { url: SmbUrl, error: String },
-}
-
-/// What the downloader should do after one item (internal).
-enum Flow {
-    /// Finished (or failed) this item: continue down the list.
-    Continue,
-    /// A newer window arrived: start over from its first item.
-    Restart,
-    /// Shutdown: leave the loop.
-    Stop,
-}
-
-/// Why [`download_file`] produced no file.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DownloadError {
-    /// The caller's `interrupt` asked to stop; the `.part` is gone.
-    Interrupted,
-    /// A key-free, user-facing reason (`smb: cannot connect`, …).
-    Failed(String),
 }
 
 /// The temp-dir window. Dropping it stops the thread **and** removes the
@@ -232,40 +208,11 @@ fn run(
     rx: Receiver<SmbCacheCmd>,
     tx: Sender<SmbCacheEvent>,
 ) {
-    let mut wanted: Vec<SmbRef>;
-    loop {
-        // 1. Block until the player hands over a window.
-        match rx.recv() {
-            Ok(SmbCacheCmd::Window(list)) => {
-                evict(&dir, &list);
-                wanted = list;
-            }
-            Ok(SmbCacheCmd::Shutdown) | Err(_) => return,
-        }
-
-        // 2. Fetch the list in priority order (current first).
-        let mut index = 0;
-        while index < wanted.len() {
-            // A newer window that arrived between items preempts ours.
-            while let Ok(cmd) = rx.try_recv() {
-                match cmd {
-                    SmbCacheCmd::Window(list) => {
-                        evict(&dir, &list);
-                        wanted = list;
-                        index = 0;
-                    }
-                    SmbCacheCmd::Shutdown => return,
-                }
-            }
-            let item = wanted[index].clone();
-            match fetch(&cfg, &dir, &item, max_bytes, &rx, &tx, &mut wanted) {
-                Flow::Continue => index += 1,
-                Flow::Restart => index = 0,
-                Flow::Stop => return,
-            }
-        }
-        // 3. Window satisfied → back to step 1 and wait.
-    }
+    cache_window::run(
+        rx,
+        |list| evict(&dir, list),
+        |item, rx, wanted| fetch(&cfg, &dir, item, max_bytes, rx, &tx, wanted),
+    );
 }
 
 /// Fetch one file for the window: [`download_file`], checking for a newer
@@ -280,21 +227,13 @@ fn fetch(
     tx: &Sender<SmbCacheEvent>,
     wanted: &mut Vec<SmbRef>,
 ) -> Flow {
-    let mut flow = Flow::Continue;
-    let result = download_file(cfg, item, dir, max_bytes, || match rx.try_recv() {
-        Ok(SmbCacheCmd::Window(list)) => {
-            evict(dir, &list);
-            let still_wanted = list.iter().any(|ref_| ref_.url == item.url);
-            *wanted = list;
-            flow = Flow::Restart;
-            !still_wanted // still wanted: finish this file, then re-check
-        }
-        Ok(SmbCacheCmd::Shutdown) | Err(TryRecvError::Disconnected) => {
-            flow = Flow::Stop;
-            true
-        }
-        Err(TryRecvError::Empty) => false,
-    });
+    let (flow, result) = fetch_one(
+        rx,
+        wanted,
+        |list| evict(dir, list),
+        |r| r.url == item.url,
+        |interrupt| download_file(cfg, item, dir, max_bytes, interrupt),
+    );
     match result {
         Ok(path) => {
             let _ = tx.send(SmbCacheEvent::Ready {

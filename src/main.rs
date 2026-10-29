@@ -8,6 +8,7 @@
 mod action;
 mod app;
 mod audio;
+mod cache_window;
 mod config;
 #[cfg(unix)]
 mod control;
