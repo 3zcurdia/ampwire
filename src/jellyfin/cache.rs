@@ -718,7 +718,7 @@ mod tests {
         let window = compute_window(&order, &arc(&tracks), Some(0), 6, 6);
         // All-remote list: the window is the whole play order, current first.
         let mut expected: Vec<String> = vec!["r0".to_string()];
-        expected.extend(order.upcoming(tracks.len()).iter().map(|&i| {
+        expected.extend(order.upcoming(tracks.len()).map(|i| {
             RemoteRef::from_track(&tracks[i])
                 .expect("remote")
                 .item_id

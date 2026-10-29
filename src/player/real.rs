@@ -969,8 +969,7 @@ impl RealPlayer {
         } else {
             self.order
                 .upcoming(1)
-                .first()
-                .copied()
+                .next()
                 .and_then(|i| self.queue_source(i))
         };
         match queued {
@@ -2393,6 +2392,7 @@ mod tests {
         let mut played: Vec<u64> = player
             .order
             .previous(len)
+            .collect::<Vec<_>>()
             .iter()
             .rev()
             .map(|&i| tracks[i].id)
@@ -2400,12 +2400,7 @@ mod tests {
         if let Some(current) = player.playlist.current() {
             played.push(tracks[current].id);
         }
-        let upcoming = player
-            .order
-            .upcoming(len)
-            .iter()
-            .map(|&i| tracks[i].id)
-            .collect();
+        let upcoming = player.order.upcoming(len).map(|i| tracks[i].id).collect();
         (played, upcoming)
     }
 
