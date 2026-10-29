@@ -598,7 +598,7 @@ impl RealPlayer {
         self.check_boundary();
         self.poll_cache();
         self.poll_smb_cache();
-        self.update_spectrum();
+        self.decay_spectrum();
     }
 
     /// Plan 09, step 4: move `current` (cursor, clock base, format line)
@@ -1170,11 +1170,10 @@ impl RealPlayer {
         self.pending_smb = None;
     }
 
-    /// Smooth the analyzer's band levels into the bars (plan §step 6):
-    /// instant attack, release `0.45`, peak caps falling at `0.06` — the
-    /// exact constants of `MockPlayer::tick`. Paused decays the bars
-    /// (`×0.75`), stopped zeroes everything.
-    fn update_spectrum(&mut self) {
+    /// Bars and peak caps while nothing is analysed (plan §step 6): paused
+    /// decays them (`×0.75`), stopped zeroes everything. Runs on every tick,
+    /// since it costs nothing; the playing case is [`RealPlayer::analyze`].
+    fn decay_spectrum(&mut self) {
         match self.state {
             PlayState::Stopped => {
                 self.spectrum.iter_mut().for_each(|bin| *bin = 0.0);
@@ -1185,37 +1184,48 @@ impl RealPlayer {
                     *bin *= PAUSE_DECAY;
                 }
             }
-            PlayState::Playing => {
-                let mut target = [0.0; BANDS];
-                if let Some(handle) = &mut self.handle {
-                    // Drain the tap completely; only the newest samples feed
-                    // one FFT frame (the ring is bigger than a frame).
-                    self.tap_buf.clear();
-                    while let Ok(sample) = handle.tap.pop() {
-                        self.tap_buf.push(sample);
-                    }
-                    if self.tap_buf.len() > TAP_ANALYZE {
-                        let excess = self.tap_buf.len() - TAP_ANALYZE;
-                        self.tap_buf.drain(..excess);
-                    }
-                    self.analyzer.push(&self.tap_buf);
-                    self.analyzer.bands(handle.sample_rate, &mut target);
-                }
-                for (i, bin) in self.spectrum.iter_mut().enumerate() {
-                    let target = target[i];
-                    // Attack fast, release moderately fast (mock copy).
-                    if target > *bin {
-                        *bin = target;
-                    } else {
-                        *bin = (*bin - target).mul_add(RELEASE, target);
-                    }
-                    let cap = &mut self.peaks[i];
-                    if *bin >= *cap {
-                        *cap = *bin;
-                    } else {
-                        *cap = (*cap - *bin).mul_add(PEAK_FALL, *bin).max(*bin);
-                    }
-                }
+            PlayState::Playing => {}
+        }
+    }
+
+    /// Analyse the tap and smooth the result into the bars (plan §step 6):
+    /// instant attack, release `0.45`, peak caps falling at `0.06` — the
+    /// exact constants of `MockPlayer::tick`. Only while playing. The FFT is
+    /// the expensive part, so the UI calls this once per frame it draws
+    /// rather than on every tick (input, remote commands and poll wake-ups
+    /// would otherwise each run a transform nobody sees).
+    pub fn analyze(&mut self) {
+        if self.state != PlayState::Playing {
+            return;
+        }
+        let mut target = [0.0; BANDS];
+        if let Some(handle) = &mut self.handle {
+            // Drain the tap completely; only the newest samples feed
+            // one FFT frame (the ring is bigger than a frame).
+            self.tap_buf.clear();
+            while let Ok(sample) = handle.tap.pop() {
+                self.tap_buf.push(sample);
+            }
+            if self.tap_buf.len() > TAP_ANALYZE {
+                let excess = self.tap_buf.len() - TAP_ANALYZE;
+                self.tap_buf.drain(..excess);
+            }
+            self.analyzer.push(&self.tap_buf);
+            self.analyzer.bands(handle.sample_rate, &mut target);
+        }
+        for (i, bin) in self.spectrum.iter_mut().enumerate() {
+            let target = target[i];
+            // Attack fast, release moderately fast (mock copy).
+            if target > *bin {
+                *bin = target;
+            } else {
+                *bin = (*bin - target).mul_add(RELEASE, target);
+            }
+            let cap = &mut self.peaks[i];
+            if *bin >= *cap {
+                *cap = *bin;
+            } else {
+                *cap = (*cap - *bin).mul_add(PEAK_FALL, *bin).max(*bin);
             }
         }
     }
@@ -2361,6 +2371,24 @@ mod tests {
             "stopped zeroes"
         );
         assert!(snapshot.peaks.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn playing_bars_move_only_when_analysed() {
+        let (mut player, _cmds, events, ..) = three_tracks();
+        player.handle(PlayerCommand::Play);
+        queue(&events, fake_started_at(0));
+        player.tick(Duration::ZERO);
+        player.spectrum.iter_mut().for_each(|b| *b = 1.0);
+        player.tick(Duration::ZERO);
+        assert!(
+            player.snapshot().spectrum.iter().all(|v| *v == 1.0),
+            "a tick runs no analysis"
+        );
+        // An empty tap releases toward zero by `RELEASE` (0.45).
+        player.analyze();
+        let released = player.snapshot().spectrum[0];
+        assert!((released - 0.45).abs() < 1e-6, "one analysis: {released}");
     }
 
     // --- cache mode: buffering, ready and failure (plan 08, step 5) ---

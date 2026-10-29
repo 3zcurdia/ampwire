@@ -187,6 +187,14 @@ impl Backend {
         }
     }
 
+    /// The spectrum analysis for one drawn frame (real player only: the mock
+    /// animates its bars in `tick`).
+    fn analyze(&mut self) {
+        if let Backend::Real(player) = self {
+            player.analyze();
+        }
+    }
+
     fn snapshot(&self) -> PlayerSnapshot {
         match self {
             Backend::Mock(player) => player.snapshot(),
@@ -484,6 +492,11 @@ impl App {
             let now = Instant::now();
             let due = now >= self.next_frame;
             if self.dirty || due {
+                if due {
+                    // The spectrum follows the frame cadence, not the tick.
+                    self.player.analyze();
+                    self.snapshot = self.player.snapshot();
+                }
                 let size = terminal.size()?;
                 self.sync_to_area(Rect::new(0, 0, size.width, size.height));
                 terminal.draw(|frame| ui::render(frame, self))?;
