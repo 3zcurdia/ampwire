@@ -49,9 +49,10 @@ pub struct ControlServer {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
         // The accept is blocking: one throwaway connection wakes it so it
-        // sees `stop`. If that connect fails (the socket file is gone) the
+        // sees `stop` (the Release store pairs with the loop's Acquire
+        // load). If that connect fails (the socket file is gone) the
         // thread is left to exit with the process rather than joined forever.
         let woke = UnixStream::connect(&self.path).is_ok();
         if let Some(thread) = self.thread.take()
@@ -240,7 +241,7 @@ fn accept_loop(
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Acquire) {
                     break;
                 }
                 let _ = handle_client(stream, view, tx);
