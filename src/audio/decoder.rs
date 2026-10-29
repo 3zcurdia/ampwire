@@ -97,8 +97,6 @@ pub struct Decoder {
     /// `start_offset` (the demuxer can report the frame *before* the one
     /// whose samples actually come out).
     refine_offset: bool,
-    /// Reused conversion buffer: one decoded packet of interleaved `f32`.
-    packet: Vec<f32>,
 }
 
 impl Decoder {
@@ -225,7 +223,6 @@ impl Decoder {
             time_base,
             start_offset,
             refine_offset: !start.is_zero(),
-            packet: Vec::new(),
         })
     }
 
@@ -281,11 +278,11 @@ impl Decoder {
                         }
                         self.refine_offset = false;
                     }
-                    // `decoded` borrows only `self.decoder`; `self.packet` and
-                    // `out` are disjoint, so this compiles without a method
-                    // taking `&mut self` (which would overlap the borrow).
-                    decoded.copy_to_vec_interleaved::<f32>(&mut self.packet);
-                    out.extend_from_slice(&self.packet);
+                    // Convert straight into the caller's buffer: one copy per
+                    // packet, no intermediate vector.
+                    let start = out.len();
+                    out.resize(start + decoded.samples_interleaved(), 0.0);
+                    decoded.copy_to_slice_interleaved::<f32, _>(&mut out[start..]);
                     return Ok(true);
                 }
                 // A damaged packet is skipped; the decoder consumed it, so the
