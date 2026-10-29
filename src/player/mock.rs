@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::playlist::Playlist;
 use super::rng::Rng;
-use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, Track, TrackSource};
+use super::{Bars, FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, Track, TrackSource};
 
 const SPECTRUM_BINS: usize = 24;
 
@@ -243,8 +243,8 @@ impl MockPlayer {
             volume: self.volume,
             balance: self.balance,
             format: self.format.clone(),
-            spectrum: self.spectrum.clone(),
-            peaks: self.peaks.clone(),
+            spectrum: Bars::from_slice(&self.spectrum),
+            peaks: Bars::from_slice(&self.peaks),
         }
     }
 

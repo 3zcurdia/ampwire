@@ -12,6 +12,7 @@ pub mod playlist;
 pub mod real;
 pub mod rng;
 
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -316,9 +317,39 @@ pub struct PlayerSnapshot {
     pub balance: i8,
     pub format: FormatInfo,
     /// Spectrum magnitudes, 0.0–1.0, low to high frequency.
-    pub spectrum: Vec<f32>,
+    pub spectrum: Bars,
     /// Spectrum peak caps, same length as `spectrum`.
-    pub peaks: Vec<f32>,
+    pub peaks: Bars,
+}
+
+/// Spectrum values held inline (at most [`crate::audio::analysis::BANDS`]),
+/// so a snapshot copies them without a heap allocation. Derefs to the bars
+/// as a slice: `len()`, indexing and iteration all work as on a `Vec`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Bars {
+    len: usize,
+    values: [f32; crate::audio::analysis::BANDS],
+}
+
+impl Bars {
+    /// A copy of `bars`. Panics if there are more than `BANDS` of them: the
+    /// analyzer and the mock both stay within that.
+    pub fn from_slice(bars: &[f32]) -> Self {
+        let mut values = [0.0; crate::audio::analysis::BANDS];
+        values[..bars.len()].copy_from_slice(bars);
+        Self {
+            len: bars.len(),
+            values,
+        }
+    }
+}
+
+impl Deref for Bars {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        &self.values[..self.len]
+    }
 }
 
 impl PlayerSnapshot {

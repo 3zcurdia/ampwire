@@ -36,7 +36,7 @@ use crate::smb::cache::{
 use super::order::PlayOrder;
 use super::playlist::Playlist;
 use super::rng::Rng;
-use super::{FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, TrackSource};
+use super::{Bars, FormatInfo, PlayState, PlayerCommand, PlayerSnapshot, TrackSource};
 
 /// Only the last `TAP_ANALYZE` tapped samples feed one FFT frame.
 const TAP_ANALYZE: usize = 4096;
@@ -95,8 +95,8 @@ pub struct RealPlayer {
     /// Reused tap-drain buffer (no per-frame allocation).
     tap_buf: Vec<f32>,
     /// Smoothed band levels / peak caps, 0.0–1.0 (plan 04: 32 real bands).
-    spectrum: Vec<f32>,
-    peaks: Vec<f32>,
+    spectrum: [f32; BANDS],
+    peaks: [f32; BANDS],
     /// The engine seam: production [`Engine`], a recording fake in tests.
     engine: Box<dyn AudioOut>,
     order: PlayOrder,
@@ -224,8 +224,8 @@ impl RealPlayer {
             pending_start: None,
             analyzer: Box::new(Analyzer::new()),
             tap_buf: Vec::new(),
-            spectrum: vec![0.0; BANDS],
-            peaks: vec![0.0; BANDS],
+            spectrum: [0.0; BANDS],
+            peaks: [0.0; BANDS],
             engine,
             order: PlayOrder::new(),
             fail_streak: 0,
@@ -273,8 +273,8 @@ impl RealPlayer {
             volume: self.volume,
             balance: self.balance,
             format,
-            spectrum: self.spectrum.clone(),
-            peaks: self.peaks.clone(),
+            spectrum: Bars::from_slice(&self.spectrum),
+            peaks: Bars::from_slice(&self.peaks),
         }
     }
 
