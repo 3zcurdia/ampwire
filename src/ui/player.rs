@@ -51,8 +51,7 @@ fn shown_secs(app: &App) -> u64 {
     snapshot
         .current_track()
         .and_then(|t| t.duration)
-        .map(|d| d.as_secs().saturating_sub(elapsed))
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs().saturating_sub(elapsed))
 }
 
 /// Render the player panel (full or compact, chosen by `compact`).
@@ -84,7 +83,16 @@ fn state_glyph(state: PlayState) -> char {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line draw of the full player panel; each block is a fixed screen region"
+)]
 fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
+    // before the flags themselves give way: the format text wins last.
+    // The `bit-perfect` marker is never dropped — it stays where it is.
+    const FLAGS_MARGIN: usize = 3;
+    const FLAGS_WIDTH: usize = 9; // `shuf  rep`
+    const MIN_GAP: usize = 2;
     let theme = &app.theme;
     let ui = &app.ui;
     let snapshot = app.snapshot();
@@ -153,19 +161,18 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     }
 
     // --- Row 2: marquee title, looping Winamp-style with ` *** ` between.
-    let title = snapshot
-        .current_track()
-        .map(|t| {
+    let title = snapshot.current_track().map_or_else(
+        || "--- ampwire ---".into(),
+        |t| {
             format!(
                 "{}. {} ({})",
-                snapshot.current.map(|i| i + 1).unwrap_or(0),
+                snapshot.current.map_or(0, |i| i + 1),
                 t.display_name(),
                 t.duration
-                    .map(|d| format_time(d.as_secs()))
-                    .unwrap_or_else(|| "--:--".into()),
+                    .map_or_else(|| "--:--".into(), |d| format_time(d.as_secs())),
             )
-        })
-        .unwrap_or_else(|| "--- ampwire ---".into());
+        },
+    );
     Marquee {
         text: &title,
         offset: ui.marquee_offset,
@@ -183,11 +190,6 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     // Flags right-aligned with a 3-column margin. When tight, give up the
     // margin, then the double spacing — and a still-narrower line drops the
     // format's trailing parts (channels first, then the rate; plan 05)
-    // before the flags themselves give way: the format text wins last.
-    // The `bit-perfect` marker is never dropped — it stays where it is.
-    const FLAGS_WIDTH: usize = 9; // `shuf  rep`
-    const FLAGS_MARGIN: usize = 3;
-    const MIN_GAP: usize = 2;
     let width = format_area.width as usize;
     // Candidate texts, widest first: the full `describe()` line, then
     // narrower rebuilds without channels, then without channels and rate.
@@ -246,8 +248,7 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
         snapshot
             .current_track()
             .and_then(|t| t.duration)
-            .map(|d| format_time(d.as_secs()))
-            .unwrap_or_else(|| "--:--".into())
+            .map_or_else(|| "--:--".into(), |d| format_time(d.as_secs()))
     );
     render_seek(app, seek_area, buf, &time_pair);
 
@@ -283,15 +284,14 @@ fn render_seek(app: &App, area: Rect, buf: &mut Buffer, time_pair: &str) {
     let total = snapshot
         .current_track()
         .and_then(|t| t.duration)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let value = if total == 0 {
         0.0
     } else {
         (snapshot.position.as_secs() as f32 / total as f32).clamp(0.0, 1.0)
     };
 
-    let knob_x = ((track_width.saturating_sub(1)) as f32 * value).round() as u16;
+    let knob_x = (f32::from(track_width.saturating_sub(1)) * value).round() as u16;
     for i in 0..track_width {
         let cell = &mut buf[(area.x + i, area.y)];
         if i == knob_x {
@@ -311,11 +311,11 @@ fn render_seek(app: &App, area: Rect, buf: &mut Buffer, time_pair: &str) {
 }
 
 fn render_mix(app: &App, area: Rect, buf: &mut Buffer) {
+    const GAP: u16 = 2;
     let theme = &app.theme;
     let snapshot = app.snapshot();
     // vol and bal are separated by a 2-column gap so they read as two
     // distinct controls rather than one continuous track.
-    const GAP: u16 = 2;
     if area.width <= GAP {
         return;
     }
@@ -334,7 +334,7 @@ fn render_mix(app: &App, area: Rect, buf: &mut Buffer) {
     };
 
     HSlider {
-        value: snapshot.volume as f32 / 100.0,
+        value: f32::from(snapshot.volume) / 100.0,
         track: theme.color(Role::Primary),
         knob: theme.color(Role::Accent),
         label: Some("vol"),
@@ -343,9 +343,9 @@ fn render_mix(app: &App, area: Rect, buf: &mut Buffer) {
     .render(vol_area, buf);
 
     // Balance: -1..=1, knob at center when 0.
-    let bal_value = snapshot.balance as f32 / 100.0;
+    let bal_value = f32::from(snapshot.balance) / 100.0;
     HSlider {
-        value: (bal_value + 1.0) / 2.0,
+        value: f32::midpoint(bal_value, 1.0),
         track: theme.color(Role::Primary),
         knob: theme.color(Role::Accent),
         label: Some("bal"),
@@ -477,7 +477,7 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
     // Title, truncated by display width.
     let title = snapshot
         .current_track()
-        .map(|t| t.display_name())
+        .map(super::super::player::Track::display_name)
         .unwrap_or_default();
     let rest = (area.x + area.width).saturating_sub(x);
     let seek_width = 12u16.min(rest / 2);
@@ -496,14 +496,13 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
         let total = snapshot
             .current_track()
             .and_then(|t| t.duration)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let value = if total == 0 {
             0.0
         } else {
             (snapshot.position.as_secs() as f32 / total as f32).clamp(0.0, 1.0)
         };
-        let knob_x = ((seek_width.saturating_sub(1)) as f32 * value).round() as u16;
+        let knob_x = (f32::from(seek_width.saturating_sub(1)) * value).round() as u16;
         for i in 0..seek_width {
             let cell = &mut buf[(x + i, area.y)];
             if i == knob_x {

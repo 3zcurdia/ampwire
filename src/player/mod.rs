@@ -107,7 +107,7 @@ pub fn format_khz(rate: u32) -> String {
     if rate.is_multiple_of(1000) {
         format!("{}", rate / 1000)
     } else {
-        let khz = format!("{:.1}", rate as f64 / 1000.0);
+        let khz = format!("{:.1}", f64::from(rate) / 1000.0);
         khz.trim_end_matches(".0").to_string()
     }
 }
@@ -425,7 +425,7 @@ mod tests {
             title: title.map(str::to_string),
             duration: None,
             bitrate_kbps: None,
-            pos: AlbumPos::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -482,7 +482,7 @@ mod tests {
             title: title.map(str::to_string),
             duration: None,
             bitrate_kbps: None,
-            pos: AlbumPos::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -498,7 +498,7 @@ mod tests {
             title: Some(format!("title-{id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: AlbumPos::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -551,9 +551,7 @@ mod tests {
         );
 
         let disk = local("/m/a.flac", None, None);
-        assert!(
-            !!matches!(disk.source, crate::player::TrackSource::Local(_)) && !disk.is_jellyfin()
-        );
+        assert!(matches!(disk.source, crate::player::TrackSource::Local(_)) && !disk.is_jellyfin());
     }
 
     // --- album order (plan 12) ---
@@ -653,7 +651,7 @@ mod tests {
         b2.pos.album_artist = Some("Artist B".into());
 
         let mut tracks = [b2, a1, b1, a2];
-        tracks.sort_by_key(|t| t.sort_key());
+        tracks.sort_by_key(super::Track::sort_key);
         assert_eq!(
             tracks
                 .iter()
@@ -681,7 +679,7 @@ mod tests {
         let x = local("/m/a/x.flac", None, None);
 
         let mut tracks = [b1, x, a2, a1];
-        tracks.sort_by_key(|t| t.sort_key());
+        tracks.sort_by_key(super::Track::sort_key);
         let paths: Vec<String> = tracks
             .iter()
             .map(|t| match &t.source {
@@ -775,6 +773,6 @@ mod tests {
         };
         assert_eq!(mono.describe(), "FLAC  24/96  mono");
         assert_eq!(FormatInfo::blank().describe(), "", "no format line");
-        assert!(FormatInfo::blank().format_parts().is_empty());
+        assert_eq!(FormatInfo::blank().format_parts().len(), 0);
     }
 }

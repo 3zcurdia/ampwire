@@ -55,19 +55,16 @@ impl PlayOrder {
             self.pos = current.unwrap_or(NONE);
             return;
         }
-        match current {
-            Some(cur) => {
-                // The rest, shuffled, behind the current track at the front.
-                let mut rest: Vec<usize> = (0..len).filter(|&i| i != cur).collect();
-                fisher_yates(&mut rest, rng);
-                rest.insert(0, cur);
-                self.order = rest;
-                self.pos = 0;
-            }
-            None => {
-                fisher_yates(&mut self.order, rng);
-                self.pos = NONE;
-            }
+        if let Some(cur) = current {
+            // The rest, shuffled, behind the current track at the front.
+            let mut rest: Vec<usize> = (0..len).filter(|&i| i != cur).collect();
+            fisher_yates(&mut rest, rng);
+            rest.insert(0, cur);
+            self.order = rest;
+            self.pos = 0;
+        } else {
+            fisher_yates(&mut self.order, rng);
+            self.pos = NONE;
         }
     }
 

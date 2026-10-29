@@ -26,7 +26,7 @@ impl Widget for Spectrum<'_> {
         }
         let n = self.values.len();
         // 16 levels across `area.height` rows (each row = 8 eighth-blocks).
-        let total_levels = area.height as f32 * 8.0;
+        let total_levels = f32::from(area.height) * 8.0;
 
         for col in 0..area.width {
             // Map each column to a bin; more columns → more bars, not

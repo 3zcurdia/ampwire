@@ -83,7 +83,7 @@ impl MockServer {
                 let state = accept_state.clone();
                 let fixture = Arc::clone(&fixture);
                 std::thread::spawn(move || {
-                    let _ = serve(stream, state, fixture);
+                    let _ = serve(stream, &state, &fixture);
                 });
             }
         });
@@ -140,7 +140,7 @@ impl MockServer {
 }
 
 /// Read one request head (GET has no body) and answer it.
-fn serve(mut stream: TcpStream, state: State, fixture: Arc<Vec<u8>>) -> std::io::Result<()> {
+fn serve(mut stream: TcpStream, state: &State, fixture: &[u8]) -> std::io::Result<()> {
     let mut head = Vec::new();
     let mut buf = [0u8; 2048];
     loop {
@@ -213,7 +213,7 @@ fn serve(mut stream: TcpStream, state: State, fixture: Arc<Vec<u8>>) -> std::io:
             )
         }
         _ if path.starts_with("/Audio/") && path.ends_with("/stream") => {
-            send_audio(&mut stream, &state, &headers, &fixture)
+            send_audio(&mut stream, state, &headers, fixture)
         }
         _ => send(&mut stream, "404 Not Found", &[], Duration::ZERO, b""),
     }

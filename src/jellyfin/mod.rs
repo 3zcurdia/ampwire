@@ -109,7 +109,7 @@ impl Client {
             .get(&url)
             .header("Authorization", &self.auth_header())
             .call()
-            .map_err(map_error)?;
+            .map_err(|error| map_error(&error))?;
         // Bounded: one byte past the cap proves the body is too big, so a
         // hostile server cannot make us buffer without limit (audit S5).
         let mut body = response
@@ -190,18 +190,16 @@ impl Client {
         if let Some(from) = range_from {
             request = request.header("Range", &format!("bytes={from}-"));
         }
-        request.call().map_err(map_error)
+        request.call().map_err(|error| map_error(&error))
     }
 }
 
 /// Every transport/HTTP failure becomes one of three fixed strings — never
 /// the error's own text (it can embed a URI, and the URI must not carry the
 /// key… but we also never print a URL at all).
-fn map_error(error: ureq::Error) -> String {
+fn map_error(error: &ureq::Error) -> String {
     match error {
-        ureq::Error::StatusCode(401) | ureq::Error::StatusCode(403) => {
-            "jellyfin: invalid API key".to_string()
-        }
+        ureq::Error::StatusCode(401 | 403) => "jellyfin: invalid API key".to_string(),
         ureq::Error::StatusCode(code) => format!("jellyfin: HTTP {code}"),
         // Connect failures, timeouts, DNS, TLS, socket errors.
         _ => "jellyfin: cannot reach server".to_string(),
@@ -280,7 +278,7 @@ struct ItemsPage {
     total_record_count: usize,
 }
 
-/// One audio item. Field names follow the Jellyfin API's PascalCase; every
+/// One audio item. Field names follow the Jellyfin API's `PascalCase`; every
 /// field is optional so a sparse item degrades instead of failing the page.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -364,7 +362,7 @@ pub(crate) fn container_ext(container: Option<&str>) -> String {
     let cleaned: String = container
         .unwrap_or("bin")
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .collect();
     if cleaned.is_empty() {
         "bin".into()
@@ -523,7 +521,7 @@ mod tests {
         let server = MockServer::start();
         let LibraryPage { tracks, total, .. } =
             server.client(KEY).page("user1", 500, PAGE_SIZE).unwrap();
-        assert!(tracks.is_empty());
+        assert_eq!(tracks.len(), 0);
         assert_eq!(total, 600);
     }
 
@@ -779,6 +777,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "an ignored end-to-end smoke test that walks one real server session in order"
+    )]
     /// The plan's *"manual — needs a real server"* checks (step 7),
     /// scripted: library page → cache window slides on a real server →
     /// directory gone on exit → `Range` streaming decodes → the engine
@@ -928,7 +930,10 @@ mod tests {
         let info = decoder.info().clone();
         let mut samples = Vec::new();
         while decoder.read(&mut samples).expect("decodes") {}
-        assert!(!samples.is_empty());
+        assert!(
+            !samples.is_empty(),
+            "the streamed original decodes to no samples"
+        );
         eprintln!(
             "streamed: {} {} Hz {}ch, {} samples",
             info.codec,

@@ -31,7 +31,7 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Read/write chunk while downloading (the plan's 256 KiB).
 const CHUNK: usize = 256 * 1024;
 /// Directories left behind by a crash are swept after this long.
-pub const STALE_AGE: Duration = Duration::from_secs(24 * 3600);
+pub const STALE_AGE: Duration = Duration::from_hours(24);
 /// Directory-name prefix this app creates for the Jellyfin window — the
 /// *only* thing the sweep and the eviction will ever touch by name. The
 /// SMB window (plan 10, step 5) reuses [`create_own_dir`] /
@@ -54,8 +54,7 @@ impl RemoteRef {
                 item_id: item_id.clone(),
                 container: container.clone(),
             }),
-            TrackSource::Smb { .. } => None,
-            TrackSource::Local(_) => None,
+            TrackSource::Smb { .. } | TrackSource::Local(_) => None,
         }
     }
 }
@@ -106,7 +105,7 @@ impl Cache {
         let thread_dir = dir.clone();
         let join = std::thread::Builder::new()
             .name("ampwire-jellyfin-cache".into())
-            .spawn(move || run(client, thread_dir, max_bytes, cmd_rx, ev_tx))?;
+            .spawn(move || run(&client, &thread_dir, max_bytes, &cmd_rx, &ev_tx))?;
 
         Ok(Cache {
             tx: cmd_tx,
@@ -291,16 +290,16 @@ pub fn compute_window(
 /// The downloader thread: wait for a window → evict → fetch in priority
 /// order, restarting whenever a newer window arrives.
 fn run(
-    client: Client,
-    dir: PathBuf,
+    client: &Client,
+    dir: &Path,
     max_bytes: u64,
-    rx: Receiver<CacheCmd>,
-    tx: Sender<CacheEvent>,
+    rx: &Receiver<CacheCmd>,
+    tx: &Sender<CacheEvent>,
 ) {
     cache_window::run(
         rx,
-        |list| evict(&dir, list),
-        |item, rx, wanted| fetch(&client, &dir, item, max_bytes, rx, &tx, wanted),
+        |list| evict(dir, list),
+        |item, rx, wanted| fetch(client, dir, item, max_bytes, rx, tx, wanted),
     );
 }
 
@@ -496,7 +495,7 @@ mod tests {
             title: Some(path.to_string()),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -511,7 +510,7 @@ mod tests {
             title: Some(format!("title-{id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -578,7 +577,7 @@ mod tests {
             ["a", "b"]
         );
         // Nothing current and no look-ahead: empty, never a panic.
-        assert!(compute_window(&order, &arc(&tracks), None, 0, 0).is_empty());
+        assert_eq!(compute_window(&order, &arc(&tracks), None, 0, 0).len(), 0);
     }
 
     #[test]
@@ -629,8 +628,11 @@ mod tests {
     fn window_of_an_all_local_playlist_is_empty() {
         let tracks: Vec<Track> = (0..5).map(|i| local(&format!("/x/{i}.flac"))).collect();
         let order = ordered(tracks.len(), Some(2));
-        assert!(compute_window(&order, &arc(&tracks), Some(2), 3, 3).is_empty());
-        assert!(compute_window(&order, &arc(&tracks), None, 10, 10).is_empty());
+        assert_eq!(
+            compute_window(&order, &arc(&tracks), Some(2), 3, 3).len(),
+            0
+        );
+        assert_eq!(compute_window(&order, &arc(&tracks), None, 10, 10).len(), 0);
     }
 
     // --- directory sweep + lifecycle (plan 08, Decisions) ---
@@ -654,8 +656,8 @@ mod tests {
         for dir in [&stale, &fresh, &unrelated, &not_a_pid] {
             fs::create_dir_all(dir).unwrap();
         }
-        age_dir(&stale, Duration::from_secs(25 * 3600)); // > 24 h
-        age_dir(&not_a_pid, Duration::from_secs(25 * 3600)); // wrong pattern
+        age_dir(&stale, Duration::from_hours(25)); // > 24 h
+        age_dir(&not_a_pid, Duration::from_hours(25)); // wrong pattern
 
         let removed = sweep_stale_dirs(parent.path(), STALE_AGE, DIR_PREFIX);
         assert_eq!(removed, 1, "exactly the stale crash leftover");

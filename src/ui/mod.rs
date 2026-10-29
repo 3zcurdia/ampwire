@@ -188,7 +188,7 @@ mod tests {
         // Plan 02 step 10: an empty session shows the dim hint row, and the
         // player panel + marquee must not panic with `current = None`.
         let app = App::new_session(Config::default(), Keymap::defaults(), theme::neon());
-        assert!(app.snapshot().tracks.is_empty());
+        assert_eq!(app.snapshot().tracks.len(), 0);
         assert_eq!(app.snapshot().current, None);
 
         for (w, h) in [(104u16, 18u16), (80, 24), (52, 12)] {
@@ -438,7 +438,7 @@ mod golden {
 #[cfg(test)]
 mod visual_dump {
     #[test]
-    #[ignore]
+    #[ignore = "writes a visual dump; run with --ignored"]
     fn dump_frame() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;

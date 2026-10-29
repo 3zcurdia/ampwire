@@ -183,6 +183,10 @@ impl Dsp {
     ///
     /// Call this **after** the spectrum tap and only over the frames that
     /// were really popped — never over the callback's padding silence.
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact unity is the bit-perfect fast path; a tolerance would change which path runs"
+    )]
     pub fn process_gain(&mut self, samples: &mut [f32]) {
         let target_vol = f32::from_bits(self.params.volume_gain.load(Ordering::Relaxed));
         let target_l = f32::from_bits(self.params.balance_left.load(Ordering::Relaxed));
@@ -242,14 +246,14 @@ fn step(cur: &mut f32, target: f32) {
 /// Volume 0–=100 → linear gain: `(v / 100)^2`. `0` is silence, `100` is
 /// exactly `1.0` (unity, so a fresh install is bit-perfect).
 pub fn volume_to_gain(v: u8) -> f32 {
-    let v = v.min(100) as f32 / 100.0;
+    let v = f32::from(v.min(100)) / 100.0;
     v * v
 }
 
 /// Balance −100 (full left) … +100 (full right) → `(left, right)` gains.
 /// Only the opposite channel is attenuated; the other stays exactly `1.0`.
 pub fn balance_to_gains(b: i8) -> (f32, f32) {
-    let b = b.clamp(-100, 100) as f32;
+    let b = f32::from(b.clamp(-100, 100));
     let left = if b <= 0.0 { 1.0 } else { 1.0 - b / 100.0 };
     let right = if b >= 0.0 { 1.0 } else { 1.0 + b / 100.0 };
     (left, right)
@@ -360,6 +364,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the test checks bit-identical output; a tolerance would hide a changed sample"
+    )]
     fn mono_ignores_balance_entirely() {
         let (mut dsp, params) = dsp(1);
         params.set(1.0, 0.0, 1.0); // full-right balance
@@ -450,6 +458,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the test checks bit-identical output; a tolerance would hide a changed sample"
+    )]
     fn swap_is_ignored_for_non_stereo_streams() {
         for channels in [1usize, 6] {
             let (mut dsp, params) = dsp(channels);
@@ -494,7 +506,9 @@ mod tests {
         // Mono, so the 1 kHz sine is also a 1 kHz per-channel signal.
         let (mut dsp, params) = dsp(1);
         let sine: Vec<f32> = (0..8192)
-            .map(|i| (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 44_100.0).sin() as f32 * 0.2)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * 1000.0 * f64::from(i) / 44_100.0).sin() as f32 * 0.2
+            })
             .collect();
 
         // Boost the 1 kHz band: the callback notices on the next pass.

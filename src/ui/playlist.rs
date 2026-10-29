@@ -126,6 +126,10 @@ fn truncate_ellipsis(text: &str, width: usize) -> String {
     out
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one draw pass for the playlist rows, footer and scrollbar"
+)]
 pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let theme = &app.theme;
     let keymap = &app.keymap;
@@ -305,7 +309,7 @@ fn render_scrollbar(app: &App, buf: &mut Buffer, scroll: usize, total: usize, in
     let thumb_pos = (scroll as f32 / max_scroll * (track_h - thumb_h)).round();
 
     for i in 0..inner.height {
-        let in_thumb = (i as f32) >= thumb_pos && (i as f32) < thumb_pos + thumb_h;
+        let in_thumb = f32::from(i) >= thumb_pos && f32::from(i) < thumb_pos + thumb_h;
         let cell = &mut buf[(x, inner.y + i)];
         if in_thumb {
             cell.set_char(glyphs::TRACK_FULL);

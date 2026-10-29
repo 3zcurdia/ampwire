@@ -40,7 +40,7 @@ pub enum DownloadError {
 /// the window no longer wants; `fetch` downloads one item (see
 /// [`fetch_one`]) and returns how the loop continues.
 pub fn run<R: Clone>(
-    rx: Receiver<WindowCmd<R>>,
+    rx: &Receiver<WindowCmd<R>>,
     mut evict: impl FnMut(&[R]),
     mut fetch: impl FnMut(&R, &Receiver<WindowCmd<R>>, &mut Vec<R>) -> Flow,
 ) {
@@ -70,7 +70,7 @@ pub fn run<R: Clone>(
                 }
             }
             let item = wanted[index].clone();
-            match fetch(&item, &rx, &mut wanted) {
+            match fetch(&item, rx, &mut wanted) {
                 Flow::Continue => index += 1,
                 Flow::Restart => index = 0,
                 Flow::Stop => return,

@@ -111,7 +111,7 @@ fn fake_tracks() -> Vec<Track> {
                 title: Some(title.into()),
                 duration: Some(Duration::from_secs(secs)),
                 bitrate_kbps: None,
-                pos: Default::default(),
+                pos: crate::player::AlbumPos::default(),
             }
         })
         .collect()
@@ -266,7 +266,7 @@ impl MockPlayer {
                 // identical so app tests can observe the command (plan 08):
                 // only Jellyfin rows go (SMB rows are remote, not Jellyfin —
                 // plan 10, step 2).
-                if self.playlist.remove_where(|track| track.is_jellyfin()) {
+                if self.playlist.remove_where(super::Track::is_jellyfin) {
                     self.state = PlayState::Stopped;
                     self.position = Duration::ZERO;
                 }
@@ -312,20 +312,19 @@ impl MockPlayer {
             // can read back what the UI sent.
             PlayerCommand::SetVolume(v) => self.volume = v.min(100),
             PlayerCommand::SetBalance(b) => self.balance = b.clamp(-100, 100),
-            PlayerCommand::SetSwapChannels(_) => {}
             PlayerCommand::SetEq { enabled, gains } => self.last_eq = Some((enabled, gains)),
             _ => {}
         }
-        self.handle_transport(cmd);
+        self.handle_transport(&cmd);
     }
 
     /// Transport and seek — everything that needs a non-empty playlist.
-    fn handle_transport(&mut self, cmd: PlayerCommand) {
+    fn handle_transport(&mut self, cmd: &PlayerCommand) {
         let len = self.playlist.len();
         if len == 0 {
             return;
         }
-        match cmd {
+        match *cmd {
             PlayerCommand::Play => {
                 if self.playlist.current().is_none() {
                     self.playlist.set_current(Some(0));
@@ -343,8 +342,8 @@ impl MockPlayer {
                 self.position = Duration::ZERO;
             }
             PlayerCommand::TogglePlayPause => match self.state {
-                PlayState::Playing => self.handle_transport(PlayerCommand::Pause),
-                _ => self.handle_transport(PlayerCommand::Play),
+                PlayState::Playing => self.handle_transport(&PlayerCommand::Pause),
+                _ => self.handle_transport(&PlayerCommand::Play),
             },
             PlayerCommand::Next => {
                 let next = self.playlist.current().map_or(0, |i| (i + 1) % len);
@@ -369,7 +368,6 @@ impl MockPlayer {
                 self.position = Duration::ZERO;
                 self.state = PlayState::Playing;
             }
-            PlayerCommand::PlayTrack(_) => {}
             PlayerCommand::SeekBy(delta) => {
                 if let Some(track) = self.current_track() {
                     let track_len = track.duration.unwrap_or(UNKNOWN_DURATION).as_secs();
@@ -543,7 +541,7 @@ mod tests {
         let mut p = MockPlayer::empty();
         assert_eq!(p.state, PlayState::Stopped);
         assert_eq!(p.playlist.current(), None);
-        assert!(p.playlist.is_empty());
+        assert_eq!(p.playlist.len(), 0);
         assert_eq!(p.volume, 68);
         assert_eq!(p.balance, 0);
         // Transport on an empty list is a no-op, never a panic.
@@ -583,7 +581,7 @@ mod tests {
 
         // Replace with nothing → stopped, empty.
         p.handle(PlayerCommand::ReplaceTracks(vec![]));
-        assert!(p.playlist.is_empty());
+        assert_eq!(p.playlist.len(), 0);
         assert_eq!(p.state, PlayState::Stopped);
     }
 

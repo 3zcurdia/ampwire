@@ -91,6 +91,10 @@ pub struct PresetPicker {
     pub saved_on: bool,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "UI state is a set of independent flags (help, prompts, panels, notices), not a state machine"
+)]
 /// Per-frame UI state the panels read.
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -216,6 +220,10 @@ impl Backend {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the app holds several independent flags (quit, read-only, dirty, omarchy fallback)"
+)]
 pub struct App {
     pub ui: UiState,
     pub theme: Theme,
@@ -485,7 +493,7 @@ impl App {
     }
 
     pub fn compute_layout(&self, area: ratatui::layout::Rect) -> ui::layout::ComputedLayout {
-        compute_layout(area, &self.layout_prefs(), &self.ui.vis)
+        compute_layout(area, &self.layout_prefs(), self.ui.vis)
     }
 
     /// Run the event loop.
@@ -885,7 +893,7 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let prompt = self.ui.prompt.take().expect("prompt is open");
-                self.submit_prompt(prompt);
+                self.submit_prompt(&prompt);
             }
             KeyCode::Esc => {
                 let kind = prompt.kind;
@@ -936,7 +944,7 @@ impl App {
     /// the local route: expand `~`, the path must exist, then scan
     /// replace/append — which is why a broken URL still reports
     /// `not found: smb://…`.
-    fn submit_prompt(&mut self, prompt: Prompt) {
+    fn submit_prompt(&mut self, prompt: &Prompt) {
         match prompt.kind {
             // Enter in Find keeps the filter and just closed the prompt.
             PromptKind::Find => {}
@@ -1050,7 +1058,7 @@ impl App {
         // measured ≈0.7 s per file: every tag read is ~16 round trips), so
         // the URL is announced right away instead of leaving the UI silent
         // until the first 50-file progress tick.
-        let announced = urls.first().map(|url| url.canonical());
+        let announced = urls.first().map(super::smb::SmbUrl::canonical);
         for url in urls {
             let cfg = self.smb_client_cfg(&url);
             crate::smb::scan::spawn_smb_scan(url, cfg, tx.clone());
@@ -1077,7 +1085,7 @@ impl App {
     /// (plan 10, step 1), so nothing outside the tests uses this.
     #[cfg(test)]
     pub fn load_paths(&mut self, paths: Vec<std::path::PathBuf>, mode: ScanMode) {
-        self.load_inputs(paths.into_iter().map(LoadInput::Local).collect(), mode)
+        self.load_inputs(paths.into_iter().map(LoadInput::Local).collect(), mode);
     }
 
     /// Drain pending scan messages. `Done` applies the tracks according to
@@ -1181,7 +1189,7 @@ impl App {
             .config
             .jellyfin
             .as_ref()
-            .is_some_and(|jf| jf.is_complete());
+            .is_some_and(super::config::JellyfinConfig::is_complete);
         if !configured {
             self.ui.notice = Some("jellyfin: add [jellyfin] url and api_key to config.toml".into());
             return;
@@ -1300,7 +1308,19 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match over every action; splitting it would scatter the action table"
+    )]
     pub fn dispatch(&mut self, action: Action) {
+        use Action::{
+            Add, BalanceLeft, BalanceRight, BandDown, BandLeft, BandRight, BandUp, Clear,
+            ClearFilter, CursorDown, CursorUp, CycleOrder, Del, EqPresets, EqReset, EqToggle, Find,
+            FocusNext, FocusPrev, Help, JumpEnd, JumpHome, LoadJellyfin, MoveDown, MoveUp, Next,
+            Open, PageDown, PageUp, Pause, Play, PlayPause, Prev, Quit, SeekBack, SeekFwd, Select,
+            Stop, ToggleColumns, ToggleEq, TogglePlayer, TogglePlaylist, ToggleRepeat,
+            ToggleShuffle, ToggleTimeMode, VolumeDown, VolumeUp,
+        };
         if self.ui.show_help
             && action != Action::Help
             && action != Action::Quit
@@ -1311,7 +1331,6 @@ impl App {
             return;
         }
 
-        use Action::*;
         match action {
             Quit => {
                 self.should_quit = true;
@@ -1496,7 +1515,7 @@ impl App {
     }
 
     fn change_volume(&mut self, delta: i32) {
-        let volume = (self.snapshot.volume as i32 + delta).clamp(0, 100) as u8;
+        let volume = (i32::from(self.snapshot.volume) + delta).clamp(0, 100) as u8;
         self.set_volume_to(volume);
     }
 
@@ -1513,7 +1532,7 @@ impl App {
     }
 
     fn change_balance(&mut self, delta: i32) {
-        let balance = (self.snapshot.balance as i32 + delta).clamp(-100, 100) as i8;
+        let balance = (i32::from(self.snapshot.balance) + delta).clamp(-100, 100) as i8;
         self.player.handle(PlayerCommand::SetBalance(balance));
         self.config.audio.balance = balance;
         self.config_dirty_since = Some(Instant::now());
@@ -2199,7 +2218,10 @@ mod tests {
     fn prompt_keys_type_backspace_and_escape() {
         let (mut app, _dir) = test_app();
         app.dispatch(Action::Open);
-        assert_eq!(app.ui.prompt.as_ref().map(|p| p.label()), Some("open"));
+        assert_eq!(
+            app.ui.prompt.as_ref().map(super::Prompt::label),
+            Some("open")
+        );
 
         for c in "music".chars() {
             app.handle_key(press(KeyCode::Char(c)));
@@ -2430,7 +2452,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         };
 
         app.scan_mode = ScanMode::Replace;
@@ -2713,7 +2735,11 @@ mod tests {
         assert!(!dir.path().join("config.toml").exists());
 
         // Age the flag past the debounce window, then tick.
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
         assert!(
             dir.path().join("config.toml").exists(),
@@ -2749,7 +2775,11 @@ mod tests {
         );
         app.dispatch(Action::VolumeDown);
         app.dispatch(Action::BalanceRight);
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
         assert!(!path.exists(), "demo mode never writes the config");
     }
@@ -2768,7 +2798,11 @@ mod tests {
         );
         app.set_read_only(true, None);
         app.dispatch(Action::VolumeDown);
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -2840,7 +2874,11 @@ mod tests {
             app.dispatch(Action::BandUp); // preamp +3
         }
         app.dispatch(Action::EqToggle); // and off
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
 
         let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
@@ -2880,7 +2918,11 @@ mod tests {
         app.ui.focus = Scope::Eq;
         app.dispatch(Action::BandUp);
         app.dispatch(Action::EqToggle);
-        app.config_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        app.config_dirty_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a test clock past one second"),
+        );
         app.tick(Duration::from_millis(33));
         assert!(!path.exists(), "demo mode never writes the config");
     }
@@ -3068,7 +3110,7 @@ mod tests {
             title: Some(format!("t-{id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 

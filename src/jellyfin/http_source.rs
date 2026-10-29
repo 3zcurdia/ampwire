@@ -172,9 +172,9 @@ impl Seek for HttpRangeSource {
     /// the next `Read` re-opens at the new position when it has to.
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         let target = match from {
-            SeekFrom::Start(pos) => pos as i128,
-            SeekFrom::End(offset) => self.len as i128 + offset as i128,
-            SeekFrom::Current(offset) => self.pos as i128 + offset as i128,
+            SeekFrom::Start(pos) => i128::from(pos),
+            SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
+            SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
         };
         self.pos = target.max(0) as u64;
         Ok(self.pos)
@@ -349,9 +349,8 @@ mod tests {
         let client = server.client(KEY);
 
         let probe = HttpRangeSource::open(client.clone(), &"any".into());
-        let error = match probe {
-            Err(error) => error,
-            Ok(_) => panic!("a 200 answer must not yield a seekable source"),
+        let Err(error) = probe else {
+            panic!("a 200 answer must not yield a seekable source")
         };
         assert_eq!(error, OpenError::NoRanges, "200 instead of 206");
 

@@ -396,9 +396,7 @@ mod tests {
     }
 
     fn parent_of(path: &str) -> &str {
-        path.rsplit_once('/')
-            .map(|(parent, _)| parent)
-            .unwrap_or("")
+        path.rsplit_once('/').map_or("", |(parent, _)| parent)
     }
 
     /// `smb://nas/Music/<path>`.
@@ -541,7 +539,7 @@ mod tests {
         let (message, _) = run(&share, &url("Album/gone.flac"));
         match message {
             ScanMsg::Failed { reason } => {
-                assert_eq!(reason, "not found: smb://nas/Music/Album/gone.flac")
+                assert_eq!(reason, "not found: smb://nas/Music/Album/gone.flac");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -551,14 +549,14 @@ mod tests {
         let share = FakeShare::new().file("cover.jpg", b"");
         let (message, _) = run(&share, &url("cover.jpg"));
         let (tracks, skipped) = done(message);
-        assert!(tracks.is_empty());
+        assert_eq!(tracks.len(), 0);
         assert_eq!(skipped, 1);
 
         // An `._` sidecar given directly → skipped, like the local rule.
         let share = FakeShare::new().file("._x.flac", b"");
         let (message, _) = run(&share, &url("._x.flac"));
         let (tracks, skipped) = done(message);
-        assert!(tracks.is_empty());
+        assert_eq!(tracks.len(), 0);
         assert_eq!(skipped, 1);
 
         // A missing directory → `not found: smb://…` too.

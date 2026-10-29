@@ -20,7 +20,7 @@ pub fn is_audio(path: &Path) -> bool {
         .is_some_and(|ext| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
-/// macOS AppleDouble sidecars (`._name.flac`): metadata stubs that inherit
+/// macOS `AppleDouble` sidecars (`._name.flac`): metadata stubs that inherit
 /// the real file's extension but are never playable audio. Other hidden
 /// files still load (plan 02's "hidden files are included" stands).
 pub fn is_apple_double(path: &Path) -> bool {
@@ -140,7 +140,7 @@ pub fn spawn_scan(paths: Vec<PathBuf>, tx: mpsc::Sender<ScanMsg>) {
 
         for path in paths {
             if path.is_dir() {
-                for entry in WalkDir::new(&path).follow_links(false).into_iter() {
+                for entry in WalkDir::new(&path).follow_links(false) {
                     match entry {
                         Ok(entry)
                             if entry.file_type().is_file()
@@ -249,7 +249,10 @@ mod tests {
         // The two non-audio *files at the root* are ignored during the walk
         // (directories skip non-audio silently).
         assert_eq!(skipped, 0, "walk skips non-audio without counting");
-        let mut names: Vec<String> = tracks.iter().map(|t| t.display_name()).collect();
+        let mut names: Vec<String> = tracks
+            .iter()
+            .map(super::super::player::Track::display_name)
+            .collect();
         names.sort();
         assert_eq!(names, ["one", "two"]);
     }
@@ -274,7 +277,10 @@ mod tests {
         std::fs::write(dir.path().join(".hidden.flac"), b"").unwrap();
 
         let (tracks, skipped) = scan(vec![dir.path().to_path_buf()]);
-        let mut names: Vec<String> = tracks.iter().map(|t| t.display_name()).collect();
+        let mut names: Vec<String> = tracks
+            .iter()
+            .map(super::super::player::Track::display_name)
+            .collect();
         names.sort();
         // Sidecars dropped; a deliberately hidden track still loads.
         assert_eq!(names, [".hidden", "1-01 Song"], "{names:?}");

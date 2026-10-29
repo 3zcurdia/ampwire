@@ -177,13 +177,15 @@ pub fn new_view() -> SharedView {
 /// Clone the latest view.
 pub fn read_view(view: &SharedView) -> View {
     view.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
 
 /// Replace the latest view.
 pub fn write_view(view: &SharedView, next: View) {
-    *view.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    *view
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
 }
 
 /// Commands the UI thread applies on its next tick. The services send; only
@@ -232,9 +234,7 @@ fn source_label(source: &TrackSource) -> &'static str {
 }
 
 fn duration_ms(duration: Option<Duration>) -> u64 {
-    duration
-        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
+    duration.map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 #[cfg(test)]
@@ -265,7 +265,7 @@ mod tests {
         let view = View::from_snapshot(&snapshot, None);
         assert_eq!(view.state, "stopped");
         assert!(view.track.is_none());
-        assert!(view.position_ms == 0);
+        assert_eq!(view.position_ms, 0);
     }
 
     #[test]

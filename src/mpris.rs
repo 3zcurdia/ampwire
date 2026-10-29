@@ -526,14 +526,14 @@ mod tests {
         assert!(metadata.contains_key("xesam:artist"));
         assert!(metadata.contains_key("mpris:length"));
         let title = String::try_from(metadata["xesam:title"].try_clone().unwrap()).unwrap();
-        assert!(!title.is_empty());
+        assert!(!title.is_empty(), "xesam:title is empty");
     }
 
     #[test]
     fn stopped_view_has_empty_metadata() {
         let mut view = playing_view();
         view.state = "stopped".into();
-        assert!(metadata_map(&view).is_empty());
+        assert_eq!(metadata_map(&view).len(), 0);
     }
 
     #[test]
@@ -581,7 +581,7 @@ mod tests {
         let metadata: HashMap<String, OwnedValue> =
             HashMap::try_from(value).expect("Metadata is a{sv}");
         let title = String::try_from(metadata["xesam:title"].try_clone().unwrap()).unwrap();
-        assert!(!title.is_empty());
+        assert!(!title.is_empty(), "xesam:title is empty");
         assert!(metadata.contains_key("mpris:trackid"));
 
         let player =

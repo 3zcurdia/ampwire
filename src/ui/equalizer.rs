@@ -146,7 +146,7 @@ fn render_toggles_and_curve(app: &App, area: Rect, buf: &mut Buffer) {
 
 /// Normalize the 10 EQ bands (skipping the preamp) to -1.0..=1.0 for the curve.
 fn curve_bands(bands: &[i8; 11]) -> Vec<f32> {
-    bands[1..].iter().map(|db| *db as f32 / 12.0).collect()
+    bands[1..].iter().map(|db| f32::from(*db) / 12.0).collect()
 }
 
 /// Column of slider `i` of `n`, spread evenly so the first and last sit on
@@ -183,7 +183,7 @@ fn render_sliders(app: &App, area: Rect, buf: &mut Buffer) {
             ..area
         };
         VSlider {
-            value: *db as f32 / 12.0,
+            value: f32::from(*db) / 12.0,
             track: theme.color(Role::Primary),
             knob: theme.color(Role::Accent),
             focused: ui.eq_focus == i,

@@ -193,7 +193,7 @@ mod tests {
             title: Some(String::new()),
             duration: Some(Duration::from_secs(60)),
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -247,7 +247,7 @@ mod tests {
                 title: Some(format!("{album} track {number}")),
                 duration: None,
                 bitrate_kbps: None,
-                pos: Default::default(),
+                pos: crate::player::AlbumPos::default(),
             };
             t.pos.album = Some(album.into());
             t.pos.number = Some(number);
@@ -260,7 +260,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         };
 
         let mut p = Playlist::new();
@@ -334,7 +334,7 @@ mod tests {
         let mut p = playlist(&["a", "b"]);
         p.set_current(Some(1));
         p.clear();
-        assert!(p.is_empty());
+        assert_eq!(p.len(), 0);
         assert_eq!(p.current(), None);
     }
 
@@ -396,7 +396,7 @@ mod tests {
             title: Some(format!("title-{id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 

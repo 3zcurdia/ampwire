@@ -42,7 +42,7 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Read/write chunk while downloading (the plan's 256 KiB).
 const CHUNK: usize = 256 * 1024;
 /// Directories left behind by a crash are swept after this long.
-pub const STALE_AGE: Duration = Duration::from_secs(24 * 3600);
+pub const STALE_AGE: Duration = Duration::from_hours(24);
 /// Directory-name prefix this app creates — the *only* thing the sweep and
 /// the eviction will ever touch by name.
 pub const DIR_PREFIX: &str = "ampwire-smb-";
@@ -108,7 +108,7 @@ impl SmbCache {
         let thread_dir = dir.clone();
         let join = std::thread::Builder::new()
             .name("ampwire-smb-cache".into())
-            .spawn(move || run(cfg, thread_dir, max_bytes, cmd_rx, ev_tx))?;
+            .spawn(move || run(&cfg, &thread_dir, max_bytes, &cmd_rx, &ev_tx))?;
 
         Ok(SmbCache {
             tx: cmd_tx,
@@ -202,16 +202,16 @@ pub fn compute_smb_window(
 /// The downloader thread: wait for a window → evict → fetch in priority
 /// order, restarting whenever a newer window arrives.
 fn run(
-    cfg: SmbClientCfg,
-    dir: PathBuf,
+    cfg: &SmbClientCfg,
+    dir: &Path,
     max_bytes: u64,
-    rx: Receiver<SmbCacheCmd>,
-    tx: Sender<SmbCacheEvent>,
+    rx: &Receiver<SmbCacheCmd>,
+    tx: &Sender<SmbCacheEvent>,
 ) {
     cache_window::run(
         rx,
-        |list| evict(&dir, list),
-        |item, rx, wanted| fetch(&cfg, &dir, item, max_bytes, rx, &tx, wanted),
+        |list| evict(dir, list),
+        |item, rx, wanted| fetch(cfg, dir, item, max_bytes, rx, tx, wanted),
     );
 }
 
@@ -414,7 +414,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -426,7 +426,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -441,7 +441,7 @@ mod tests {
             title: None,
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -512,7 +512,10 @@ mod tests {
         let only_local = vec![local_track("/m/a.mp3")];
         let mut order = PlayOrder::new();
         order.appended(1, Some(0), &mut crate::player::rng::Rng::new(1));
-        assert!(compute_smb_window(&order, &arc(&only_local), Some(0), 3, 3).is_empty());
+        assert_eq!(
+            compute_smb_window(&order, &arc(&only_local), Some(0), 3, 3).len(),
+            0
+        );
     }
 
     /// Eviction deletes files (and `.part`s) whose URL left the window, and
@@ -622,9 +625,9 @@ mod tests {
         for dir in [&stale, &fresh, &unrelated, &not_a_pid, &other_window] {
             fs::create_dir_all(dir).unwrap();
         }
-        age_dir(&stale, Duration::from_secs(25 * 3600)); // > 24 h
-        age_dir(&not_a_pid, Duration::from_secs(25 * 3600)); // wrong pattern
-        age_dir(&other_window, Duration::from_secs(25 * 3600)); // other window
+        age_dir(&stale, Duration::from_hours(25)); // > 24 h
+        age_dir(&not_a_pid, Duration::from_hours(25)); // wrong pattern
+        age_dir(&other_window, Duration::from_hours(25)); // other window
 
         let removed = sweep_stale_dirs(parent.path(), STALE_AGE, DIR_PREFIX);
         assert_eq!(removed, 1, "exactly the stale crash leftover");
@@ -765,9 +768,9 @@ mod tests {
         match error {
             DownloadError::Failed(reason) => {
                 assert!(reason.contains("over the"), "reason: {reason}");
-                assert!(!reason.contains("nas") && !reason.contains("/"), "{reason}");
+                assert!(!reason.contains("nas") && !reason.contains('/'), "{reason}");
             }
-            other => panic!("expected a Failed cap notice: {other:?}"),
+            other @ DownloadError::Interrupted => panic!("expected a Failed cap notice: {other:?}"),
         }
         assert!(
             fs::read_dir(other.path())
@@ -795,7 +798,7 @@ mod tests {
                 assert_eq!(url.canonical(), "smb://nas/Music/a.flac");
                 assert_eq!(path, PathBuf::from("/tmp/x.flac"));
             }
-            other => panic!("expected Ready: {other:?}"),
+            other @ SmbCacheEvent::Failed { .. } => panic!("expected Ready: {other:?}"),
         }
         match failed {
             SmbCacheEvent::Failed { error, .. } => {
@@ -804,7 +807,7 @@ mod tests {
                     "{error}"
                 );
             }
-            other => panic!("expected Failed: {other:?}"),
+            other @ SmbCacheEvent::Ready { .. } => panic!("expected Failed: {other:?}"),
         }
         // The command shapes the player sends.
         let window = SmbCacheCmd::Window(vec![SmbRef { url: url("a.flac") }]);

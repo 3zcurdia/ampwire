@@ -33,8 +33,7 @@ pub fn lcd_width(text: &str) -> u16 {
     let mut glyphs = 0u16;
     for c in text.chars() {
         width += match c {
-            ':' | '.' => 1,
-            ' ' => 1,
+            ':' | '.' | ' ' => 1,
             _ => 3,
         };
         glyphs += 1;

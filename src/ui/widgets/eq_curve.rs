@@ -57,7 +57,7 @@ impl Widget for EqCurve<'_> {
                     i as f32 * (dots_w as f32 - 1.0) / (n - 1) as f32
                 };
                 let v = v.clamp(-1.0, 1.0);
-                let y = (1.0 - (v + 1.0) / 2.0) * (dots_h as f32 - 1.0);
+                let y = (1.0 - f32::midpoint(v, 1.0)) * (dots_h as f32 - 1.0);
                 (x, y)
             })
             .collect();

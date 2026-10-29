@@ -109,7 +109,7 @@ pub struct Equalizer {
 impl Equalizer {
     pub fn new(sample_rate: u32, channels: usize) -> Self {
         Self {
-            fs: sample_rate.max(1) as f64,
+            fs: f64::from(sample_rate.max(1)),
             channels,
             preamp: 1.0,
             filters: (0..channels.max(1))
@@ -124,9 +124,9 @@ impl Equalizer {
     /// clamped to ±12 dB. A band is marked inactive — and skipped in
     /// `process` — when its gain is 0 or `f0 >= 0.45 * fs`.
     pub fn set_gains(&mut self, gains: [i8; 11]) {
-        self.preamp = 10f64.powf(gains[0].clamp(GAIN_MIN, GAIN_MAX) as f64 / 20.0);
+        self.preamp = 10f64.powf(f64::from(gains[0].clamp(GAIN_MIN, GAIN_MAX)) / 20.0);
         for (i, &f0) in BAND_HZ.iter().enumerate() {
-            let db = gains[i + 1].clamp(GAIN_MIN, GAIN_MAX) as f64;
+            let db = f64::from(gains[i + 1].clamp(GAIN_MIN, GAIN_MAX));
             self.active[i] = db != 0.0 && f0 < NYQUIST_GUARD * self.fs;
             let coeffs = if self.active[i] {
                 peaking(f0, db, self.fs)
@@ -142,6 +142,10 @@ impl Equalizer {
     /// Interleaved in-place: preamp → each active band, in order → clamp to
     /// ±1.0. A trailing partial frame is processed sample-wise (the caller
     /// only ever passes whole frames).
+    #[allow(
+        clippy::float_cmp,
+        reason = "a flat EQ is exactly 1.0 preamp with no active band; exactness gates the bypass"
+    )]
     pub fn process(&mut self, frames: &mut [f32]) {
         // Nothing to do: don't touch a single sample (bit-perfect).
         if self.preamp == 1.0 && !self.active.iter().any(|&a| a) {
@@ -150,7 +154,7 @@ impl Equalizer {
         let channels = self.channels.max(1);
         for (i, sample) in frames.iter_mut().enumerate() {
             let channel = &mut self.filters[i % channels];
-            let mut x = *sample as f64 * self.preamp;
+            let mut x = f64::from(*sample) * self.preamp;
             for (band, biquad) in channel.iter_mut().enumerate() {
                 if self.active[band] {
                     x = biquad.run(x);
@@ -185,13 +189,14 @@ mod tests {
         let amplitude = 0.25;
         let mut buffer: Vec<f32> = (0..n)
             .map(|i| {
-                (2.0 * std::f64::consts::PI * freq * i as f64 / FS as f64).sin() as f32 * amplitude
+                (2.0 * std::f64::consts::PI * freq * f64::from(i) / f64::from(FS)).sin() as f32
+                    * amplitude
             })
             .collect();
         eq.process(&mut buffer);
         let mut out = 0.0;
         // A sine's mean square is amplitude²/2.
-        let input_mean_square = amplitude as f64 * amplitude as f64 / 2.0;
+        let input_mean_square = f64::from(amplitude) * f64::from(amplitude) / 2.0;
         let mut input = 0.0;
         for &s in &buffer[4096..] {
             out += f64::from(s) * f64::from(s);
@@ -212,7 +217,7 @@ mod tests {
     /// Cookbook check: at 0 dB the peaking filter *is* the identity.
     #[test]
     fn peaking_at_zero_db_is_identity() {
-        let c = peaking(1000.0, 0.0, FS as f64);
+        let c = peaking(1000.0, 0.0, f64::from(FS));
         assert!((c.b0 - 1.0).abs() < 1e-12, "b0 = {}", c.b0);
         assert!((c.b1 - c.a1).abs() < 1e-12, "b1 = {}", c.b1);
         assert!((c.b2 - c.a2).abs() < 1e-12, "b2 = {}", c.b2);
@@ -227,8 +232,8 @@ mod tests {
             (1000.0, -12.0),
             (16_000.0, 6.0),
         ] {
-            let c = peaking(f0, db, FS as f64);
-            let w0 = 2.0 * std::f64::consts::PI * f0 / FS as f64;
+            let c = peaking(f0, db, f64::from(FS));
+            let w0 = 2.0 * std::f64::consts::PI * f0 / f64::from(FS);
             let gain = magnitude(&c, w0);
             assert!(
                 (gain - 10f64.powf(db / 20.0)).abs() < 1e-9,
@@ -274,7 +279,8 @@ mod tests {
         let n = 16_384;
         let mut buffer: Vec<f32> = (0..n)
             .map(|i| {
-                (2.0 * std::f64::consts::PI * 440.0 * i as f64 / FS as f64).sin() as f32 * 0.25
+                (2.0 * std::f64::consts::PI * 440.0 * f64::from(i) / f64::from(FS)).sin() as f32
+                    * 0.25
             })
             .collect();
         let expected: f64 = 0.25 * 10f64.powf(6.0 / 20.0) / 2.0f64.sqrt();
@@ -283,7 +289,7 @@ mod tests {
         for &s in &buffer[4096..] {
             out += f64::from(s) * f64::from(s);
         }
-        let rms = (out / (n - 4096) as f64).sqrt();
+        let rms = (out / f64::from(n - 4096)).sqrt();
         assert!(
             (rms - expected).abs() / expected < 0.05,
             "preamp +6 dB should be ×2 (rms {rms} vs {expected})"
@@ -306,13 +312,13 @@ mod tests {
     #[test]
     fn full_scale_boost_stays_within_plus_minus_one() {
         let mut gains = flat_gains();
-        for g in gains.iter_mut() {
-            *g = 12;
-        }
+        gains.fill(12);
         let mut eq = eq(gains, 2);
         let n = 32_768;
         let mut buffer: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / FS as f64).sin() as f32)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * 1000.0 * f64::from(i) / f64::from(FS)).sin() as f32
+            })
             .collect();
         eq.process(&mut buffer);
         assert!(
@@ -384,7 +390,7 @@ mod tests {
         let mut buffer: Vec<f32> = Vec::with_capacity(frames * 2);
         for i in 0..frames {
             let left =
-                (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / FS as f64).sin() as f32 * 0.2;
+                (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / f64::from(FS)).sin() as f32 * 0.2;
             buffer.push(left);
             buffer.push(0.0);
         }

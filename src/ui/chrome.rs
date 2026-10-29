@@ -25,10 +25,9 @@ fn superscript(action: Action, keymap: &Keymap) -> String {
 
 fn toggle_action(panel: Panel) -> Action {
     match panel {
-        Panel::Player => Action::TogglePlayer,
         Panel::Eq => Action::ToggleEq,
         Panel::Playlist => Action::TogglePlaylist,
-        Panel::Unknown => Action::TogglePlayer,
+        Panel::Player | Panel::Unknown => Action::TogglePlayer,
     }
 }
 

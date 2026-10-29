@@ -47,6 +47,10 @@ const RELEASE: f32 = 0.45;
 /// Peak caps fall at this factor per frame (mock copy).
 const PEAK_FALL: f32 = 0.06;
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the player holds independent flags (shuffle, repeat, bit-perfect source, notice shown) mirrored in the snapshot"
+)]
 pub struct RealPlayer {
     playlist: Playlist,
     state: PlayState,
@@ -190,7 +194,7 @@ impl RealPlayer {
                         player.cache = Some(cache);
                     }
                     Err(reason) => {
-                        player.notice = Some(format!("jellyfin: cache unavailable ({reason})"))
+                        player.notice = Some(format!("jellyfin: cache unavailable ({reason})"));
                     }
                 }
             }
@@ -347,7 +351,7 @@ impl RealPlayer {
                     .iter()
                     .map(|track| track.is_jellyfin())
                     .collect();
-                let was_current = self.playlist.remove_where(|track| track.is_jellyfin());
+                let was_current = self.playlist.remove_where(super::Track::is_jellyfin);
                 self.order
                     .removed(&removed, self.playlist.current(), &mut self.rng);
                 self.update_cache_window();
@@ -414,7 +418,7 @@ impl RealPlayer {
             PlayerCommand::SetEq { enabled, gains } => self.set_eq(enabled, gains),
             _ => {}
         }
-        self.handle_transport(cmd);
+        self.handle_transport(&cmd);
     }
 
     /// Volume 0–=100 → the shared gain target (0 = silence, 100 = unity).
@@ -466,11 +470,11 @@ impl RealPlayer {
     }
 
     /// Transport — everything that needs a non-empty playlist.
-    fn handle_transport(&mut self, cmd: PlayerCommand) {
+    fn handle_transport(&mut self, cmd: &PlayerCommand) {
         if self.playlist.is_empty() {
             return;
         }
-        match cmd {
+        match *cmd {
             PlayerCommand::Play => match self.state {
                 PlayState::Paused => {
                     self.engine.send(EngineCmd::Resume);
@@ -497,8 +501,8 @@ impl RealPlayer {
             }
             PlayerCommand::Stop => self.stop_playback(),
             PlayerCommand::TogglePlayPause => match self.state {
-                PlayState::Playing => self.handle_transport(PlayerCommand::Pause),
-                _ => self.handle_transport(PlayerCommand::Play),
+                PlayState::Playing => self.handle_transport(&PlayerCommand::Pause),
+                _ => self.handle_transport(&PlayerCommand::Play),
             },
             // End of track and manual Next share one rule (plan §Decisions).
             PlayerCommand::Next => self.advance_after_end(),
@@ -514,7 +518,6 @@ impl RealPlayer {
                 self.order.jump_to(i);
                 self.start_track(i);
             }
-            PlayerCommand::PlayTrack(_) => {}
             PlayerCommand::SeekBy(delta) => self.seek_by(delta),
             PlayerCommand::SeekTo(target) => self.seek_to(target),
             PlayerCommand::ToggleShuffle => {
@@ -583,7 +586,7 @@ impl RealPlayer {
     pub fn tick(&mut self, _dt: Duration) {
         for event in self.engine.poll() {
             match event {
-                EngineEvent::Started(info, handle) => self.on_started(info, handle),
+                EngineEvent::Started(info, handle) => self.on_started(&info, handle),
                 // Plan 09, step 4: remember the switch; the track change
                 // itself happens when the clock reaches the boundary.
                 EngineEvent::Advanced(info) => self.pending_advance = Some(info),
@@ -652,7 +655,7 @@ impl RealPlayer {
     /// decoder's accurate duration when the tag had none or lied (the tag
     /// is off by more than a second) — and the gapless queue for what
     /// plays next (plan 09, step 5).
-    fn on_started(&mut self, info: StreamInfo, handle: PlaybackHandle) {
+    fn on_started(&mut self, info: &StreamInfo, handle: PlaybackHandle) {
         self.fail_streak = 0;
         // Buffering is over: retire that exact notice if it is still up
         // (anything else queued meanwhile keeps its place).
@@ -668,7 +671,7 @@ impl RealPlayer {
         let current = self.playlist.current();
         self.handle = Some(handle);
         self.pending_start = None; // the live clock takes over
-        self.apply_format(&info, current);
+        self.apply_format(info, current);
         // `stream_pure` (plan 08): first remote track of the session — say
         // what is different about it. Shown at `Started`, so it is never
         // clobbered by (and never hides) the `buffering…` it follows.
@@ -734,8 +737,7 @@ impl RealPlayer {
             .playlist
             .current()
             .and_then(|i| self.playlist.tracks().get(i))
-            .map(|t| t.display_name())
-            .unwrap_or_else(|| "track".into());
+            .map_or_else(|| "track".into(), |t| t.display_name());
         if self.fail_streak >= self.playlist.len() {
             // Keep the last reason in the give-up notice: without it the
             // user only sees silence and "no playable tracks" — e.g. a
@@ -898,16 +900,15 @@ impl RealPlayer {
                         .as_ref()
                         .and_then(|config| config.cache_dir.clone());
                     let cfg = crate::smb::SmbClientCfg::for_url(url, self.smb.as_ref());
-                    match SmbCache::new(cfg, parent) {
-                        Ok(cache) => self.smb_cache = Some(cache),
-                        Err(_) => {
-                            // No window to download into: stop with the
-                            // reason instead of skipping through every SMB
-                            // track in the list (the plan's cache rule).
-                            self.stop_playback();
-                            self.notice = Some("smb: cache unavailable".into());
-                            return false;
-                        }
+                    if let Ok(cache) = SmbCache::new(cfg, parent) {
+                        self.smb_cache = Some(cache);
+                    } else {
+                        // No window to download into: stop with the reason
+                        // instead of skipping through every SMB track in the
+                        // list (the plan's cache rule).
+                        self.stop_playback();
+                        self.notice = Some("smb: cache unavailable".into());
+                        return false;
                     }
                 }
                 let ready = self
@@ -1263,7 +1264,7 @@ fn position(start_offset: Duration, played_frames: u64, sample_rate: u32) -> Dur
     if sample_rate == 0 {
         return start_offset;
     }
-    start_offset + Duration::from_secs_f64(played_frames as f64 / sample_rate as f64)
+    start_offset + Duration::from_secs_f64(played_frames as f64 / f64::from(sample_rate))
 }
 
 /// Wall-clock seed for shuffle (tests build players through `with_engine` and
@@ -1271,8 +1272,7 @@ fn position(start_offset: Duration, played_frames: u64, sample_rate: u32) -> Dur
 fn wall_clock_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        .map_or(0x9E37_79B9_7F4A_7C15, |since| since.as_nanos() as u64)
 }
 
 #[cfg(test)]
@@ -1336,7 +1336,7 @@ mod tests {
                 title: Some(format!("Track {i}")),
                 duration: None,
                 bitrate_kbps: None,
-                pos: Default::default(),
+                pos: crate::player::AlbumPos::default(),
             })
             .collect()
     }
@@ -1763,7 +1763,7 @@ mod tests {
 
         player.handle(PlayerCommand::ReplaceTracks(vec![]));
         assert_eq!(player.state, PlayState::Stopped);
-        assert!(player.playlist.is_empty());
+        assert_eq!(player.playlist.len(), 0);
         assert!(matches!(log_of(&cmds).last(), Some(EngineCmd::Stop)));
     }
 
@@ -1790,7 +1790,7 @@ mod tests {
         player.handle(PlayerCommand::Play);
         player.handle(PlayerCommand::ClearPlaylist);
         assert_eq!(player.state, PlayState::Stopped);
-        assert!(player.playlist.is_empty());
+        assert_eq!(player.playlist.len(), 0);
         // Transport on the empty list is a no-op, never a panic.
         player.handle(PlayerCommand::Next);
         player.handle(PlayerCommand::Play);
@@ -2220,10 +2220,10 @@ mod tests {
     fn advanced_moves_the_current_track_exactly_at_the_boundary() {
         let (mut player, cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
-        let played = Arc::new(AtomicU64::new(0));
+        let heard = Arc::new(AtomicU64::new(0));
         let boundary = Arc::new(AtomicU64::new(110_250)); // 2.5 s in
         let handle = PlaybackHandle {
-            played: Arc::clone(&played),
+            played: Arc::clone(&heard),
             boundary: Arc::clone(&boundary),
             sample_rate: 44_100,
             start_offset: Duration::ZERO,
@@ -2248,12 +2248,12 @@ mod tests {
         assert_eq!(&*player.snapshot().format.codec, "FLAC", "not yet");
 
         // One frame short of the boundary: still the old track.
-        played.store(110_249, Ordering::Relaxed);
+        heard.store(110_249, Ordering::Relaxed);
         player.tick(Duration::ZERO);
         assert_eq!(player.playlist.current(), Some(0), "one frame early");
 
         // Exactly the boundary frame: the track change happens now.
-        played.store(110_250, Ordering::Relaxed);
+        heard.store(110_250, Ordering::Relaxed);
         player.tick(Duration::ZERO);
         assert_eq!(player.playlist.current(), Some(1), "crossed");
         let snapshot = player.snapshot();
@@ -2265,7 +2265,7 @@ mod tests {
         );
 
         // The clock keeps counting from the boundary (not from frame 0).
-        played.store(110_250 + 44_100, Ordering::Relaxed);
+        heard.store(110_250 + 44_100, Ordering::Relaxed);
         assert_eq!(player.snapshot().position, Duration::from_secs(1));
 
         // The queue moved on to the track after that.
@@ -2374,6 +2374,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the test sets the bars to exactly 1.0 and checks they stay there"
+    )]
     fn playing_bars_move_only_when_analysed() {
         let (mut player, _cmds, events, ..) = three_tracks();
         player.handle(PlayerCommand::Play);
@@ -2405,7 +2409,7 @@ mod tests {
             title: Some(format!("R {id}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 
@@ -2417,7 +2421,7 @@ mod tests {
     fn shuffle_view(player: &RealPlayer) -> (Vec<u64>, Vec<u64>) {
         let tracks = player.playlist.tracks();
         let len = tracks.len();
-        let mut played: Vec<u64> = player
+        let mut history: Vec<u64> = player
             .order
             .previous(len)
             .collect::<Vec<_>>()
@@ -2426,10 +2430,10 @@ mod tests {
             .map(|&i| tracks[i].id)
             .collect();
         if let Some(current) = player.playlist.current() {
-            played.push(tracks[current].id);
+            history.push(tracks[current].id);
         }
         let upcoming = player.order.upcoming(len).map(|i| tracks[i].id).collect();
-        (played, upcoming)
+        (history, upcoming)
     }
 
     /// Audit P3: in shuffle, editing the playlist must not reshuffle what is
@@ -2444,16 +2448,16 @@ mod tests {
         player.handle(PlayerCommand::Play);
         player.handle(PlayerCommand::Next);
         player.handle(PlayerCommand::Next);
-        let (played, upcoming) = shuffle_view(&player);
-        assert_eq!(played.len(), 3);
+        let (history, upcoming) = shuffle_view(&player);
+        assert_eq!(history.len(), 3);
 
         // Append: old upcoming keeps its relative order, new ids join it.
         let added = tracks(5);
         let added_ids: Vec<u64> = added.iter().map(|t| t.id).collect();
         player.handle(PlayerCommand::AppendInOrder(added));
-        let (played_after, upcoming_after) = shuffle_view(&player);
+        let (history_after, upcoming_after) = shuffle_view(&player);
         assert_eq!(
-            played_after, played,
+            history_after, history,
             "history and current survive an append"
         );
         let old_only: Vec<u64> = upcoming_after
@@ -2478,7 +2482,7 @@ mod tests {
             .unwrap();
         player.handle(PlayerCommand::RemoveTrack(index));
         let (played_now, upcoming_now) = shuffle_view(&player);
-        assert_eq!(played_now, played);
+        assert_eq!(played_now, history);
         let expected: Vec<u64> = upcoming_after
             .iter()
             .copied()
@@ -2504,7 +2508,7 @@ mod tests {
         std::fs::create_dir(&stale).unwrap();
         std::fs::File::open(&stale)
             .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600))
+            .set_modified(std::time::SystemTime::now() - Duration::from_hours(25))
             .unwrap();
         let config = JellyfinConfig {
             url: "http://127.0.0.1:9".into(),
@@ -2733,7 +2737,7 @@ mod tests {
             title: Some(format!("S {title}")),
             duration: None,
             bitrate_kbps: None,
-            pos: Default::default(),
+            pos: crate::player::AlbumPos::default(),
         }
     }
 

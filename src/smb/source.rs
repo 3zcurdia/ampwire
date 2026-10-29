@@ -169,9 +169,9 @@ impl SmbFileSource {
 /// wrap into a huge offset on the next positioned read).
 fn cursor_pos(from: SeekFrom, pos: u64, len: u64) -> u64 {
     let target = match from {
-        SeekFrom::Start(p) => p as i128,
-        SeekFrom::End(offset) => len as i128 + offset as i128,
-        SeekFrom::Current(offset) => pos as i128 + offset as i128,
+        SeekFrom::Start(p) => i128::from(p),
+        SeekFrom::End(offset) => i128::from(len) + i128::from(offset),
+        SeekFrom::Current(offset) => i128::from(pos) + i128::from(offset),
     };
     target.max(0) as u64
 }
@@ -452,7 +452,7 @@ mod tests {
         assert!(total > Duration::from_secs(10), "{song} is only {total:?}");
         let mut from_start = Vec::new();
         while decoder.read(&mut from_start).expect("decodes") {}
-        assert!(!from_start.is_empty());
+        assert!(!from_start.is_empty(), "{song} decodes to no samples");
 
         let mut decoder = match open_song(&client, &unc, &song, Duration::from_secs(5)) {
             Ok(decoder) => decoder,

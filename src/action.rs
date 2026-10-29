@@ -222,7 +222,14 @@ impl Action {
 
     /// All actions, in a stable display order for the help overlay.
     pub fn all() -> &'static [Action] {
-        use Action::*;
+        use Action::{
+            Add, BalanceLeft, BalanceRight, BandDown, BandLeft, BandRight, BandUp, Clear,
+            ClearFilter, CursorDown, CursorUp, CycleOrder, Del, EqPresets, EqReset, EqToggle, Find,
+            FocusNext, FocusPrev, Help, JumpEnd, JumpHome, LoadJellyfin, MoveDown, MoveUp, Next,
+            Open, PageDown, PageUp, Pause, Play, PlayPause, Prev, Quit, SeekBack, SeekFwd, Select,
+            Stop, ToggleColumns, ToggleEq, TogglePlayer, TogglePlaylist, ToggleRepeat,
+            ToggleShuffle, ToggleTimeMode, VolumeDown, VolumeUp,
+        };
         &[
             PlayPause,
             Prev,

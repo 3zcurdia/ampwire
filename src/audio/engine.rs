@@ -206,7 +206,7 @@ impl Engine {
         let (ev_tx, ev_rx) = channel();
         let join = std::thread::Builder::new()
             .name("ampwire-engine".into())
-            .spawn(move || run(cmd_rx, ev_tx, params, stream, smb))
+            .spawn(move || run(&cmd_rx, &ev_tx, &params, stream.as_ref(), smb.as_ref()))
             .expect("spawn the audio engine thread");
         Engine {
             tx: cmd_tx,
@@ -245,7 +245,7 @@ impl Drop for Engine {
 /// flag.
 struct Playing {
     /// Kept alive (and dropped) on this thread — macOS `Stream` is `!Send`.
-    _stream: cpal::Stream,
+    stream: cpal::Stream,
     feeder: Feeder,
     /// Set by cpal's error callback; checked (and cleared) by the loop.
     device_error: Arc<AtomicBool>,
@@ -345,7 +345,7 @@ impl Feeder {
         self.eof = false;
         // Everything pushed is eventually played, so "samples pushed so
         // far" is the frames-played value at which the new track starts.
-        let channels = self.decoder.info().channels.max(1) as u64;
+        let channels = u64::from(self.decoder.info().channels.max(1));
         self.boundary
             .store(self.pushed / channels, Ordering::Release);
         self.switched = Some(self.decoder.info().clone());
@@ -444,8 +444,7 @@ fn query_device() -> Result<DeviceData, PlayError> {
     // jack that only advertises 44.1/48 kHz fed from a 96 kHz file).
     let label = device
         .description()
-        .map(|d| d.name().to_string())
-        .unwrap_or_else(|_| "default output".into());
+        .map_or_else(|_| "default output".into(), |d| d.name().to_string());
     let ranges = device
         .supported_output_configs()
         .map_err(|e| format!("stream error: {e}"))?
@@ -473,13 +472,17 @@ impl Drop for PendingDownload {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the engine thread's single state machine (commands, feed, boundary, errors); splitting it would hide the ordering the comments rely on"
+)]
 /// The engine thread loop: commands → feed the ring → sleep.
 fn run(
-    cmd_rx: Receiver<EngineCmd>,
-    ev_tx: Sender<EngineEvent>,
-    params: Arc<SharedParams>,
-    stream: Option<StreamSetup>,
-    smb: Option<SmbSetup>,
+    cmd_rx: &Receiver<EngineCmd>,
+    ev_tx: &Sender<EngineEvent>,
+    params: &Arc<SharedParams>,
+    stream: Option<&StreamSetup>,
+    smb: Option<&SmbSetup>,
 ) {
     // Ring policy for the whole session: any session that can stream a
     // track gets the ≈2 s ring, so a network hiccup cannot starve the
@@ -514,7 +517,7 @@ fn run(
                     download = None;
                     let ctx = StartCtx {
                         paused: &paused,
-                        params: &params,
+                        params,
                         devices: &mut devices,
                         streaming,
                     };
@@ -546,11 +549,11 @@ fn run(
                     };
                     let ctx = StartCtx {
                         paused: &paused,
-                        params: &params,
+                        params,
                         devices: &mut devices,
                         streaming,
                     };
-                    match open_remote(stream.as_ref(), &mut fallback_dir, remote, ctx, &ev_tx) {
+                    match open_remote(stream, &mut fallback_dir, &remote, ctx, ev_tx) {
                         Ok(Opened::Playing(opened)) => {
                             let (playing, handle) = *opened;
                             let _ =
@@ -572,11 +575,11 @@ fn run(
                     let _ = ev_tx.send(EngineEvent::Buffering);
                     let ctx = StartCtx {
                         paused: &paused,
-                        params: &params,
+                        params,
                         devices: &mut devices,
                         streaming,
                     };
-                    match open_smb(smb.as_ref(), &url, start, ctx) {
+                    match open_smb(smb, &url, start, ctx) {
                         Ok((playing, handle)) => {
                             let _ =
                                 ev_tx.send(EngineEvent::Started(playing.info().clone(), handle));
@@ -596,8 +599,7 @@ fn run(
                     // live stream; a queue while stopped is meaningless and
                     // silently dropped.
                     if let Some(playing) = &mut state {
-                        match open_queued(&source, start, eq_bypass, stream.as_ref(), smb.as_ref())
-                        {
+                        match open_queued(&source, start, eq_bypass, stream, smb) {
                             Ok(Some(queued)) => playing.feeder.queue(queued),
                             // Not gapless-capable (e.g. a server without
                             // `Range`): queue nothing and let the drain take
@@ -641,7 +643,7 @@ fn run(
             download = None;
             let ctx = StartCtx {
                 paused: &paused,
-                params: &params,
+                params,
                 devices: &mut devices,
                 streaming,
             };
@@ -709,15 +711,12 @@ fn run(
             let held = state
                 .as_mut()
                 .and_then(|playing| playing.feeder.queue_error.take());
-            match held {
-                Some(reason) => {
-                    let _ = ev_tx.send(EngineEvent::Error(reason));
-                    state = None;
-                }
-                None => {
-                    let _ = ev_tx.send(EngineEvent::Finished);
-                    state = None;
-                }
+            if let Some(reason) = held {
+                let _ = ev_tx.send(EngineEvent::Error(reason));
+                state = None;
+            } else {
+                let _ = ev_tx.send(EngineEvent::Finished);
+                state = None;
             }
         }
 
@@ -910,7 +909,7 @@ enum Opened {
 fn open_remote(
     stream: Option<&StreamSetup>,
     fallback_dir: &mut Option<PathBuf>,
-    remote: RemoteLoad<'_>,
+    remote: &RemoteLoad<'_>,
     ctx: StartCtx<'_>,
     ev_tx: &Sender<EngineEvent>,
 ) -> Result<Opened, PlayError> {
@@ -927,17 +926,16 @@ fn open_remote(
             let _ = ev_tx.send(EngineEvent::Notice(
                 "jellyfin: server does not support ranges, downloading".into(),
             ));
-            let dir = match fallback_dir {
-                Some(dir) => dir.clone(),
-                None => {
-                    let parent = stream
-                        .fallback_parent
-                        .clone()
-                        .unwrap_or_else(std::env::temp_dir);
-                    let dir = create_own_dir(&parent, JELLYFIN_DIR_PREFIX)
-                        .map_err(|_| "jellyfin: cache unavailable".to_string())?;
-                    fallback_dir.insert(dir).clone()
-                }
+            let dir = if let Some(dir) = fallback_dir {
+                dir.clone()
+            } else {
+                let parent = stream
+                    .fallback_parent
+                    .clone()
+                    .unwrap_or_else(std::env::temp_dir);
+                let dir = create_own_dir(&parent, JELLYFIN_DIR_PREFIX)
+                    .map_err(|_| "jellyfin: cache unavailable".to_string())?;
+                fallback_dir.insert(dir).clone()
             };
             let (done_tx, done) = channel();
             let cancel = Arc::new(AtomicBool::new(false));
@@ -1042,7 +1040,7 @@ fn finish_start(
                     &callback_played,
                     channels,
                     &mut dsp,
-                )
+                );
             },
             move |_err| callback_error.store(true, Ordering::Relaxed),
             None,
@@ -1064,7 +1062,7 @@ fn finish_start(
         eq_bypass: false,
     };
     let mut playing = Playing {
-        _stream: stream,
+        stream,
         feeder,
         device_error,
     };
@@ -1081,7 +1079,7 @@ fn finish_start(
     }
 
     playing
-        ._stream
+        .stream
         .play()
         .map_err(|e| format!("{label}: stream error: {e}"))?;
 
@@ -1312,6 +1310,8 @@ mod tests {
     /// miss) — so even a non-gapless reopen skips the slow queries.
     #[test]
     fn the_device_cache_queries_once_until_invalidated() {
+        // Always Ok by design: `get_or_query` takes a fallible query.
+        #[allow(clippy::unnecessary_wraps)]
         fn counted(queries: &mut usize, value: u32) -> Result<u32, ()> {
             *queries += 1;
             Ok(value)
@@ -1467,7 +1467,7 @@ mod tests {
         file.write_all(&data_len.to_le_bytes()).unwrap();
         for i in 0..frames {
             let sample = (i as f32 * 0.05).sin() * 0.5;
-            file.write_all(&((sample * i16::MAX as f32) as i16).to_le_bytes())
+            file.write_all(&((sample * f32::from(i16::MAX)) as i16).to_le_bytes())
                 .unwrap();
         }
     }
@@ -1890,7 +1890,7 @@ mod tests {
         );
         match events.get(1) {
             Some(EngineEvent::Error(reason)) => {
-                assert_eq!(reason.to_string(), "smb: cannot connect")
+                assert_eq!(reason.to_string(), "smb: cannot connect");
             }
             other => panic!("expected the connect failure: {other:?}"),
         }
@@ -1906,15 +1906,14 @@ mod tests {
         let setup = SmbSetup {
             cfg: crate::smb::SmbClientCfg::new("127.0.0.1", "", ""),
         };
-        let error = match open_queued(
+        let Err(error) = open_queued(
             &QueueSource::Smb(smb_test_url()),
             Duration::ZERO,
             false,
             None,
             Some(&setup),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("127.0.0.1 refuses, so nothing can be queued"),
+        ) else {
+            panic!("127.0.0.1 refuses, so nothing can be queued")
         };
         assert_eq!(error.to_string(), "smb: cannot connect");
     }
@@ -1991,15 +1990,14 @@ mod tests {
     /// engine *has* the credentials).
     #[test]
     fn queueing_an_smb_stream_without_a_setup_is_one_fixed_line() {
-        let error = match open_queued(
+        let Err(error) = open_queued(
             &QueueSource::Smb(smb_test_url()),
             Duration::ZERO,
             false,
             None,
             None,
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("no setup must not open a queue"),
+        ) else {
+            panic!("no setup must not open a queue")
         };
         assert_eq!(
             error,
