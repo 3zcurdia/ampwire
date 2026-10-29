@@ -1,6 +1,6 @@
 [package]
 name = "ampwire"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A terminal player inspired by Winamp 2, implemented from scratch for the terminal"
 license = "MIT"
