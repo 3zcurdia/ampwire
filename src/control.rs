@@ -30,8 +30,6 @@ use crate::smb::{LoadInput, parse_load_input};
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// A status/control request is tiny; refuse anything larger.
 const MAX_REQUEST: usize = 64 * 1024;
-/// Non-blocking accept: sleep instead of spinning.
-const ACCEPT_SLEEP: Duration = Duration::from_millis(20);
 
 /// What `start` did. `AlreadyRunning` means the paths were forwarded.
 pub enum Start {
@@ -52,7 +50,13 @@ pub struct ControlServer {
 impl Drop for ControlServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
+        // The accept is blocking: one throwaway connection wakes it so it
+        // sees `stop`. If that connect fails (the socket file is gone) the
+        // thread is left to exit with the process rather than joined forever.
+        let woke = UnixStream::connect(&self.path).is_ok();
+        if let Some(thread) = self.thread.take()
+            && woke
+        {
             let _ = thread.join();
         }
         let _ = fs::remove_file(&self.path);
@@ -215,7 +219,6 @@ fn start_at(path: &Path, view: SharedView, tx: Sender<RemoteCommand>) -> io::Res
 fn bind(path: &Path, view: SharedView, tx: Sender<RemoteCommand>) -> io::Result<ControlServer> {
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let thread = thread::spawn(move || accept_loop(listener, thread_stop, view, tx));
@@ -232,12 +235,17 @@ fn accept_loop(
     view: SharedView,
     tx: Sender<RemoteCommand>,
 ) {
-    while !stop.load(Ordering::Relaxed) {
+    // Blocks in `accept` (no polling): an idle session costs no wake-ups.
+    // `ControlServer::drop` ends the loop with one connection of its own.
+    loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let _ = handle_client(stream, &view, &tx);
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_SLEEP),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
