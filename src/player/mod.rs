@@ -43,7 +43,8 @@ pub struct FormatInfo {
 
 impl FormatInfo {
     /// Nothing known yet: shown when stopped, or between `Load` and the
-    /// engine's `Started` event.
+    /// engine's `Started` event. An empty codec means "nothing playing": the
+    /// UI renders no format line.
     pub fn blank() -> Self {
         Self {
             codec: String::new(),
@@ -54,11 +55,6 @@ impl FormatInfo {
             bitrate_kbps: None,
             lossless: false,
         }
-    }
-
-    /// "Nothing playing": codec empty, so the UI renders no format line.
-    pub fn empty() -> Self {
-        Self::blank()
     }
 
     /// The parts of the format line, widest first: codec, depth/rate
@@ -756,7 +752,7 @@ mod tests {
             ..FormatInfo::default()
         };
         assert_eq!(mono.describe(), "FLAC  24/96  mono");
-        assert_eq!(FormatInfo::empty().describe(), "", "no format line");
-        assert!(FormatInfo::empty().format_parts().is_empty());
+        assert_eq!(FormatInfo::blank().describe(), "", "no format line");
+        assert!(FormatInfo::blank().format_parts().is_empty());
     }
 }

@@ -245,7 +245,7 @@ impl RealPlayer {
 
     pub fn snapshot(&self) -> PlayerSnapshot {
         let format = if self.state == PlayState::Stopped {
-            FormatInfo::empty()
+            FormatInfo::blank()
         } else {
             let mut format = self.format.clone();
             // Bit-perfect marker (plan 05/06): only a lossless source with
