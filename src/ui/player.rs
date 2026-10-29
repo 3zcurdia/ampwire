@@ -112,7 +112,7 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
 
     // --- Row 1: state glyph + LCD digits, spectrum on the right.
     let glyph_cell = &mut buf[(time_area.x, time_area.y)];
-    glyph_cell.set_symbol(&state_glyph(snapshot.state).to_string());
+    glyph_cell.set_char(state_glyph(snapshot.state));
     glyph_cell.set_fg(state_color(snapshot.state, theme));
 
     let time_text = format_time(shown_secs(app));
@@ -295,7 +295,7 @@ fn render_seek(app: &App, area: Rect, buf: &mut Buffer, time_pair: &str) {
     for i in 0..track_width {
         let cell = &mut buf[(area.x + i, area.y)];
         if i == knob_x {
-            cell.set_symbol(&glyphs::KNOB.to_string());
+            cell.set_char(glyphs::KNOB);
             cell.set_fg(theme.color(Role::Accent));
         } else {
             cell.set_symbol("━");
@@ -305,7 +305,7 @@ fn render_seek(app: &App, area: Rect, buf: &mut Buffer, time_pair: &str) {
     let x = area.x + track_width + 1;
     for (x, c) in (x..area.x + area.width).zip(time_pair.chars()) {
         let cell = &mut buf[(x, area.y)];
-        cell.set_symbol(&c.to_string());
+        cell.set_char(c);
         cell.set_fg(theme.color(Role::Fg));
     }
 }
@@ -431,7 +431,7 @@ fn render_transport(app: &App, area: Rect, buf: &mut Buffer) {
         let hotkey_len = hint.chars().count();
         for (cx, (j, c)) in (start.max(bx + 1)..end).zip(content.chars().enumerate()) {
             let cell = &mut buf[(cx, content_y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             // The hotkey letter is accent; the glyph is foreground.
             let is_hotkey = j < hotkey_len;
             cell.set_fg(if is_hotkey {
@@ -455,7 +455,7 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
 
     // State glyph, colored like the full player's.
     let glyph_cell = &mut buf[(x, area.y)];
-    glyph_cell.set_symbol(&state_glyph(snapshot.state).to_string());
+    glyph_cell.set_char(state_glyph(snapshot.state));
     glyph_cell.set_fg(state_color(snapshot.state, theme));
     x += 2;
 
@@ -468,7 +468,7 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
             return;
         }
         let cell = &mut buf[(x, area.y)];
-        cell.set_symbol(&c.to_string());
+        cell.set_char(c);
         cell.set_fg(time_color);
         x += 1;
     }
@@ -485,7 +485,7 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
     let truncated = truncate_to_width(&title, title_width as usize);
     for c in truncated.chars() {
         let cell = &mut buf[(x, area.y)];
-        cell.set_symbol(&c.to_string());
+        cell.set_char(c);
         cell.set_fg(theme.color(Role::Fg));
         x += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
     }
@@ -507,7 +507,7 @@ fn render_compact(app: &App, area: Rect, buf: &mut Buffer) {
         for i in 0..seek_width {
             let cell = &mut buf[(x + i, area.y)];
             if i == knob_x {
-                cell.set_symbol(&glyphs::KNOB.to_string());
+                cell.set_char(glyphs::KNOB);
                 cell.set_fg(theme.color(Role::Accent));
             } else {
                 cell.set_symbol("━");

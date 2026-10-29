@@ -103,7 +103,7 @@ impl Widget for EqCurve<'_> {
                 if bits != 0 {
                     let cell = &mut buf[(area.x + cx as u16, area.y + cy as u16)];
                     if let Some(c) = char::from_u32(BRAILLE_BLANK + bits) {
-                        cell.set_symbol(&c.to_string());
+                        cell.set_char(c);
                         cell.set_fg(self.color);
                     }
                 }

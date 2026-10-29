@@ -193,7 +193,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
                 break;
             }
             let cell = &mut buf[(inner.x + i as u16, inner.y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(theme.color(Role::Muted));
         }
         return;
@@ -245,7 +245,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
 
         // Marker.
         let cell = &mut buf[(x, y)];
-        cell.set_symbol(&marker.to_string());
+        cell.set_char(marker);
         cell.set_fg(theme.color(Role::Accent));
         x += 1;
 
@@ -255,7 +255,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
                 break;
             }
             let cell = &mut buf[(x, y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(theme.color(Role::Muted));
             x += 1;
         }
@@ -275,7 +275,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         let truncated = crate::ui::player::truncate_to_width(&name, available);
         for c in truncated.chars() {
             let cell = &mut buf[(x, y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_style(title_style);
             x += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
         }
@@ -283,7 +283,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         let dx = inner.x + list_width - 1 - duration_width as u16;
         for (i, c) in duration.chars().enumerate() {
             let cell = &mut buf[(dx + i as u16, y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(if is_current {
                 theme.color(Role::Accent)
             } else {
@@ -314,7 +314,7 @@ fn render_scrollbar(app: &App, buf: &mut Buffer, scroll: usize, total: usize, in
         let in_thumb = (i as f32) >= thumb_pos && (i as f32) < thumb_pos + thumb_h;
         let cell = &mut buf[(x, inner.y + i)];
         if in_thumb {
-            cell.set_symbol(&glyphs::TRACK_FULL.to_string());
+            cell.set_char(glyphs::TRACK_FULL);
             cell.set_fg(theme.color(Role::Primary));
         } else {
             cell.set_symbol("│");

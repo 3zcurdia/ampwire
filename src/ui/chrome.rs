@@ -89,7 +89,7 @@ pub fn render_too_small(area: Rect, buf: &mut ratatui::buffer::Buffer, theme: &T
     let style = Style::default().fg(theme.color(Role::Warn));
     for (i, c) in text.chars().enumerate() {
         let cell = &mut buf[(x + i as u16, y)];
-        cell.set_symbol(&c.to_string());
+        cell.set_char(c);
         cell.set_style(style);
     }
 }

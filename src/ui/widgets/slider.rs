@@ -27,7 +27,7 @@ impl Widget for HSlider<'_> {
                     return;
                 }
                 let cell = &mut buf[(x, area.y)];
-                cell.set_symbol(&c.to_string());
+                cell.set_char(c);
                 cell.set_fg(self.label_style);
                 x += 1;
             }

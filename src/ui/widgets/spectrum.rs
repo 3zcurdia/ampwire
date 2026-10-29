@@ -60,7 +60,7 @@ impl Widget for Spectrum<'_> {
                 } else {
                     EIGHTHS[(filled_here - 1) as usize]
                 };
-                cell.set_symbol(&symbol.to_string());
+                cell.set_char(symbol);
                 cell.set_fg(color);
             }
 
@@ -73,7 +73,7 @@ impl Widget for Spectrum<'_> {
                 if cap_row < area.height {
                     let y = area.y + area.height - 1 - cap_row;
                     let cell = &mut buf[(x, y)];
-                    cell.set_symbol(&EIGHTHS[7].to_string());
+                    cell.set_char(EIGHTHS[7]);
                     cell.set_fg(self.peak_color);
                 }
             }

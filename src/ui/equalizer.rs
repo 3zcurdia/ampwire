@@ -87,7 +87,7 @@ fn render_toggles_and_curve(app: &App, area: Rect, buf: &mut Buffer) {
                 return;
             }
             let cell = &mut buf[(*x, area.y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(color);
             *x += 1;
         }
@@ -122,7 +122,7 @@ fn render_toggles_and_curve(app: &App, area: Rect, buf: &mut Buffer) {
         let cx = rx + i as u16;
         if cx < right {
             let cell = &mut buf[(cx, area.y)];
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(theme.color(Role::Glow));
         }
     }
@@ -207,7 +207,7 @@ fn render_sliders(app: &App, area: Rect, buf: &mut Buffer) {
             let cx = start + i as u16;
             if cx < area.x + SCALE_WIDTH {
                 let cell = &mut buf[(cx, area.y + row)];
-                cell.set_symbol(&c.to_string());
+                cell.set_char(c);
                 cell.set_fg(theme.color(Role::Muted));
             }
         }
@@ -254,7 +254,7 @@ fn render_labels(app: &App, area: Rect, buf: &mut Buffer) {
             let cx = start + j as u16;
             if cx < right {
                 let cell = &mut buf[(cx, area.y)];
-                cell.set_symbol(&c.to_string());
+                cell.set_char(c);
                 cell.set_fg(color);
             }
         }

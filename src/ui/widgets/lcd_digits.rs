@@ -92,7 +92,7 @@ fn write_row(buf: &mut Buffer, x: u16, y: u16, glyphs: &str, fg: Color) {
     for (i, c) in glyphs.chars().enumerate() {
         let cx = x + i as u16;
         if let Some(cell) = buf.cell_mut((cx, y)) {
-            cell.set_symbol(&c.to_string());
+            cell.set_char(c);
             cell.set_fg(fg);
         }
     }
