@@ -704,14 +704,14 @@ impl RealPlayer {
         };
         self.source_exact = info.f32_exact;
         self.format = FormatInfo {
-            codec: info.codec.clone(),
+            codec: info.codec.as_str().into(),
             // The marker itself is computed in `snapshot()` from the live
             // volume/balance (plan 05); the stored format only carries the
             // source's losslessness.
             bit_perfect: false,
             bit_depth: info.bit_depth,
             sample_rate: Some(info.sample_rate),
-            channels: channels_label(info.channels),
+            channels: channels_label(info.channels).into(),
             bitrate_kbps,
             lossless: info.lossless,
         };
@@ -1669,10 +1669,10 @@ mod tests {
         queue(&events, fake_started_at(0));
         player.tick(Duration::ZERO);
         let format = player.snapshot().format;
-        assert_eq!(format.codec, "FLAC");
+        assert_eq!(&*format.codec, "FLAC");
         assert_eq!(format.bit_depth, Some(16));
         assert_eq!(format.sample_rate, Some(44_100));
-        assert_eq!(format.channels, "stereo");
+        assert_eq!(&*format.channels, "stereo");
         assert!(format.lossless);
         assert!(format.bit_perfect, "lossless at 100 % / centered");
         // Lossy start → no bit-perfect flag.
@@ -1684,9 +1684,9 @@ mod tests {
         queue(&events, EngineEvent::Started(lossy, fake_handle(0)));
         player.tick(Duration::ZERO);
         let format = player.snapshot().format;
-        assert_eq!(format.codec, "MP3");
+        assert_eq!(&*format.codec, "MP3");
         assert!(!format.bit_perfect);
-        assert_eq!(format.channels, "mono");
+        assert_eq!(&*format.channels, "mono");
         // Stop → blank again.
         player.handle(PlayerCommand::Stop);
         assert_eq!(player.snapshot().format, FormatInfo::blank());
@@ -2245,7 +2245,7 @@ mod tests {
             Some(0),
             "the event alone moves nothing"
         );
-        assert_eq!(player.snapshot().format.codec, "FLAC", "not yet");
+        assert_eq!(&*player.snapshot().format.codec, "FLAC", "not yet");
 
         // One frame short of the boundary: still the old track.
         played.store(110_249, Ordering::Relaxed);
@@ -2257,7 +2257,7 @@ mod tests {
         player.tick(Duration::ZERO);
         assert_eq!(player.playlist.current(), Some(1), "crossed");
         let snapshot = player.snapshot();
-        assert_eq!(snapshot.format.codec, "MP3", "format line switched");
+        assert_eq!(&*snapshot.format.codec, "MP3", "format line switched");
         assert_eq!(
             snapshot.position,
             Duration::ZERO,

@@ -30,10 +30,12 @@ pub enum PlayState {
 /// Format of the current track — the hi-fi line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatInfo {
-    pub codec: String,
+    /// Shared (`Arc<str>`): a snapshot is taken every tick, and copying the
+    /// format line must not allocate.
+    pub codec: Arc<str>,
     pub bit_depth: Option<u8>,
     pub sample_rate: Option<u32>,
-    pub channels: String,
+    pub channels: Arc<str>,
     pub bit_perfect: bool,
     /// Lossy only: the tagged (or estimated) bitrate. `None` for lossless.
     pub bitrate_kbps: Option<u32>,
@@ -48,10 +50,10 @@ impl FormatInfo {
     /// UI renders no format line.
     pub fn blank() -> Self {
         Self {
-            codec: String::new(),
+            codec: "".into(),
             bit_depth: None,
             sample_rate: None,
-            channels: String::new(),
+            channels: "".into(),
             bit_perfect: false,
             bitrate_kbps: None,
             lossless: false,
@@ -67,7 +69,7 @@ impl FormatInfo {
         if self.codec.is_empty() {
             return parts; // nothing playing: no format line
         }
-        parts.push(self.codec.clone());
+        parts.push(self.codec.to_string());
         let rate = self.sample_rate.map(format_khz);
         if self.lossless {
             match (self.bit_depth, &rate) {
@@ -85,7 +87,7 @@ impl FormatInfo {
             }
         }
         if !self.channels.is_empty() {
-            parts.push(self.channels.clone());
+            parts.push(self.channels.to_string());
         }
         parts
     }

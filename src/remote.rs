@@ -69,10 +69,10 @@ impl Default for FormatView {
 impl From<&FormatInfo> for FormatView {
     fn from(format: &FormatInfo) -> Self {
         Self {
-            codec: format.codec.clone(),
+            codec: format.codec.to_string(),
             bit_depth: format.bit_depth,
             sample_rate: format.sample_rate,
-            channels: format.channels.clone(),
+            channels: format.channels.to_string(),
             bitrate_kbps: format.bitrate_kbps,
             lossless: format.lossless,
             bit_perfect: format.bit_perfect,
