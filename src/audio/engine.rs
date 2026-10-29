@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -29,9 +29,13 @@ use crate::smb::{SmbSetup, SmbUrl};
 use super::dsp::{Dsp, SharedParams};
 use super::{Decoder, PlayError, StreamInfo};
 
-/// How often the engine thread wakes to feed the ring buffer / poll commands.
-/// Never busy-spins, never sleeps long enough to starve the callback.
+/// How often the engine thread wakes to feed the ring buffer / poll commands
+/// while a track plays or a download runs. Never sleeps long enough to starve
+/// the callback.
 const FEED_INTERVAL: Duration = Duration::from_millis(5);
+/// The wake-up while paused: the callback has stopped draining the ring, so
+/// nothing needs feeding. A command still wakes the thread at once.
+const PAUSED_WAIT: Duration = Duration::from_millis(100);
 /// Smallest decode batch: ~11 ms of 44.1 kHz stereo, so pushes stay chunky.
 const MIN_CHUNK: usize = 1024;
 /// Ring capacity in samples: the plan's ≈0.5 s (`rate * channels / 2`), with a
@@ -493,11 +497,14 @@ fn run(
     // (Load + Pause) never audibly blips: whoever wants playback re-sends
     // Resume (or the player re-sends Pause right after the seek Load).
     let paused = Arc::new(AtomicBool::new(false));
+    // A command the idle wait at the bottom of the loop already received;
+    // it is handled first, before anything else queued behind it.
+    let mut stashed: Option<EngineCmd> = None;
 
     loop {
         // 1. Commands (non-blocking).
         let mut shutdown = false;
-        while let Ok(cmd) = cmd_rx.try_recv() {
+        while let Some(cmd) = stashed.take().or_else(|| cmd_rx.try_recv().ok()) {
             match cmd {
                 EngineCmd::Load { path, start } => {
                     // Drop the old stream first: its ring buffer dies with it,
@@ -714,8 +721,31 @@ fn run(
             }
         }
 
-        // 4. Never busy-spin.
-        std::thread::sleep(FEED_INTERVAL);
+        // 4. Wait for the next thing to do. A command wakes the thread at
+        //    once in every case. Nothing playing and no download: block
+        //    until a command arrives, so an idle player costs no wake-ups.
+        //    Paused: wait longer, since no feeding is due.
+        let wait = if download.is_some() {
+            Some(FEED_INTERVAL)
+        } else if state.is_none() {
+            None
+        } else if paused.load(Ordering::Relaxed) {
+            Some(PAUSED_WAIT)
+        } else {
+            Some(FEED_INTERVAL)
+        };
+        match wait {
+            None => match cmd_rx.recv() {
+                Ok(cmd) => stashed = Some(cmd),
+                // Every sender is gone: the same exit as `Shutdown`.
+                Err(_) => break,
+            },
+            Some(wait) => match cmd_rx.recv_timeout(wait) {
+                Ok(cmd) => stashed = Some(cmd),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+        }
     }
 
     // Exit: cancel a running download, then remove the fallback directory
