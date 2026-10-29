@@ -89,19 +89,18 @@ impl Analyzer {
         self.update_edges(sample_rate);
 
         // 1. Last 2048 samples, right-aligned (newest at the end), zero-padded
-        //    when fewer have arrived, multiplied by the Hann window.
+        //    at the front when fewer have arrived, multiplied by the Hann
+        //    window. The oldest kept sample sits `filled` slots behind the
+        //    write cursor; walk forward from there, wrapping by a compare.
         let pad = FFT_LEN - self.filled;
-        for pos in 0..FFT_LEN {
-            let sample = if pos < pad {
-                0.0
-            } else {
-                // Newest sits at `pos = FFT_LEN - 1`, i.e. ring slot
-                // `write - 1`; walk backwards from there (wrapping).
-                let slot = (self.write as isize + pos as isize - FFT_LEN as isize)
-                    .rem_euclid(FFT_LEN as isize);
-                self.ring[slot as usize]
-            };
-            self.spectrum[pos] = Complex::new(sample * self.window[pos], 0.0);
+        self.spectrum[..pad].fill(Complex::new(0.0, 0.0));
+        let mut slot = (self.write + FFT_LEN - self.filled) % FFT_LEN;
+        for pos in pad..FFT_LEN {
+            self.spectrum[pos] = Complex::new(self.ring[slot] * self.window[pos], 0.0);
+            slot += 1;
+            if slot == FFT_LEN {
+                slot = 0;
+            }
         }
         self.fft
             .process_with_scratch(&mut self.spectrum, &mut self.scratch);
