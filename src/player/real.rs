@@ -1086,15 +1086,8 @@ impl RealPlayer {
                 if self.pending_remote.as_ref() != Some(&item_id) {
                     return; // stale: the user already moved on
                 }
-                let start = self.pending_start.unwrap_or(Duration::ZERO);
-                let keep_paused = self.state == PlayState::Paused;
                 self.pending_remote = None;
-                self.engine.send(EngineCmd::Load { path, start });
-                if keep_paused {
-                    self.engine.send(EngineCmd::Pause);
-                } else {
-                    self.engine.send(EngineCmd::Resume);
-                }
+                self.load_ready_file(path);
             }
             CacheEvent::Failed { item_id, error } => {
                 if self.pending_remote.as_ref() != Some(&item_id) {
@@ -1130,15 +1123,8 @@ impl RealPlayer {
                 if self.pending_smb.as_ref() != Some(&url) {
                     return; // stale: the user already moved on
                 }
-                let start = self.pending_start.unwrap_or(Duration::ZERO);
-                let keep_paused = self.state == PlayState::Paused;
                 self.pending_smb = None;
-                self.engine.send(EngineCmd::Load { path, start });
-                if keep_paused {
-                    self.engine.send(EngineCmd::Pause);
-                } else {
-                    self.engine.send(EngineCmd::Resume);
-                }
+                self.load_ready_file(path);
             }
             SmbCacheEvent::Failed { url, error } => {
                 if self.pending_smb.as_ref() != Some(&url) {
@@ -1150,6 +1136,20 @@ impl RealPlayer {
                 self.on_error(PlayError::Failed(error));
             }
         }
+    }
+
+    /// Load a downloaded file the track was waiting for, at the pending start
+    /// offset. The engine's pause flag survives a `Load`, so the state the
+    /// user left (paused or playing) is re-asserted right after it.
+    fn load_ready_file(&mut self, path: std::path::PathBuf) {
+        let start = self.pending_start.unwrap_or(Duration::ZERO);
+        let keep_paused = self.state == PlayState::Paused;
+        self.engine.send(EngineCmd::Load { path, start });
+        self.engine.send(if keep_paused {
+            EngineCmd::Pause
+        } else {
+            EngineCmd::Resume
+        });
     }
 
     /// Halt playback but keep the current track selected (Stop semantics).
