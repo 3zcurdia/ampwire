@@ -88,8 +88,6 @@ fn state_glyph(state: PlayState) -> char {
     reason = "one straight-line draw of the full player panel; each block is a fixed screen region"
 )]
 fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
-    // before the flags themselves give way: the format text wins last.
-    // The `bit-perfect` marker is never dropped — it stays where it is.
     const FLAGS_MARGIN: usize = 3;
     const FLAGS_WIDTH: usize = 9; // `shuf  rep`
     const MIN_GAP: usize = 2;
@@ -190,6 +188,8 @@ fn render_full(app: &App, area: Rect, buf: &mut Buffer) {
     // Flags right-aligned with a 3-column margin. When tight, give up the
     // margin, then the double spacing — and a still-narrower line drops the
     // format's trailing parts (channels first, then the rate; plan 05)
+    // before the flags themselves give way: the format text wins last.
+    // The `bit-perfect` marker is never dropped — it stays where it is.
     let width = format_area.width as usize;
     // Candidate texts, widest first: the full `describe()` line, then
     // narrower rebuilds without channels, then without channels and rate.

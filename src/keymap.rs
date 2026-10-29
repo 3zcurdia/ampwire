@@ -792,7 +792,6 @@ mod tests {
 
     #[test]
     fn remap_next_to_n_updates_hints_and_transport() {
-        // The transport box (drawn from keymap.hint) shows the remapped key.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         // remap `next = ["n"]`: `b` no longer maps to Next, and the transport
@@ -812,6 +811,7 @@ mod tests {
         );
         assert_eq!(map.hint(Action::Next).as_deref(), Some("n"));
 
+        // The transport box (drawn from keymap.hint) shows the remapped key.
         let app = crate::app::App::new(
             crate::config::Config::default(),
             map,
