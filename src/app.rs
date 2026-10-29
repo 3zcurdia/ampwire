@@ -1238,6 +1238,9 @@ impl App {
                 theme.apply_depth(ui::theme::ColorDepth::detect());
                 self.theme = theme;
                 self.omarchy_fallback = false;
+                // Only a real theme change needs a redraw now; an unchanged
+                // poll leaves the frame cadence alone.
+                self.dirty = true;
             }
             Ok(None) => {}
             Err(_reason) => {
@@ -1249,12 +1252,10 @@ impl App {
                     Self::apply_theme_overrides(&mut self.theme, &self.config);
                     self.theme.apply_depth(ui::theme::ColorDepth::detect());
                     self.omarchy_fallback = true;
+                    self.dirty = true;
                 }
             }
         }
-        // The poll runs once a second; a redraw then is the idle cadence
-        // anyway, and it makes a real theme change visible immediately.
-        self.dirty = true;
     }
 
     /// Apply per-role overrides from `[theme.colors]` on top of a preset.
