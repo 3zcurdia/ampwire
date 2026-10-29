@@ -134,16 +134,10 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
 
     // Totals always count the *whole* playlist, filtered or not; unknown
     // durations are excluded from the sum.
-    let total_secs: u64 = snapshot
-        .tracks
-        .iter()
-        .filter_map(|t| t.duration)
-        .map(|d| d.as_secs())
-        .sum();
     let totals = format!(
         "{} · {}",
         snapshot.tracks.len(),
-        format_duration(total_secs)
+        format_duration(app.playlist_seconds())
     );
     // The notice slot: an open prompt types here, else the active filter,
     // else whatever notice was left (truncated; totals always fit).

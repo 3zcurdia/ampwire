@@ -237,6 +237,8 @@ pub struct App {
     last_area: Option<Rect>,
     /// Memo behind [`App::visible_indices`].
     visible_cache: RefCell<Option<VisibleCache>>,
+    /// Memo behind [`App::playlist_seconds`]: the summed duration of one list.
+    total_cache: RefCell<Option<(TrackList, u64)>>,
     /// Omarchy is unavailable and the neon fallback is already applied.
     omarchy_fallback: bool,
     /// A background directory scan is in flight (plan 02, step 8).
@@ -316,6 +318,7 @@ impl App {
             config_dirty_since: None,
             last_area: None,
             visible_cache: RefCell::new(None),
+            total_cache: RefCell::new(None),
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
@@ -380,6 +383,7 @@ impl App {
             config_dirty_since: None,
             last_area: None,
             visible_cache: RefCell::new(None),
+            total_cache: RefCell::new(None),
             omarchy_fallback: false,
             scan_rx: None,
             scan_mode: ScanMode::Replace,
@@ -690,6 +694,26 @@ impl App {
             indices: Arc::clone(&indices),
         });
         indices
+    }
+
+    /// Summed length of the whole playlist in whole seconds, tracks with an
+    /// unknown duration excluded. The footer asks every frame, so it is
+    /// memoized per track list (same pointer rule as `visible_indices`).
+    pub fn playlist_seconds(&self) -> u64 {
+        let tracks = &self.snapshot.tracks;
+        let mut cache = self.total_cache.borrow_mut();
+        if let Some((hit, seconds)) = cache.as_ref()
+            && Arc::ptr_eq(hit, tracks)
+        {
+            return *seconds;
+        }
+        let seconds = tracks
+            .iter()
+            .filter_map(|t| t.duration)
+            .map(|d| d.as_secs())
+            .sum();
+        *cache = Some((Arc::clone(tracks), seconds));
+        seconds
     }
 
     /// Keep the cursor inside the visible list after it changes shape.
@@ -2393,6 +2417,17 @@ mod tests {
         app.dispatch(Action::Open);
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn playlist_seconds_follows_the_list_and_is_memoized() {
+        let (mut app, _dir) = test_app();
+        let full = app.playlist_seconds();
+        assert!(full > 0, "the mock list has durations");
+        // A second read of the same list is the memo's hit.
+        assert_eq!(app.playlist_seconds(), full);
+        app.dispatch(Action::Clear);
+        assert_eq!(app.playlist_seconds(), 0, "an edit invalidates the memo");
     }
 
     #[test]
