@@ -5,6 +5,10 @@
 //! track, the manual Next/Prev keys and plan 08's cache window all go
 //! through [`PlayOrder`], so they can never disagree about "what plays next".
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::Track;
 use super::rng::Rng;
 
 /// "Nothing is playing yet": every real index into `order` is `< len`, so
@@ -273,6 +277,59 @@ impl PlayOrder {
             (nearest.saturating_sub(n.saturating_sub(1)), nearest + 1)
         };
         (first..end).rev().map(move |i| self.order[i])
+    }
+
+    /// A rolling cache window (plans 08/10): the `current` track first, then
+    /// up to `ahead` accepted tracks going forward in *play* order, then up
+    /// to `behind` going back. `keep` maps a track to the item to cache, or
+    /// `None` to skip it — a skipped track does not count toward the quota.
+    /// Each playlist index is considered once.
+    pub fn window<T>(
+        &self,
+        tracks: &[Arc<Track>],
+        current: Option<usize>,
+        ahead: usize,
+        behind: usize,
+        keep: impl Fn(&Track) -> Option<T>,
+    ) -> Vec<T> {
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut out: Vec<T> = Vec::new();
+        // Returns whether the track was accepted, i.e. counted toward a quota.
+        let mut admit = |index: usize, out: &mut Vec<T>| -> bool {
+            if !seen.insert(index) {
+                return false;
+            }
+            match tracks.get(index).and_then(|track| keep(track)) {
+                Some(item) => {
+                    out.push(item);
+                    true
+                }
+                None => false,
+            }
+        };
+
+        if let Some(current) = current {
+            admit(current, &mut out);
+        }
+        let mut count = 0;
+        for index in self.upcoming(tracks.len()) {
+            if count >= ahead {
+                break;
+            }
+            if admit(index, &mut out) {
+                count += 1;
+            }
+        }
+        let mut count = 0;
+        for index in self.previous(tracks.len()) {
+            if count >= behind {
+                break;
+            }
+            if admit(index, &mut out) {
+                count += 1;
+            }
+        }
+        out
     }
 
     /// The playlist index the cursor sits on, if anything is current.

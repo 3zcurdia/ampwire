@@ -210,10 +210,9 @@ impl Drop for SmbCache {
     }
 }
 
-/// The window in play order: current (if SMB) → `ahead` next SMB tracks →
-/// `behind` previous ones, nearest first, deduplicated. Local and Jellyfin
-/// tracks are skipped and never counted, so shuffle (which reorders the play
-/// sequence, not the playlist) is respected automatically.
+/// The SMB window: the rule is [`PlayOrder::window`]; only `smb://` tracks
+/// are downloadable here (a Jellyfin row has its own window, plan 10,
+/// step 2).
 pub fn compute_smb_window(
     order: &PlayOrder,
     tracks: &[Arc<Track>],
@@ -221,48 +220,7 @@ pub fn compute_smb_window(
     ahead: usize,
     behind: usize,
 ) -> Vec<SmbRef> {
-    let mut seen: HashSet<usize> = HashSet::new();
-    let mut wanted: Vec<usize> = Vec::new();
-
-    let mut take = |index: usize, wanted: &mut Vec<usize>| {
-        // Only *SMB* tracks are downloadable here: a Jellyfin row in the
-        // same playlist has its own window (plan 10, step 2).
-        if seen.insert(index) && tracks.get(index).is_some_and(|track| track.is_smb()) {
-            wanted.push(index);
-        }
-    };
-
-    if let Some(current) = current {
-        take(current, &mut wanted);
-    }
-    // `N` large enough to find `ahead` *SMB* tracks among everything.
-    let mut count = 0;
-    for index in order.upcoming(tracks.len()) {
-        if count >= ahead {
-            break;
-        }
-        let before = wanted.len();
-        take(index, &mut wanted);
-        if wanted.len() > before {
-            count += 1;
-        }
-    }
-    let mut count = 0;
-    for index in order.previous(tracks.len()) {
-        if count >= behind {
-            break;
-        }
-        let before = wanted.len();
-        take(index, &mut wanted);
-        if wanted.len() > before {
-            count += 1;
-        }
-    }
-
-    wanted
-        .into_iter()
-        .filter_map(|index| SmbRef::from_track(&tracks[index]))
-        .collect()
+    order.window(tracks, current, ahead, behind, SmbRef::from_track)
 }
 
 /// The downloader thread: wait for a window → evict → fetch in priority

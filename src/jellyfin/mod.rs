@@ -489,7 +489,10 @@ mod tests {
         assert_eq!(first.title.as_deref(), Some("Song One"));
         assert_eq!(first.duration, Some(Duration::from_secs(250)));
         assert_eq!(first.bitrate_kbps, Some(320), "320000 bits/s → 320 kbps");
-        assert!(first.is_remote());
+        assert!(!matches!(
+            first.source,
+            crate::player::TrackSource::Local(_)
+        ));
         assert!(
             matches!(&first.source, TrackSource::Remote { item_id, container }
                 if item_id == "item1" && container.as_deref() == Some("mp3")),
