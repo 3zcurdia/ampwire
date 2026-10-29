@@ -432,7 +432,7 @@ mod tests {
 
         // Removing the remote batch takes the current track too.
         assert!(
-            p.remove_where(|t| !matches!(t.source, crate::player::TrackSource::Local(_))),
+            p.remove_where(|t| t.is_remote()),
             "the current track was removed"
         );
         assert_eq!(p.current(), None, "current clears, like `remove`");
@@ -443,14 +443,14 @@ mod tests {
         let mut p = Playlist::new();
         p.append_in_order(vec![remote("a"), track("local"), remote("b")]);
         p.set_current(Some(1));
-        assert!(!p.remove_where(|t| !matches!(t.source, crate::player::TrackSource::Local(_))));
+        assert!(!p.remove_where(|t| t.is_remote()));
         assert_eq!(p.current(), Some(0), "still pointing at the local track");
         assert_eq!(p.len(), 1);
 
         // No match at all: nothing moves, `false` comes back.
         let mut p = playlist(&["x", "y"]);
         p.set_current(Some(1));
-        assert!(!p.remove_where(|t| !matches!(t.source, crate::player::TrackSource::Local(_))));
+        assert!(!p.remove_where(|t| t.is_remote()));
         assert_eq!(p.len(), 2);
         assert_eq!(p.current(), Some(1));
     }

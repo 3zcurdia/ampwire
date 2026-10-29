@@ -450,9 +450,7 @@ mod tests {
         names.sort();
         assert_eq!(names, ["mix", "one", "two"]);
         assert!(
-            tracks.iter().all(
-                |t| !matches!(t.source, crate::player::TrackSource::Local(_)) && !t.is_jellyfin()
-            ),
+            tracks.iter().all(|t| t.is_remote() && !t.is_jellyfin()),
             "every row is an SMB track"
         );
         assert!(progress.is_empty(), "fewer than 50 files");
@@ -657,9 +655,7 @@ mod tests {
                 );
                 assert!(!tracks.is_empty(), "the share has audio files");
                 assert!(
-                    tracks
-                        .iter()
-                        .all(|t| matches!(t.source, crate::player::TrackSource::Smb { .. })),
+                    tracks.iter().all(Track::is_smb),
                     "every row came from the share"
                 );
                 assert!(

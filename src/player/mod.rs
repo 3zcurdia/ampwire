@@ -292,6 +292,18 @@ impl Track {
         }
     }
 
+    /// Not a local file — Jellyfin *or* SMB (plan 10). Drives the
+    /// remote-only cache windows (one per source) and the "no path in the
+    /// row" rules. Test-only: the windows take their source filter from the
+    /// per-cache `from_track`.
+    #[cfg(test)]
+    pub fn is_remote(&self) -> bool {
+        matches!(
+            self.source,
+            TrackSource::Remote { .. } | TrackSource::Smb { .. }
+        )
+    }
+
     /// A Jellyfin item specifically: the rules that are Jellyfin's alone —
     /// the `j` reload rule ([`RemoveRemote`][PlayerCommand::RemoveRemote]),
     /// the Jellyfin download window and `stream_pure`'s EQ bypass — key off
@@ -299,6 +311,15 @@ impl Track {
     /// be dropped, downloaded or EQ-bypassed by a Jellyfin action).
     pub fn is_jellyfin(&self) -> bool {
         matches!(self.source, TrackSource::Remote { .. })
+    }
+
+    /// An SMB row specifically — what the SMB rolling cache window (plan
+    /// 10, step 5) and anything else SMB-only selects. Expressed through
+    /// the other two so the relation stays visible: remote, and not the
+    /// Jellyfin half of them. Test-only, like [`is_remote`][Self::is_remote].
+    #[cfg(test)]
+    pub fn is_smb(&self) -> bool {
+        self.is_remote() && !self.is_jellyfin()
     }
 }
 
@@ -533,25 +554,20 @@ mod tests {
         assert_eq!(smb("", None, None).alpha_key(), "smb://nas/music");
     }
 
-    /// Plan 10, step 2: a non-local source covers both Jellyfin and SMB (the
+    /// Plan 10, step 2: `is_remote()` covers both non-local sources (the
     /// remote-only UI rules), while the three Jellyfin-specific rules stay
     /// Jellyfin-only.
     #[test]
     fn smb_tracks_are_remote_but_not_jellyfin() {
         let share = smb("a.flac", None, None);
-        assert!(
-            !matches!(share.source, crate::player::TrackSource::Local(_)),
-            "SMB is not a local file"
-        );
+        assert!(share.is_remote(), "SMB is not a local file");
         assert!(!share.is_jellyfin(), "…but it is not a Jellyfin item");
 
         let server = jellyfin("abc");
-        assert!(
-            !matches!(server.source, crate::player::TrackSource::Local(_)) && server.is_jellyfin()
-        );
+        assert!(server.is_remote() && server.is_jellyfin());
 
         let disk = local("/m/a.flac", None, None);
-        assert!(matches!(disk.source, crate::player::TrackSource::Local(_)) && !disk.is_jellyfin());
+        assert!(!disk.is_remote() && !disk.is_jellyfin());
     }
 
     // --- album order (plan 12) ---

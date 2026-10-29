@@ -514,6 +514,24 @@ mod tests {
         }
     }
 
+    fn smb(path: &str) -> Track {
+        Track {
+            id: Track::next_id(),
+            source: TrackSource::Smb {
+                url: crate::smb::SmbUrl {
+                    server: "nas".into(),
+                    share: "Music".into(),
+                    path: path.into(),
+                },
+            },
+            artist: None,
+            title: None,
+            duration: None,
+            bitrate_kbps: None,
+            pos: crate::player::AlbumPos::default(),
+        }
+    }
+
     /// Ordered play order over `len` tracks, cursor on `current`.
     fn ordered(len: usize, current: Option<usize>) -> PlayOrder {
         let mut rng = Rng::new(1);
@@ -578,6 +596,20 @@ mod tests {
         );
         // Nothing current and no look-ahead: empty, never a panic.
         assert_eq!(compute_window(&order, &arc(&tracks), None, 0, 0).len(), 0);
+    }
+
+    /// The mirror of the SMB cache's mixed-source window test: an SMB row
+    /// never enters the Jellyfin window and never eats its quota.
+    #[test]
+    fn window_skips_smb_tracks_without_counting_them() {
+        // [R-a, S-x, R-b, R-c], current = the remote at index 0.
+        let tracks = vec![remote("a"), smb("x.flac"), remote("b"), remote("c")];
+        let order = ordered(tracks.len(), Some(0));
+        assert_eq!(
+            ids(&compute_window(&order, &arc(&tracks), Some(0), 3, 2)),
+            ["a", "b", "c"],
+            "the SMB row is skipped, so three ahead still yields b and c"
+        );
     }
 
     #[test]
