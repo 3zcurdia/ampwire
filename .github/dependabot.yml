@@ -1,0 +1,12 @@
+# Dependabot version updates for Cargo (Cargo.toml + Cargo.lock): daily,
+# every version — major, minor and patch alike. Each update opens its own
+# PR and is merged by hand. Dependabot *security* updates are a separate
+# repository setting and are not configured here.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "06:00" # UTC unless timezone is given
+    open-pull-requests-limit: 10
