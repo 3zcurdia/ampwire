@@ -18,7 +18,7 @@ rustfft = "6"
 rtrb = "0.4.0"
 serde = { version = "1", features = ["derive"] }
 symphonia = { version = "0.6.1", features = ["mp3", "isomp4", "aac", "alac", "flac", "wav", "pcm"] }
-toml = "0.8"
+toml = "1.1"
 toml_edit = "0.22"
 unicode-width = "0.2"
 walkdir = "2.5.0"
