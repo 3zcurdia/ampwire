@@ -19,7 +19,7 @@ rtrb = "0.4.0"
 serde = { version = "1", features = ["derive"] }
 symphonia = { version = "0.6.1", features = ["mp3", "isomp4", "aac", "alac", "flac", "wav", "pcm"] }
 toml = "0.8"
-toml_edit = "0.22"
+toml_edit = "0.25"
 unicode-width = "0.2"
 walkdir = "2.5.0"
 ureq = "3.5.0"
