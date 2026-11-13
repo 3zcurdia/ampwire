@@ -18,9 +18,8 @@ use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use zbus::blocking::{Connection, connection};
-use zbus::interface;
-use zbus::zvariant::{ObjectPath, OwnedValue, Value};
+use zbus::connection::Builder;
+use zbus::{Connection, ObjectPath, OwnedVariant, Variant, block_on, interface};
 
 use crate::remote::{RemoteCommand, SharedView, View, read_view};
 
@@ -46,7 +45,7 @@ pub struct MprisHandle {
 impl Drop for MprisHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.conn.clone().close();
+        let _ = block_on(self.conn.clone().close());
         if let Some(thread) = self.closed.take() {
             let _ = thread.join();
         }
@@ -64,21 +63,22 @@ pub fn start(view: SharedView, tx: Sender<RemoteCommand>) -> Option<MprisHandle>
         tx,
         view: view.clone(),
     };
-    let conn = connection::Builder::session()
-        .ok()?
-        .name(BUS_NAME)
-        .ok()?
-        .serve_at(OBJECT_PATH, root)
-        .ok()?
-        .serve_at(OBJECT_PATH, player)
-        .ok()?
-        .build()
-        .ok()?;
+    // zbus 6 defers all builder errors to `build()`, which is async: drive it
+    // with `block_on` (the blocking API is gone). `None` on any failure.
+    let conn = block_on(async {
+        Builder::session()
+            .name(BUS_NAME)
+            .serve_at(OBJECT_PATH, root)
+            .serve_at(OBJECT_PATH, player)
+            .build()
+            .await
+    })
+    .ok()?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let closed_conn = conn.clone();
     let wait = closed_conn.clone();
-    let closed = thread::spawn(move || wait.closed());
+    let closed = thread::spawn(move || block_on(wait.closed()));
     let emitter_stop = Arc::clone(&stop);
     let emitter = thread::spawn(move || emitter_loop(conn, view, emitter_stop));
     Some(MprisHandle {
@@ -266,7 +266,7 @@ impl PlayerIface {
     }
 
     #[zbus(property(emits_changed_signal = "false"))]
-    fn metadata(&self) -> HashMap<String, OwnedValue> {
+    fn metadata(&self) -> HashMap<String, OwnedVariant> {
         metadata_map(&read_view(&self.view))
     }
 
@@ -336,7 +336,7 @@ fn can_previous(view: &View) -> bool {
     can_next(view)
 }
 
-fn metadata_map(view: &View) -> HashMap<String, OwnedValue> {
+fn metadata_map(view: &View) -> HashMap<String, OwnedVariant> {
     let Some(track) = view.track.as_ref() else {
         return HashMap::new();
     };
@@ -345,7 +345,7 @@ fn metadata_map(view: &View) -> HashMap<String, OwnedValue> {
     }
     let mut metadata = HashMap::new();
     if let Ok(track_id) = ObjectPath::try_from(format!("{TRACK_PATH_PREFIX}{}", track.id)) {
-        metadata.insert("mpris:trackid".into(), OwnedValue::from(track_id));
+        metadata.insert("mpris:trackid".into(), OwnedVariant::from(track_id));
     }
     if !track.title.is_empty() {
         metadata.insert("xesam:title".into(), owned(track.title.clone()));
@@ -363,8 +363,8 @@ fn metadata_map(view: &View) -> HashMap<String, OwnedValue> {
 }
 
 /// Wrap a D-Bus-encodable value in the variant form `a{sv}` needs.
-fn owned<T: Into<Value<'static>>>(value: T) -> OwnedValue {
-    OwnedValue::try_from(value.into()).expect("MPRIS metadata is encodable")
+fn owned<T: Into<Variant<'static>>>(value: T) -> OwnedVariant {
+    OwnedVariant::try_from(value.into()).expect("MPRIS metadata is encodable")
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -428,7 +428,7 @@ fn emitter_loop(conn: Connection, view: SharedView, stop: Arc<AtomicBool>) {
         let state = MprisState::from_view(&snapshot);
 
         if let Some(previous) = &last {
-            let mut changed: HashMap<String, OwnedValue> = HashMap::new();
+            let mut changed: HashMap<String, OwnedVariant> = HashMap::new();
             if previous.state != state.state {
                 changed.insert("PlaybackStatus".into(), owned(playback_status(&snapshot)));
             }
@@ -461,13 +461,13 @@ fn emitter_loop(conn: Connection, view: SharedView, stop: Arc<AtomicBool>) {
             }
             if !changed.is_empty() {
                 let body = (PLAYER_IFACE, changed, Vec::<String>::new());
-                let _ = conn.emit_signal(
+                let _ = block_on(conn.emit_signal(
                     None::<&str>,
                     OBJECT_PATH,
                     PROPERTIES_IFACE,
                     "PropertiesChanged",
                     &body,
-                );
+                ));
             }
 
             // Position is polled by clients; Seeked is only for real jumps.
@@ -476,13 +476,13 @@ fn emitter_loop(conn: Connection, view: SharedView, stop: Arc<AtomicBool>) {
                 let jumped =
                     (position as i64 - previous_position as i64).abs() >= SEEK_THRESHOLD_MS;
                 if previous.track_id == Some(track_id) && state.state != "stopped" && jumped {
-                    let _ = conn.emit_signal(
+                    let _ = block_on(conn.emit_signal(
                         None::<&str>,
                         OBJECT_PATH,
                         PLAYER_IFACE,
                         "Seeked",
                         &(position as i64 * 1000),
-                    );
+                    ));
                 }
                 last_position_ms = Some(position);
             } else {
@@ -566,27 +566,27 @@ mod tests {
             eprintln!("skipping: no usable session bus");
             return;
         };
-        let conn = Connection::session().expect("client session bus");
+        let conn = block_on(Connection::session()).expect("client session bus");
 
-        let properties = zbus::blocking::Proxy::new(
+        let properties = block_on(zbus::Proxy::new(
             &conn,
             BUS_NAME,
             OBJECT_PATH,
             "org.freedesktop.DBus.Properties",
-        )
+        ))
         .expect("properties proxy");
-        let value: OwnedValue = properties
-            .call("Get", &("org.mpris.MediaPlayer2.Player", "Metadata"))
-            .expect("Metadata Get");
-        let metadata: HashMap<String, OwnedValue> =
+        let value: OwnedVariant =
+            block_on(properties.call("Get", &("org.mpris.MediaPlayer2.Player", "Metadata")))
+                .expect("Metadata Get");
+        let metadata: HashMap<String, OwnedVariant> =
             HashMap::try_from(value).expect("Metadata is a{sv}");
         let title = String::try_from(metadata["xesam:title"].try_clone().unwrap()).unwrap();
         assert!(!title.is_empty(), "xesam:title is empty");
         assert!(metadata.contains_key("mpris:trackid"));
 
         let player =
-            zbus::blocking::Proxy::new(&conn, BUS_NAME, OBJECT_PATH, PLAYER_IFACE).expect("proxy");
-        let _: () = player.call("Next", &()).expect("Next call");
+            block_on(zbus::Proxy::new(&conn, BUS_NAME, OBJECT_PATH, PLAYER_IFACE)).expect("proxy");
+        let _: () = block_on(player.call("Next", &())).expect("Next call");
         match rx.recv_timeout(Duration::from_secs(2)).expect("command") {
             RemoteCommand::Next => {}
             other => panic!("expected Next, got {other:?}"),
