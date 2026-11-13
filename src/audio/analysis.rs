@@ -114,8 +114,8 @@ impl Analyzer {
             let lo = (self.edges[i] / bw).floor() as usize;
             let hi = ((self.edges[i + 1] / bw).ceil() as usize).max(lo);
             let mut mag = 0.0f32;
-            for bin in lo..=hi.min(BINS - 1) {
-                mag = mag.max(self.spectrum[bin].norm() * scale);
+            for spec in self.spectrum.iter().take(hi.min(BINS - 1) + 1).skip(lo) {
+                mag = mag.max(spec.norm() * scale);
             }
             let center = (self.edges[i] * self.edges[i + 1]).sqrt();
             // Tilt keeps highs visible; never *cuts* below 1 kHz.

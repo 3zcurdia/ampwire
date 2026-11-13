@@ -113,11 +113,12 @@ fn dump(dump: &Dump) -> std::io::Result<()> {
     }
 
     let backend = ratatui::backend::TestBackend::new(dump.width, dump.height);
-    let mut terminal =
-        ratatui::Terminal::new(backend).map_err(|e| std::io::Error::other(e.to_string()))?;
+    // `TestBackend`'s error type is `Infallible`: neither call can fail, so
+    // there is no `io::Error` to convert (`?` has no `From<Infallible>`).
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend is infallible");
     terminal
         .draw(|f| ui::render(f, &app))
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .expect("TestBackend is infallible");
 
     let buf = terminal.backend().buffer();
     for y in 0..dump.height {
